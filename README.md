@@ -8,18 +8,38 @@
 ```
 
 <p align="center">
+  <img src="https://img.shields.io/badge/Version-1.0-red" alt="Version">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
   <img src="https://img.shields.io/github/stars/vehoelite/image-anarchy?style=social" alt="Stars">
 </p>
 
-<h1 align="center">Ⓐ Image Anarchy</h1>
+<h1 align="center">Ⓐ Image Anarchy v1.0</h1>
 <h3 align="center">Android Image Swiss Army Knife</h3>
 
 <p align="center">
   <i>Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.</i>
 </p>
+
+---
+
+## 📸 Screenshots
+
+<table>
+  <tr>
+    <td align="center"><b>📦 Payload Extract</b><br><img src="screenshots/extract.png" alt="Extract Tab" width="400"></td>
+    <td align="center"><b>🔧 Payload Repack</b><br><img src="screenshots/repack.png" alt="Repack Tab" width="400"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>🔍 Image Extract</b><br><img src="screenshots/image_extract.png" alt="Image Extract" width="400"></td>
+    <td align="center"><b>🔨 Image Repack</b><br><img src="screenshots/image_repack.png" alt="Image Repack" width="400"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>🔄 Recovery Porter</b><br><img src="screenshots/recovery.png" alt="Recovery Porter" width="400"></td>
+    <td align="center"><b>📊 ABL Analysis</b><br><img src="screenshots/analysis.png" alt="Analysis" width="400"></td>
+  </tr>
+</table>
 
 ---
 
@@ -36,21 +56,41 @@
 | Format | Capabilities |
 |--------|-------------|
 | **Sparse** | Convert to raw images |
-| **Boot/Vendor Boot** | Extract kernel, ramdisk, DTB (v0-v4) |
+| **Boot/Recovery/Vendor Boot** | Extract kernel, ramdisk, DTB (v0-v4) |
 | **Super (Dynamic)** | Extract all logical partitions |
 | **vbmeta** | Parse, patch (disable verity/verification), re-sign |
+| **DTBO** | Extract device tree overlays (all entries) |
+| **ABL (Android Bootloader)** | Deep analysis - Qualcomm ELF & Pixel/Tensor binary |
 | **ext4** | Extract filesystem contents |
 | **FAT** | Extract filesystem contents |
-| **ELF/Bootloader** | Analyze XBL, ABL, TZ, firmware |
+| **ELF/Bootloader** | Analyze XBL, TZ, firmware |
+
+### 📱 Device Support
+| Vendor | ABL Format | Features |
+|--------|-----------|----------|
+| **Qualcomm** | ELF | Full analysis, unlock checks, secure boot |
+| **Google Pixel/Tensor** | Binary blob | Device detection, Tensor chip patterns |
+| **LG** | ELF + LAF | LAF mode detection, unlock bypass research |
+| **Samsung Exynos** | Binary blob | Basic detection |
+| **MediaTek** | LK format | Bootloader analysis |
 
 ### 🔨 Image Repacking
-- **Boot images** (v0, v1, v2, v3, v4) - custom kernel/ramdisk
+- **Boot/Recovery images** (v0, v1, v2, v3, v4) - custom kernel/ramdisk
 - **Vendor boot images** (v3, v4)
 - **Sparse images** from raw (for faster flashing)
 - **vbmeta images** with AVB disabled
 - **Ramdisk** from directory (cpio + compression)
 
-### 🔐 Security Features
+### � Recovery Porter
+- **Analyze** TWRP, OrangeFox, SHRP, PitchBlack, LineageOS recovery
+- **Extract** kernel, DTB, ramdisk, cmdline
+- **Browse** ramdisk contents (view fstab, init scripts)
+- **Swap** kernel/DTB from another device
+- **Modify** cmdline and rebuild
+- **Port** custom recoveries between devices
+- **Educational comments** explaining recovery internals
+
+### �🔐 Security Features
 - **vbmeta patching**: Disable dm-verity and AVB verification
 - **Custom AVB signing**: Re-sign with your own keys
 - Key generation (RSA-2048/4096/8192)
@@ -66,7 +106,14 @@
 
 ## 📥 Installation
 
-### Prerequisites
+### 🎯 Portable EXE (Windows - Easiest)
+
+Download the pre-built executable from [Releases](https://github.com/vehoelite/image-anarchy/releases):
+- **No Python installation required**
+- **No dependencies to install**
+- Just download and run!
+
+### Prerequisites (Python Version)
 - Python 3.9 or higher
 - pip (Python package manager)
 
@@ -123,11 +170,12 @@ cryptography>=40.0.0  # Optional: for AVB key signing
 python image_anarchy.py
 ```
 
-The GUI provides 4 tabs:
+The GUI provides 5 tabs:
 1. **📦 Extract** - Extract partitions from payload.bin
 2. **🔧 Repack** - Create new payload.bin from images
 3. **🔍 Image Extract** - Analyze and extract Android images
 4. **🔨 Image Repack** - Create boot, sparse, vbmeta images
+5. **🔄 Recovery Porter** - Port/modify custom recoveries
 
 ### CLI Mode
 
@@ -219,6 +267,49 @@ python image_anarchy.py --extract payload.bin -i boot
 # Results in smaller file that flashes faster via fastboot
 ```
 
+### Analyze ABL (Android Bootloader)
+
+```bash
+# ABL is critical for LG devices (LAF mode), unlock verification, and fastboot
+# GUI: Image Extract tab
+# 1. Load abl.img
+# 2. Click Analyze - shows:
+#    - Unlock status checks (device locked/unlocked detection)
+#    - Secure boot references
+#    - AVB verification calls
+#    - Anti-rollback fuse reads
+#    - LG-specific LAF mode (if LG device)
+#    - Fastboot command handlers
+# 3. Extract to get:
+#    - abl_analysis_report.txt (detailed analysis)
+#    - ELF segments
+
+# Useful for:
+# - Understanding how your bootloader checks unlock status
+# - Finding LAF mode entry points on LG devices
+# - Researching anti-rollback protection
+# - Educational reverse engineering
+```
+
+### Port TWRP to Another Device
+
+```bash
+# GUI: Recovery Porter tab
+# 1. Load source TWRP recovery.img (working on similar device)
+# 2. Click "Analyze" to see recovery structure
+# 3. Replace kernel with target device's kernel
+#    - Get kernel from your device's boot.img
+# 4. Replace DTB if needed (device tree for hardware)
+# 5. Click "Extract All" to extract ramdisk
+# 6. Edit fstab to match target device partitions:
+#    - /dev/block/bootdevice/by-name/system -> your device path
+#    - Update partition names and filesystem types
+# 7. Set output path and click "Build Recovery"
+# 8. Flash: fastboot flash recovery recovery_ported.img
+
+# Recovery Porter detects: TWRP, OrangeFox, SHRP, PitchBlack, LineageOS
+```
+
 ---
 
 ## 🏗️ Project Structure
@@ -233,6 +324,76 @@ image-anarchy/
 ```
 
 The entire application is contained in a single Python file with embedded protobuf definitions - no external proto files needed!
+
+---
+
+## ✅ Tested On
+
+### OTA Payloads
+- Google Pixel 6/7/8/9 (Tensor)
+- Samsung Galaxy S series (Snapdragon)
+- OnePlus devices
+- Xiaomi/Redmi devices
+- Nothing Phone
+- Motorola devices
+
+### Boot Image Versions
+- v0-v2: Legacy devices
+- v3: Android 11+ GKI
+- v4: Android 12+ GKI (Pixel 6+)
+
+### Recovery Images
+- TWRP 3.x
+- OrangeFox
+- SHRP (Skyhawk)
+- PitchBlack
+- LineageOS Recovery
+
+*If you test on other devices, let us know!*
+
+---
+
+## 📋 Changelog
+
+### v1.0 (January 2026)
+- 🎉 Initial public release
+- ✅ Full payload.bin extraction and creation
+- ✅ Boot image v0-v4 support (including Pixel GKI)
+- ✅ Vendor boot image support
+- ✅ Super partition extraction
+- ✅ vbmeta parsing, patching, and custom key signing
+- ✅ DTBO image extraction (device tree overlays)
+- ✅ ABL analysis for Qualcomm, Pixel/Tensor, LG devices
+- ✅ Recovery Porter for TWRP, OrangeFox, etc.
+- ✅ ext4 and FAT filesystem extraction
+- ✅ Modern PyQt6 dark-themed GUI
+- ✅ Windows portable EXE
+
+---
+
+## 🗺️ Roadmap
+
+### Planned for v1.x
+- [ ] EROFS filesystem extraction
+- [ ] F2FS filesystem support
+- [ ] Device tree decompiler (DTB → DTS)
+- [ ] Batch processing mode
+- [ ] Drag & drop folders
+
+### Planned for v2.0
+- [ ] Magisk-style boot patching (root)
+- [ ] build.prop editor
+- [ ] init.rc script editor
+- [ ] Partition size calculator
+- [ ] OTA diff viewer
+- [ ] Multi-language support
+
+### Future Ideas
+- [ ] OTA generator (create OTA from two builds)
+- [ ] A/B slot switcher
+- [ ] Fastboot integration
+- [ ] ADB sideload support
+- [ ] Plugin system for custom extractors
 
 ---
 
