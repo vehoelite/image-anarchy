@@ -379,6 +379,7 @@ The entire application is contained in a single Python file with embedded protob
 - [ ] Device tree decompiler (DTB → DTS)
 - [ ] Batch processing mode
 - [ ] Drag & drop folders
+- [ ] Bootloader exploit/unlocks
 
 ### Planned for v2.0
 - [ ] Magisk-style boot patching (root)
@@ -386,6 +387,7 @@ The entire application is contained in a single Python file with embedded protob
 - [ ] init.rc script editor
 - [ ] Partition size calculator
 - [ ] OTA diff viewer
+- [ ] Bootloader Replacement **
 - [ ] Multi-language support
 
 ### Future Ideas
@@ -394,6 +396,8 @@ The entire application is contained in a single Python file with embedded protob
 - [ ] Fastboot integration
 - [ ] ADB sideload support
 - [ ] Plugin system for custom extractors
+- [ ] Recovery maker and framework
+- [ ] Kernel Maker
 
 ---
 
