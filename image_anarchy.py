@@ -65,7 +65,7 @@ import urllib.parse
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable, Optional
+from typing import Any, BinaryIO, Callable, Dict, List, Optional
 
 # Third-party imports
 import brotli
@@ -78,9 +78,9 @@ from google.protobuf.internal import builder as _builder
 
 # Cryptography imports for AVB signing
 try:
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa, padding
-    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives import hashes, serialization  # type: ignore
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding  # type: ignore
+    from cryptography.hazmat.backends import default_backend  # type: ignore
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
@@ -88,7 +88,7 @@ except ImportError:
 try:
     import lzma
 except ImportError:
-    from backports import lzma
+    from backports import lzma  # type: ignore
 
 # =============================================================================
 # EMBEDDED PROTOBUF DEFINITIONS
@@ -4791,7 +4791,7 @@ class RamdiskPacker:
                 compressed = gzip.compress(cpio_data)
             elif compression == 'lz4':
                 try:
-                    import lz4.frame
+                    import lz4.frame  # type: ignore
                     compressed = lz4.frame.compress(cpio_data)
                 except ImportError:
                     logger.warning("lz4 not available, using gzip")
@@ -5170,12 +5170,12 @@ class RecoveryPorter:
             return gzip.decompress(data)
         elif data[:4] == b'\x04\x22\x4d\x18':  # lz4
             try:
-                import lz4.frame
+                import lz4.frame  # type: ignore
                 return lz4.frame.decompress(data)
             except ImportError:
                 # Try legacy lz4
                 try:
-                    import lz4.block
+                    import lz4.block  # type: ignore
                     return lz4.block.decompress(data)
                 except:
                     return None
@@ -6351,9 +6351,12 @@ class AndroidImageExtractor:
             analysis = analyzer.analyze()
             report_path = analyzer.write_report()
             
-            # Also extract ELF segments
-            elf_extractor = ElfExtractor(path, output_dir, self.progress_callback)
-            elf_extractor.extract()
+            # Also extract ELF segments if it's an ELF file
+            segments_count = 0
+            if analysis.get('is_elf', False):
+                elf_extractor = ElfImageExtractor(path, output_dir, self.progress_callback)
+                elf_extractor.extract()
+                segments_count = len(elf_extractor.segments)
             
             return {
                 'type': 'abl',
@@ -6362,7 +6365,7 @@ class AndroidImageExtractor:
                 'summary': analyzer.get_summary(),
                 'is_lg': analyzer.is_lg_device(),
                 'unlock_checks': len(analysis.get('unlock_checks', [])),
-                'segments': len(elf_extractor.segments),
+                'segments': segments_count,
             }
         
         elif img_type == 'vbmeta':
@@ -6759,7 +6762,7 @@ def create_gui_app():
             if urls:
                 self.setText(urls[0].toLocalFile())
 
-    class PayloadDumperGUI(QMainWindow):
+    class ImageAnarchyGUI(QMainWindow):
         """Main application window."""
         
         STYLESHEET = """
@@ -9593,7 +9596,7 @@ def create_gui_app():
             self.log.emit(f"Copied to: {dst_path}")
             self.progress.emit(1, 1, "Copy complete")
 
-    return QApplication, PayloadDumperGUI, QPalette, QColor
+    return QApplication, ImageAnarchyGUI, QPalette, QColor
 
 
 # =============================================================================
@@ -9895,14 +9898,14 @@ Examples:
     else:
         # GUI mode
         try:
-            QApplication, PayloadDumperGUI, QPalette, QColor = create_gui_app()
+            QApplication, ImageAnarchyGUI, QPalette, QColor = create_gui_app()
         except ImportError:
             print("PyQt6 is required for GUI mode. Install with: pip install PyQt6")
             print("Or use CLI mode: python image_anarchy.py --cli payload.bin")
             sys.exit(1)
         
         app = QApplication(sys.argv)
-        app.setApplicationName("OTA Payload Dumper")
+        app.setApplicationName("Image Anarchy")
         app.setStyle("Fusion")
         
         # Dark palette
@@ -9918,7 +9921,7 @@ Examples:
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
         app.setPalette(palette)
         
-        window = PayloadDumperGUI()
+        window = ImageAnarchyGUI()
         window.show()
         
         sys.exit(app.exec())
