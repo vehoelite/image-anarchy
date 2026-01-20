@@ -413,11 +413,12 @@ Contributions are welcome! Feel free to:
 
 ## ⚠️ Disclaimer
 
-This tool is provided for **educational and development purposes**. 
+This tool is provided for **educational and development/repair purposes**. 
 
 - Modifying device images may void your warranty
 - Always backup your data before flashing modified images
 - Disabling AVB/dm-verity reduces device security
+- Always follow your state and federal laws 
 - Use at your own risk
 
 ---
