@@ -418,7 +418,15 @@ This tool is provided for **educational and development purposes**.
 
 ---
 
-## 📜 License
+## � Support
+
+If this tool saved you time, consider supporting development:
+
+**Bitcoin:** `bc1qx5kp5sx67qe2fd32h6ne7jvw6xpzy2xhnph0rs`
+
+---
+
+## �📜 License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
