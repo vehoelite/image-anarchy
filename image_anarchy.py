@@ -12,13 +12,13 @@ Features:
 - CREATE: Repack partition images into a new payload.bin  
 - IMAGE EXTRACT: Analyze and extract Android image formats:
   * Sparse images → Raw images
-  * Boot/vendor_boot images → kernel, ramdisk, DTB
+  * Boot/recovery/vendor_boot images → kernel, ramdisk, DTB
   * Super (dynamic partition) images → individual partition images
   * vbmeta patching (disable verity/verification) with optional re-signing
   * ext4/FAT filesystem extraction
   * ELF/bootloader analysis
 - IMAGE REPACK: Create Android images from components:
-  * Boot/vendor_boot images (v0-v4)
+  * Boot/recovery/vendor_boot images (v0-v4)
   * Sparse images from raw
   * vbmeta images (disabled AVB)
   * Ramdisk from directory
@@ -698,6 +698,7 @@ QCOM_MBN_MAGIC_2 = 0x00000007  # Qualcomm MBN format (type 7)
 QCOM_ELF_MAGIC = b'\x7fELF'  # Qualcomm signed ELF (XBL, ABL, etc.)
 MTK_LOGO_MAGIC = b'LOGO'  # MediaTek logo partition
 GZIP_MAGIC = b'\x1f\x8b'  # Gzip compressed
+DTBO_MAGIC = 0xD7B7AB1E  # DTBO table magic (Android Device Tree Blob Overlay)
 
 
 @dataclass
@@ -825,7 +826,12 @@ def detect_image_type(file_path: str) -> str:
                 # ARM=40, AArch64=183, Hexagon=164
                 # Check file name hints for bootloader
                 filename = Path(file_path).stem.lower()
-                bootloader_names = ['xbl', 'abl', 'hyp', 'tz', 'tzsq', 'devcfg', 'aop', 
+                
+                # ABL is special - return specific type for deeper analysis
+                if 'abl' in filename:
+                    return 'abl'
+                
+                bootloader_names = ['xbl', 'hyp', 'tz', 'tzsq', 'devcfg', 'aop', 
                                     'keymaster', 'cmnlib', 'qupfw', 'storsec', 'uefi',
                                     'lk', 'preloader', 'sbl1', 'rpm', 'pmic']
                 if any(bl in filename for bl in bootloader_names):
@@ -835,6 +841,12 @@ def detect_image_type(file_path: str) -> str:
     # Check for AVB vbmeta (Android Verified Boot)
     if header[:4] == AVB_MAGIC:
         return 'vbmeta'
+    
+    # Check for DTBO (Device Tree Blob Overlay) image
+    if len(header) >= 4:
+        dtbo_magic = struct.unpack('>I', header[:4])[0]  # Big endian!
+        if dtbo_magic == DTBO_MAGIC:
+            return 'dtbo'
     
     # Check for Little Kernel bootloader (MediaTek)
     if header[:8] == LK_MAGIC:
@@ -849,6 +861,12 @@ def detect_image_type(file_path: str) -> str:
             flash_parti_ver = struct.unpack('<I', header[4:8])[0]
             if flash_parti_ver in (3, 4, 5, 6, 7):  # Known versions
                 return 'bootloader'
+    
+    # Check filename for ABL even if not ELF (Pixel/Tensor, Samsung Exynos)
+    # These devices use signed binary blobs instead of ELF
+    filename = Path(file_path).stem.lower()
+    if 'abl' in filename or filename in ['bl1', 'bl2', 'bl31']:
+        return 'abl'
     
     return 'raw'
 
@@ -950,7 +968,15 @@ class SparseImageConverter:
 
 
 class BootImageExtractor:
-    """Extract components from Android boot images."""
+    """Extract components from Android boot/recovery images.
+    
+    Supports:
+    - boot.img (v0-v4)
+    - recovery.img (same format as boot.img)
+    - vendor_boot.img (v3-v4)
+    
+    Extracts: kernel, ramdisk, DTB, second bootloader, recovery_dtbo
+    """
     
     def __init__(self, progress_callback: Optional[callable] = None):
         self.progress_callback = progress_callback
@@ -1889,6 +1915,825 @@ class ElfImageExtractor:
                 self.progress_callback(progress)
         
         logger.info(f"Extracted {extracted} segments from ELF file")
+
+
+class AblAnalyzer:
+    """Analyze and patch Android Bootloader (ABL) images.
+    
+    ABL (abl.img) is critical for device boot, especially on:
+    - LG devices (LAF mode, unlock verification, device checks)
+    - Qualcomm devices (fastboot, AVB verification, anti-rollback)
+    
+    This class provides:
+    - Deep analysis of ABL structure and embedded strings
+    - Detection of unlock status checks
+    - Detection of anti-rollback fuses
+    - LG-specific LAF mode detection
+    - Optional patching capabilities (DANGEROUS - can brick device!)
+    
+    EDUCATIONAL NOTES:
+    ==================
+    ABL is an ELF binary that runs on the Application Processor (AP).
+    It's responsible for:
+    1. Initializing hardware after XBL (eXtensible Bootloader)
+    2. Implementing fastboot protocol
+    3. Verifying boot/recovery images (AVB)
+    4. Checking bootloader unlock status
+    5. Loading and booting the kernel
+    
+    On LG devices, ABL also handles:
+    - LAF (Download) mode entry
+    - Device unlock token verification
+    - IMEI/device binding checks
+    
+    Common ABL strings to look for:
+    - "device is UNLOCKED" / "device is LOCKED"
+    - "Orange State" / "Red State" / "Green State"
+    - "Press VOLUME UP to continue"
+    - "Start fastboot mode"
+    - "SECURE BOOT"
+    - "anti-rollback"
+    
+    WARNING: Patching ABL incorrectly WILL brick your device!
+    Always have a backup and understand what you're doing.
+    """
+    
+    # Known ABL string patterns for various checks
+    UNLOCK_PATTERNS = [
+        b'device is UNLOCKED',
+        b'device is LOCKED',
+        b'DEVICE_UNLOCKED',
+        b'DEVICE_LOCKED',
+        b'unlock_status',
+        b'is_unlocked',
+        b'get_unlock_state',
+        b'verify_unlock',
+        b'oem_unlock',
+        b'UNLOCK=',
+        b'LOCK=',
+        b'unlock_ability',
+        b'unlockable',
+        b'unlock_allowed',
+    ]
+    
+    SECURE_BOOT_PATTERNS = [
+        b'SECURE BOOT',
+        b'secure boot',
+        b'secureboot',
+        b'is_secure_boot',
+        b'secure_boot_enabled',
+        b'verify_secure_boot',
+        b'verified boot',
+        b'VERIFIED BOOT',
+    ]
+    
+    AVB_PATTERNS = [
+        b'avb_',
+        b'AVB_',
+        b'vbmeta',
+        b'dm-verity',
+        b'verify_vbmeta',
+        b'avb_verify',
+        b'verify_boot',
+        b'android_verify_boot',
+        b'AVB0',
+        b'AvbFooter',
+        b'AvbVBMeta',
+    ]
+    
+    ANTI_ROLLBACK_PATTERNS = [
+        b'anti-rollback',
+        b'anti_rollback',
+        b'rollback_index',
+        b'ROLLBACK',
+        b'fuse_read',
+        b'fuse_write',
+        b'qfprom',
+        b'QFPROM',
+        b'otp_read',
+        b'efuse',
+        b'EFUSE',
+    ]
+    
+    # Google Pixel / Tensor specific patterns
+    PIXEL_PATTERNS = [
+        b'Pixel',
+        b'pixel',
+        b'GOOGLE',
+        b'google',
+        b'Tensor',
+        b'tensor',
+        b'gs101',  # Tensor G1
+        b'gs201',  # Tensor G2
+        b'gs301',  # Tensor G3
+        b'zuma',   # Tensor G3 codename
+        b'slider', # Pixel 6 codename
+        b'cloudripper',  # Pixel 6 Pro codename
+        b'oriole',  # Pixel 6 codename
+        b'raven',   # Pixel 6 Pro codename
+        b'bluejay', # Pixel 6a codename
+        b'panther', # Pixel 7 codename
+        b'cheetah', # Pixel 7 Pro codename
+        b'lynx',    # Pixel 7a codename
+        b'tangorpro', # Pixel Tablet codename
+        b'felix',   # Pixel Fold codename
+        b'shiba',   # Pixel 8 codename
+        b'husky',   # Pixel 8 Pro codename
+        b'akita',   # Pixel 8a codename
+        b'tokay',   # Pixel 9 codename
+        b'caiman',  # Pixel 9 Pro codename
+        b'komodo',  # Pixel 9 Pro XL codename
+        b'comet',   # Pixel 9 Pro Fold codename
+        b'trusty',
+        b'BL31',
+        b'BL2',
+    ]
+    
+    LG_PATTERNS = [
+        b'LAF',
+        b'laf_mode',
+        b'download_mode',
+        b'LG_UNLOCK',
+        b'lg_unlock',
+        b'device_unlock_token',
+        b'LGUP',
+        b'kdz',
+        b'KDZ',
+    ]
+    
+    FASTBOOT_PATTERNS = [
+        b'fastboot',
+        b'FASTBOOT',
+        b'getvar:',
+        b'oem ',
+        b'flash:',
+        b'boot:',
+        b'reboot',
+        b'continue',
+        b'flashing unlock',
+        b'flashing lock',
+    ]
+    
+    WARNING_PATTERNS = [
+        b'Orange State',
+        b'Red State',
+        b'Yellow State',
+        b'green state',
+        b'warranty void',
+        b'WARRANTY VOID',
+        b'tampered',
+        b'TAMPERED',
+        b'PRESS VOLUME',
+        b'Press Volume',
+    ]
+    
+    def __init__(self, input_path: str, output_dir: str = None,
+                 progress_callback: Optional[Callable[[int], None]] = None):
+        self.input_path = Path(input_path)
+        self.output_dir = Path(output_dir) if output_dir else self.input_path.parent / 'abl_analysis'
+        self.progress_callback = progress_callback
+        self.data = None
+        self.analysis = {}
+        
+    def analyze(self) -> dict:
+        """Perform comprehensive ABL analysis."""
+        logger.info(f"Analyzing ABL: {self.input_path.name}")
+        
+        with open(self.input_path, 'rb') as f:
+            self.data = f.read()
+        
+        # Detect format
+        is_elf = self.data[:4] == ELF_MAGIC
+        is_signed_blob = False
+        format_type = 'Unknown'
+        
+        if is_elf:
+            format_type = 'ELF (Qualcomm)'
+            is_64bit = len(self.data) > 4 and self.data[4] == 2
+        else:
+            # Check for common Pixel/Tensor/Exynos signatures
+            # These are typically ARM Trusted Firmware (ATF) or signed blobs
+            is_64bit = False  # Can't easily determine from blob
+            
+            # Check for certificate/signature headers (common in signed bootloaders)
+            if self.data[:2] == b'\x30\x82':  # ASN.1 DER sequence (certificate)
+                format_type = 'Signed Binary (Certificate Header)'
+                is_signed_blob = True
+            elif b'CERT' in self.data[:256] or b'RSA' in self.data[:256]:
+                format_type = 'Signed Binary'
+                is_signed_blob = True
+            elif self.data[:4] == b'\x00\x00\xa0\xe1':  # ARM NOP instruction
+                format_type = 'ARM Binary (Raw)'
+            elif self.data[:4] == b'\xd5\x03\x20\x1f':  # AArch64 NOP
+                format_type = 'AArch64 Binary (Raw)'
+                is_64bit = True
+            else:
+                format_type = 'Binary Blob (Pixel/Tensor/Exynos format)'
+        
+        self.analysis = {
+            'file': str(self.input_path),
+            'size': len(self.data),
+            'is_elf': is_elf,
+            'is_64bit': is_64bit,
+            'format': format_type,
+            'is_signed_blob': is_signed_blob,
+            'unlock_checks': [],
+            'secure_boot': [],
+            'avb_references': [],
+            'anti_rollback': [],
+            'lg_specific': [],
+            'pixel_specific': [],
+            'fastboot_commands': [],
+            'warning_messages': [],
+            'interesting_strings': [],
+            'potential_patches': [],
+        }
+        
+        if self.progress_callback:
+            self.progress_callback(10)
+        
+        # Search for patterns
+        self._find_patterns('unlock_checks', self.UNLOCK_PATTERNS)
+        if self.progress_callback:
+            self.progress_callback(20)
+            
+        self._find_patterns('secure_boot', self.SECURE_BOOT_PATTERNS)
+        self._find_patterns('avb_references', self.AVB_PATTERNS)
+        if self.progress_callback:
+            self.progress_callback(35)
+            
+        self._find_patterns('anti_rollback', self.ANTI_ROLLBACK_PATTERNS)
+        self._find_patterns('lg_specific', self.LG_PATTERNS)
+        self._find_patterns('pixel_specific', self.PIXEL_PATTERNS)
+        if self.progress_callback:
+            self.progress_callback(50)
+            
+        self._find_patterns('fastboot_commands', self.FASTBOOT_PATTERNS)
+        self._find_patterns('warning_messages', self.WARNING_PATTERNS)
+        if self.progress_callback:
+            self.progress_callback(65)
+        
+        # Find all printable strings (useful for further analysis)
+        self._extract_interesting_strings()
+        if self.progress_callback:
+            self.progress_callback(80)
+        
+        # Identify potential patch points
+        self._identify_patch_points()
+        if self.progress_callback:
+            self.progress_callback(100)
+        
+        return self.analysis
+    
+    def _find_patterns(self, category: str, patterns: list):
+        """Search for byte patterns in the data."""
+        for pattern in patterns:
+            offset = 0
+            while True:
+                pos = self.data.find(pattern, offset)
+                if pos == -1:
+                    break
+                
+                # Get surrounding context
+                context_start = max(0, pos - 20)
+                context_end = min(len(self.data), pos + len(pattern) + 20)
+                context = self.data[context_start:context_end]
+                
+                # Clean up context for display
+                try:
+                    context_str = context.decode('utf-8', errors='replace')
+                    context_str = ''.join(c if c.isprintable() or c in '\n\r\t' else '.' for c in context_str)
+                except:
+                    context_str = repr(context)
+                
+                self.analysis[category].append({
+                    'pattern': pattern.decode('utf-8', errors='replace'),
+                    'offset': pos,
+                    'hex_offset': f'0x{pos:08X}',
+                    'context': context_str.strip(),
+                })
+                
+                offset = pos + 1
+    
+    def _extract_interesting_strings(self):
+        """Extract printable strings from ABL (like 'strings' command)."""
+        min_length = 6
+        strings = []
+        current = b''
+        start_offset = 0
+        
+        for i, byte in enumerate(self.data):
+            if 32 <= byte <= 126:  # Printable ASCII
+                if not current:
+                    start_offset = i
+                current += bytes([byte])
+            else:
+                if len(current) >= min_length:
+                    try:
+                        s = current.decode('ascii')
+                        # Filter for interesting strings
+                        if any(keyword in s.lower() for keyword in 
+                               ['boot', 'unlock', 'lock', 'verify', 'secure', 'fuse', 
+                                'avb', 'rollback', 'fastboot', 'oem', 'flash', 'error',
+                                'failed', 'success', 'invalid', 'tamper', 'lg', 'laf']):
+                            strings.append({
+                                'string': s,
+                                'offset': start_offset,
+                                'hex_offset': f'0x{start_offset:08X}',
+                            })
+                    except:
+                        pass
+                current = b''
+        
+        # Deduplicate and limit
+        seen = set()
+        unique_strings = []
+        for s in strings:
+            if s['string'] not in seen:
+                seen.add(s['string'])
+                unique_strings.append(s)
+        
+        self.analysis['interesting_strings'] = unique_strings[:200]  # Limit to 200
+    
+    def _identify_patch_points(self):
+        """Identify potential patch points (for educational purposes)."""
+        patches = []
+        
+        # Common unlock bypass patterns
+        # These are for EDUCATIONAL/RESEARCH purposes only
+        
+        # Pattern: Function returning lock status (return 0 vs return 1)
+        # Often: mov w0, #1 (locked) can be changed to mov w0, #0 (unlocked)
+        # ARM64: 20 00 80 52 (mov w0, #1) -> 00 00 80 52 (mov w0, #0)
+        
+        if self.analysis['is_64bit']:
+            # ARM64 patterns
+            mov_w0_1 = b'\x20\x00\x80\x52'  # mov w0, #1
+            mov_w0_0 = b'\x00\x00\x80\x52'  # mov w0, #0
+            
+            for match in self.analysis['unlock_checks']:
+                offset = match['offset']
+                # Search nearby for the return instruction
+                search_start = max(0, offset - 100)
+                search_end = min(len(self.data), offset + 100)
+                nearby = self.data[search_start:search_end]
+                
+                pos = nearby.find(mov_w0_1)
+                if pos != -1:
+                    patches.append({
+                        'type': 'unlock_bypass_candidate',
+                        'description': f"Potential unlock check near '{match['pattern']}'",
+                        'offset': search_start + pos,
+                        'hex_offset': f'0x{search_start + pos:08X}',
+                        'original': mov_w0_1.hex(),
+                        'patched': mov_w0_0.hex(),
+                        'warning': 'DANGEROUS: Incorrect patching will brick device!',
+                    })
+        
+        # Look for conditional branches after security checks
+        for match in self.analysis['secure_boot']:
+            patches.append({
+                'type': 'secure_boot_check',
+                'description': f"Secure boot check at '{match['pattern']}'",
+                'offset': match['offset'],
+                'hex_offset': match['hex_offset'],
+                'warning': 'Research only - modifying secure boot checks is extremely risky',
+            })
+        
+        self.analysis['potential_patches'] = patches
+    
+    def write_report(self) -> str:
+        """Write detailed analysis report to file."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = self.output_dir / 'abl_analysis_report.txt'
+        
+        with open(report_path, 'w') as f:
+            f.write("=" * 70 + "\n")
+            f.write("ABL (Android Bootloader) Analysis Report\n")
+            f.write("Generated by Image Anarchy\n")
+            f.write("=" * 70 + "\n\n")
+            
+            f.write(f"File: {self.analysis['file']}\n")
+            f.write(f"Size: {self.analysis['size']} bytes ({self.analysis['size'] / 1024:.2f} KB)\n")
+            f.write(f"Format: {self.analysis.get('format', 'Unknown')}\n")
+            if self.analysis.get('is_elf'):
+                f.write(f"ELF Class: {'64-bit' if self.analysis['is_64bit'] else '32-bit'}\n")
+            f.write("\n")
+            
+            # Device detection
+            if self.is_pixel_device():
+                f.write("📱 GOOGLE PIXEL / TENSOR DEVICE DETECTED\n")
+                f.write("-" * 70 + "\n")
+                f.write("This ABL is from a Google Pixel device with Tensor chip.\n")
+                f.write("Pixel ABL uses signed binary format (not ELF like Qualcomm).\n")
+                f.write("Pattern matches: " + ", ".join(set(
+                    m['pattern'] for m in self.analysis['pixel_specific'][:10]
+                )) + "\n")
+                f.write("\n")
+            
+            if self.is_lg_device():
+                f.write("⚡ LG DEVICE DETECTED\n")
+                f.write("-" * 70 + "\n")
+                f.write("This ABL is from an LG device with LAF mode support.\n\n")
+            
+            # Unlock checks
+            f.write("-" * 70 + "\n")
+            f.write("UNLOCK STATUS CHECKS\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['unlock_checks']:
+                for item in self.analysis['unlock_checks']:
+                    f.write(f"\n  Pattern: {item['pattern']}\n")
+                    f.write(f"  Offset:  {item['hex_offset']}\n")
+                    f.write(f"  Context: {item['context']}\n")
+            else:
+                f.write("  None found\n")
+            f.write("\n")
+            
+            # Secure boot
+            f.write("-" * 70 + "\n")
+            f.write("SECURE BOOT REFERENCES\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['secure_boot']:
+                for item in self.analysis['secure_boot']:
+                    f.write(f"\n  Pattern: {item['pattern']}\n")
+                    f.write(f"  Offset:  {item['hex_offset']}\n")
+            else:
+                f.write("  None found\n")
+            f.write("\n")
+            
+            # AVB references
+            f.write("-" * 70 + "\n")
+            f.write("AVB (Android Verified Boot) REFERENCES\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['avb_references']:
+                for item in self.analysis['avb_references'][:20]:  # Limit output
+                    f.write(f"\n  Pattern: {item['pattern']}\n")
+                    f.write(f"  Offset:  {item['hex_offset']}\n")
+                f.write(f"\n  Total: {len(self.analysis['avb_references'])} references\n")
+            else:
+                f.write("  None found\n")
+            f.write("\n")
+            
+            # Anti-rollback
+            f.write("-" * 70 + "\n")
+            f.write("ANTI-ROLLBACK REFERENCES\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['anti_rollback']:
+                for item in self.analysis['anti_rollback']:
+                    f.write(f"\n  Pattern: {item['pattern']}\n")
+                    f.write(f"  Offset:  {item['hex_offset']}\n")
+            else:
+                f.write("  None found\n")
+            f.write("\n")
+            
+            # LG specific
+            f.write("-" * 70 + "\n")
+            f.write("LG DEVICE SPECIFIC\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['lg_specific']:
+                for item in self.analysis['lg_specific']:
+                    f.write(f"\n  Pattern: {item['pattern']}\n")
+                    f.write(f"  Offset:  {item['hex_offset']}\n")
+                    f.write(f"  Context: {item['context']}\n")
+            else:
+                f.write("  None found (not an LG device or no LG-specific code)\n")
+            f.write("\n")
+            
+            # Fastboot commands
+            f.write("-" * 70 + "\n")
+            f.write("FASTBOOT COMMANDS\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['fastboot_commands']:
+                for item in self.analysis['fastboot_commands'][:30]:
+                    f.write(f"  {item['hex_offset']}: {item['pattern']}\n")
+            else:
+                f.write("  None found\n")
+            f.write("\n")
+            
+            # Warning messages
+            f.write("-" * 70 + "\n")
+            f.write("WARNING/STATE MESSAGES\n")
+            f.write("-" * 70 + "\n")
+            if self.analysis['warning_messages']:
+                for item in self.analysis['warning_messages']:
+                    f.write(f"\n  Pattern: {item['pattern']}\n")
+                    f.write(f"  Offset:  {item['hex_offset']}\n")
+                    f.write(f"  Context: {item['context']}\n")
+            else:
+                f.write("  None found\n")
+            f.write("\n")
+            
+            # Potential patches (educational)
+            if self.analysis['potential_patches']:
+                f.write("-" * 70 + "\n")
+                f.write("POTENTIAL PATCH POINTS (EDUCATIONAL/RESEARCH ONLY)\n")
+                f.write("-" * 70 + "\n")
+                f.write("\n⚠️  WARNING: DO NOT ATTEMPT PATCHING UNLESS YOU FULLY UNDERSTAND\n")
+                f.write("    THE RISKS. INCORRECT PATCHES WILL PERMANENTLY BRICK YOUR DEVICE!\n\n")
+                
+                for patch in self.analysis['potential_patches']:
+                    f.write(f"\n  Type: {patch['type']}\n")
+                    f.write(f"  Description: {patch['description']}\n")
+                    f.write(f"  Offset: {patch['hex_offset']}\n")
+                    if 'original' in patch:
+                        f.write(f"  Original bytes: {patch['original']}\n")
+                        f.write(f"  Patched bytes:  {patch['patched']}\n")
+                    f.write(f"  ⚠️  {patch['warning']}\n")
+            
+            # Interesting strings
+            f.write("\n" + "-" * 70 + "\n")
+            f.write("INTERESTING STRINGS (first 100)\n")
+            f.write("-" * 70 + "\n")
+            for item in self.analysis['interesting_strings'][:100]:
+                f.write(f"  {item['hex_offset']}: {item['string']}\n")
+        
+        logger.info(f"Wrote ABL analysis report to: {report_path}")
+        return str(report_path)
+    
+    def is_lg_device(self) -> bool:
+        """Check if this ABL is from an LG device."""
+        return len(self.analysis.get('lg_specific', [])) > 0
+    
+    def is_pixel_device(self) -> bool:
+        """Check if this ABL is from a Google Pixel device."""
+        return len(self.analysis.get('pixel_specific', [])) > 0
+    
+    def get_summary(self) -> str:
+        """Get a brief summary of the analysis."""
+        summary = []
+        summary.append(f"ABL Analysis: {self.input_path.name}")
+        summary.append(f"  Format: {self.analysis.get('format', 'Unknown')}")
+        summary.append(f"  Size: {self.analysis['size'] / 1024:.2f} KB")
+        summary.append(f"  Unlock checks found: {len(self.analysis['unlock_checks'])}")
+        summary.append(f"  Secure boot refs: {len(self.analysis['secure_boot'])}")
+        summary.append(f"  AVB references: {len(self.analysis['avb_references'])}")
+        summary.append(f"  Anti-rollback refs: {len(self.analysis['anti_rollback'])}")
+        summary.append(f"  Fastboot commands: {len(self.analysis['fastboot_commands'])}")
+        
+        if self.is_lg_device():
+            summary.append(f"  LG-specific: {len(self.analysis['lg_specific'])}")
+            summary.append("\n  ⚡ LG device detected - LAF mode references found")
+        
+        if self.is_pixel_device():
+            summary.append(f"  Pixel-specific: {len(self.analysis['pixel_specific'])}")
+            summary.append("\n  📱 Google Pixel/Tensor device detected")
+        
+        if not self.analysis.get('is_elf'):
+            summary.append("\n  ℹ️  Non-ELF format (Pixel/Tensor/Exynos signed binary)")
+        
+        return '\n'.join(summary)
+
+
+class DtboExtractor:
+    """Extract and parse Android DTBO (Device Tree Blob Overlay) images.
+    
+    DTBO images contain device tree overlays that are applied on top of the
+    base device tree (DTB). They allow OEMs to customize hardware descriptions
+    without modifying the main DTB.
+    
+    DTBO Image Format:
+    - Header (32 bytes):
+      - magic (4 bytes): 0xD7B7AB1E (big endian)
+      - total_size (4 bytes): Total file size
+      - header_size (4 bytes): Size of header
+      - dt_entry_size (4 bytes): Size of each entry
+      - dt_entry_count (4 bytes): Number of DT entries
+      - dt_entries_offset (4 bytes): Offset to entries
+      - page_size (4 bytes): Page size (typically 4096)
+      - version (4 bytes): DTBO version
+    - DT Entries (32 bytes each):
+      - dt_size (4 bytes): Size of this overlay
+      - dt_offset (4 bytes): Offset to overlay data
+      - id (4 bytes): Identifier
+      - rev (4 bytes): Revision
+      - custom[4] (16 bytes): Custom data
+    - DT Overlay Data: FDT (Flattened Device Tree) blobs
+    """
+    
+    DTBO_MAGIC = 0xD7B7AB1E
+    HEADER_SIZE = 32
+    ENTRY_SIZE = 32
+    FDT_MAGIC = 0xD00DFEED  # Device Tree magic
+    
+    def __init__(self, progress_callback: Optional[callable] = None):
+        self.progress_callback = progress_callback
+        self.header = {}
+        self.entries = []
+    
+    def analyze(self, file_path: str) -> Dict[str, Any]:
+        """Analyze DTBO image and return metadata."""
+        result = {
+            'format': 'dtbo',
+            'valid': False,
+            'version': 0,
+            'entry_count': 0,
+            'page_size': 0,
+            'total_size': 0,
+            'entries': []
+        }
+        
+        try:
+            with open(file_path, 'rb') as f:
+                # Read header (32 bytes, all big endian)
+                header_data = f.read(32)
+                if len(header_data) < 32:
+                    return result
+                
+                magic = struct.unpack('>I', header_data[0:4])[0]
+                if magic != self.DTBO_MAGIC:
+                    return result
+                
+                total_size = struct.unpack('>I', header_data[4:8])[0]
+                header_size = struct.unpack('>I', header_data[8:12])[0]
+                dt_entry_size = struct.unpack('>I', header_data[12:16])[0]
+                dt_entry_count = struct.unpack('>I', header_data[16:20])[0]
+                dt_entries_offset = struct.unpack('>I', header_data[20:24])[0]
+                page_size = struct.unpack('>I', header_data[24:28])[0]
+                version = struct.unpack('>I', header_data[28:32])[0]
+                
+                self.header = {
+                    'magic': magic,
+                    'total_size': total_size,
+                    'header_size': header_size,
+                    'dt_entry_size': dt_entry_size,
+                    'dt_entry_count': dt_entry_count,
+                    'dt_entries_offset': dt_entries_offset,
+                    'page_size': page_size,
+                    'version': version
+                }
+                
+                result['valid'] = True
+                result['version'] = version
+                result['entry_count'] = dt_entry_count
+                result['page_size'] = page_size
+                result['total_size'] = total_size
+                result['header_size'] = header_size
+                
+                # Read entries
+                f.seek(dt_entries_offset)
+                entries = []
+                for i in range(dt_entry_count):
+                    entry_data = f.read(dt_entry_size)
+                    if len(entry_data) < 32:
+                        break
+                    
+                    dt_size = struct.unpack('>I', entry_data[0:4])[0]
+                    dt_offset = struct.unpack('>I', entry_data[4:8])[0]
+                    dt_id = struct.unpack('>I', entry_data[8:12])[0]
+                    dt_rev = struct.unpack('>I', entry_data[12:16])[0]
+                    custom = entry_data[16:32]
+                    
+                    # Try to identify overlay type from the FDT
+                    overlay_info = self._get_overlay_info(f, dt_offset, dt_size)
+                    
+                    entry = {
+                        'index': i,
+                        'size': dt_size,
+                        'offset': dt_offset,
+                        'id': dt_id,
+                        'rev': dt_rev,
+                        'custom': custom.hex(),
+                        'info': overlay_info
+                    }
+                    entries.append(entry)
+                
+                self.entries = entries
+                result['entries'] = entries
+                
+        except Exception as e:
+            logger.error(f"Error analyzing DTBO: {e}")
+        
+        return result
+    
+    def _get_overlay_info(self, f, offset: int, size: int) -> str:
+        """Try to extract overlay identification from FDT."""
+        try:
+            current_pos = f.tell()
+            f.seek(offset)
+            fdt_data = f.read(min(size, 256))  # Read first 256 bytes
+            f.seek(current_pos)
+            
+            # Check FDT magic
+            if len(fdt_data) >= 4:
+                fdt_magic = struct.unpack('>I', fdt_data[0:4])[0]
+                if fdt_magic == self.FDT_MAGIC:
+                    # Try to find compatible string
+                    try:
+                        # Search for 'compatible' property (rough search)
+                        compat_idx = fdt_data.find(b'compatible')
+                        if compat_idx > 0 and compat_idx < len(fdt_data) - 20:
+                            # Extract string after 'compatible'
+                            str_start = compat_idx + 11
+                            str_end = fdt_data.find(b'\x00', str_start)
+                            if str_end > str_start:
+                                return fdt_data[str_start:str_end].decode('utf-8', errors='ignore')
+                    except:
+                        pass
+                    return "Valid FDT overlay"
+            return "Unknown"
+        except:
+            return "Unknown"
+    
+    def extract(self, file_path: str, output_dir: str) -> List[str]:
+        """Extract all DT overlays from DTBO image."""
+        if not self.header:
+            self.analyze(file_path)
+        
+        if not self.entries:
+            logger.warning("No DTBO entries found")
+            return []
+        
+        os.makedirs(output_dir, exist_ok=True)
+        extracted = []
+        
+        try:
+            with open(file_path, 'rb') as f:
+                for i, entry in enumerate(self.entries):
+                    if self.progress_callback:
+                        self.progress_callback(i, len(self.entries), f"Extracting overlay {i+1}...")
+                    
+                    f.seek(entry['offset'])
+                    dt_data = f.read(entry['size'])
+                    
+                    # Name based on ID if available, otherwise index
+                    if entry['id'] != 0:
+                        out_name = f"dtbo_{entry['id']:08x}.dtbo"
+                    else:
+                        out_name = f"dtbo_{i:02d}.dtbo"
+                    
+                    out_path = os.path.join(output_dir, out_name)
+                    with open(out_path, 'wb') as f_out:
+                        f_out.write(dt_data)
+                    
+                    extracted.append(out_path)
+                    logger.info(f"Extracted: {out_name} ({entry['size']} bytes)")
+            
+            # Write info file
+            info_path = os.path.join(output_dir, 'dtbo_info.txt')
+            self._write_info(info_path)
+            extracted.append(info_path)
+            
+            if self.progress_callback:
+                self.progress_callback(len(self.entries), len(self.entries), "Complete")
+            
+        except Exception as e:
+            logger.error(f"Error extracting DTBO: {e}")
+        
+        return extracted
+    
+    def _write_info(self, info_path: str):
+        """Write DTBO information to text file."""
+        with open(info_path, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("DTBO (Device Tree Blob Overlay) Image Info\n")
+            f.write("=" * 60 + "\n\n")
+            
+            f.write("Header Information:\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"  Magic: 0x{self.header.get('magic', 0):08X}\n")
+            f.write(f"  Version: {self.header.get('version', 0)}\n")
+            f.write(f"  Total Size: {self.header.get('total_size', 0)} bytes\n")
+            f.write(f"  Header Size: {self.header.get('header_size', 0)} bytes\n")
+            f.write(f"  Page Size: {self.header.get('page_size', 0)}\n")
+            f.write(f"  Entry Count: {self.header.get('dt_entry_count', 0)}\n")
+            f.write(f"  Entry Size: {self.header.get('dt_entry_size', 0)} bytes\n")
+            f.write(f"  Entries Offset: 0x{self.header.get('dt_entries_offset', 0):X}\n")
+            f.write("\n")
+            
+            f.write("DT Overlay Entries:\n")
+            f.write("-" * 40 + "\n")
+            for entry in self.entries:
+                f.write(f"\n  Entry {entry['index']}:\n")
+                f.write(f"    Offset: 0x{entry['offset']:X}\n")
+                f.write(f"    Size: {entry['size']} bytes\n")
+                f.write(f"    ID: 0x{entry['id']:08X}\n")
+                f.write(f"    Rev: 0x{entry['rev']:08X}\n")
+                f.write(f"    Info: {entry['info']}\n")
+            
+            f.write("\n" + "=" * 60 + "\n")
+            f.write("Extracted by Image Anarchy - https://github.com/vehoelite/image-anarchy\n")
+    
+    def get_summary(self) -> str:
+        """Get human-readable summary of DTBO."""
+        if not self.header:
+            return "DTBO not analyzed"
+        
+        lines = [
+            f"📦 DTBO Image (Device Tree Blob Overlay)",
+            f"  Version: {self.header.get('version', 0)}",
+            f"  Overlays: {self.header.get('dt_entry_count', 0)}",
+            f"  Page Size: {self.header.get('page_size', 0)}",
+            f"  Total Size: {self.header.get('total_size', 0) / 1024:.1f} KB"
+        ]
+        
+        if self.entries:
+            lines.append(f"\n  Overlay Details:")
+            for entry in self.entries[:5]:  # Show first 5
+                lines.append(f"    [{entry['index']:02d}] ID=0x{entry['id']:08X} Size={entry['size']} {entry['info'][:30]}")
+            if len(self.entries) > 5:
+                lines.append(f"    ... and {len(self.entries) - 5} more overlays")
+        
+        return '\n'.join(lines)
 
 
 class VbmetaExtractor:
@@ -3191,13 +4036,16 @@ class VbmetaPatcher:
 # =============================================================================
 
 class BootImagePacker:
-    """Pack boot.img / vendor_boot.img from components.
+    """Pack boot.img / recovery.img / vendor_boot.img from components.
     
     Supports:
-    - Boot image v0-v4 formats
+    - Boot image v0-v4 formats (same format for recovery.img)
     - vendor_boot image v3-v4 formats
     - Custom kernel, ramdisk, DTB
     - Cmdline modification
+    
+    Note: boot.img and recovery.img use identical formats.
+    The difference is the ramdisk contents (boot vs recovery init).
     """
     
     BOOT_MAGIC = b'ANDROID!'
@@ -4083,6 +4931,572 @@ class RamdiskPacker:
         output.write(b'\x00' * pad)
 
 
+# =============================================================================
+# RECOVERY PORTER / MODIFIER
+# =============================================================================
+#
+# EDUCATIONAL NOTES: Understanding Android Recovery Partitions
+# ============================================================
+#
+# Recovery is a minimal Linux environment for system maintenance:
+# - Flashing OTA updates
+# - Factory reset (wipe data)
+# - Wipe cache
+# - ADB sideload
+# - Custom recoveries add: root, backups, custom ROMs
+#
+# RECOVERY IMAGE STRUCTURE (same as boot.img):
+# ┌──────────────────────────────────────┐
+# │ Header (v0-v4)                       │
+# │   - magic: "ANDROID!"                │
+# │   - kernel_size, kernel_addr         │
+# │   - ramdisk_size, ramdisk_addr       │
+# │   - cmdline, page_size, etc          │
+# ├──────────────────────────────────────┤
+# │ Kernel (zImage/Image.gz)             │
+# │   - Linux kernel for recovery mode   │
+# │   - Often same as boot kernel        │
+# ├──────────────────────────────────────┤
+# │ Ramdisk (cpio.gz)                    │
+# │   - Root filesystem                  │
+# │   - Contains recovery binary         │
+# │   - init scripts, fstab              │
+# ├──────────────────────────────────────┤
+# │ DTB (optional, v2+)                  │
+# │   - Device Tree Blob                 │
+# │   - Hardware description             │
+# └──────────────────────────────────────┘
+#
+# RAMDISK STRUCTURE (what's inside the cpio archive):
+# /
+# ├── init                    # First process (PID 1)
+# ├── init.rc                 # Init script - starts services
+# ├── default.prop            # System properties
+# ├── fstab.*                 # Partition mount table (CRITICAL!)
+# ├── sbin/
+# │   ├── recovery            # Main recovery binary (TWRP/OrangeFox)
+# │   ├── adbd                # ADB daemon
+# │   └── ...                 # Other tools
+# ├── res/                    # Resources (fonts, images)
+# ├── etc/                    # Config files
+# │   └── recovery.fstab      # Recovery-specific fstab
+# └── system/                 # Minimal system files
+#
+# FSTAB FORMAT (Critical for porting):
+# <mount_point> <type> <device> <device2> <flags>
+# Example:
+# /system      ext4  /dev/block/bootdevice/by-name/system  flags=...
+# /data        ext4  /dev/block/bootdevice/by-name/userdata flags=...
+# /boot        emmc  /dev/block/bootdevice/by-name/boot
+#
+# COMMON RECOVERY FRAMEWORKS:
+# - AOSP Recovery: Basic, stock Android
+# - TWRP: Touch-based, most popular custom recovery
+# - OrangeFox: TWRP fork with extra features
+# - SHRP: Skyhawk Recovery Project
+# - PBRP: PitchBlack Recovery
+# - LineageOS Recovery: Clean, simple
+#
+# PORTING RECOVERY TO A NEW DEVICE:
+# 1. Find recovery from similar device (same SoC, similar hardware)
+# 2. Extract kernel and DTB from TARGET device's boot.img
+# 3. Modify fstab to match TARGET device's partition layout
+# 4. Update init scripts if needed
+# 5. Repack with target's kernel + modified ramdisk
+#
+# =============================================================================
+
+class RecoveryPorter:
+    """Port and modify Android recovery images.
+    
+    This class helps with:
+    - Extracting recovery components
+    - Analyzing ramdisk contents
+    - Modifying fstab for device porting
+    - Swapping kernels between devices
+    - Repacking modified recovery
+    
+    Common use cases:
+    - Port TWRP from similar device
+    - Update kernel in existing recovery
+    - Modify partition mappings
+    - Add tools/scripts to recovery
+    """
+    
+    # Known recovery signatures
+    RECOVERY_SIGNATURES = {
+        b'TWRP': 'Team Win Recovery Project',
+        b'OrangeFox': 'OrangeFox Recovery',
+        b'SHRP': 'Skyhawk Recovery Project',
+        b'PBRP': 'PitchBlack Recovery',
+        b'LineageOS': 'LineageOS Recovery',
+    }
+    
+    # Critical fstab mount points
+    CRITICAL_MOUNTS = [
+        '/system', '/system_root', '/vendor', '/product',
+        '/data', '/cache', '/boot', '/recovery',
+        '/misc', '/persist', '/metadata'
+    ]
+    
+    def __init__(self, progress_callback: Optional[callable] = None):
+        self.progress_callback = progress_callback
+        self.recovery_type = None
+        self.ramdisk_contents = {}
+        self.fstab_entries = []
+        self.kernel_info = {}
+        self.header_version = 0
+    
+    def analyze(self, recovery_path: str) -> dict:
+        """Analyze a recovery image and return detailed information.
+        
+        Args:
+            recovery_path: Path to recovery.img
+            
+        Returns:
+            Dict with recovery analysis
+        """
+        info = {
+            'path': recovery_path,
+            'size': os.path.getsize(recovery_path),
+            'format': None,
+            'recovery_type': 'Unknown',
+            'header_version': 0,
+            'kernel_size': 0,
+            'ramdisk_size': 0,
+            'dtb_size': 0,
+            'cmdline': '',
+            'fstab': [],
+            'ramdisk_files': [],
+            'warnings': [],
+            'can_port': True,
+        }
+        
+        try:
+            with open(recovery_path, 'rb') as f:
+                magic = f.read(8)
+                
+                if magic == b'ANDROID!':
+                    info['format'] = 'boot'
+                    self._analyze_boot_format(f, info)
+                elif magic == b'VNDRBOOT':
+                    info['format'] = 'vendor_boot'
+                    info['warnings'].append('vendor_boot format - unusual for recovery')
+                else:
+                    info['format'] = 'unknown'
+                    info['can_port'] = False
+                    info['warnings'].append(f'Unknown format: {magic[:8]}')
+                    return info
+            
+            # Extract and analyze ramdisk
+            self._analyze_ramdisk(recovery_path, info)
+            
+        except Exception as e:
+            info['warnings'].append(f'Analysis error: {e}')
+            info['can_port'] = False
+        
+        return info
+    
+    def _analyze_boot_format(self, f: BinaryIO, info: dict):
+        """Parse boot image header."""
+        f.seek(0)
+        header = f.read(1648)
+        
+        # Parse header
+        kernel_size = struct.unpack('<I', header[8:12])[0]
+        ramdisk_size = struct.unpack('<I', header[16:20])[0]
+        second_size = struct.unpack('<I', header[24:28])[0]
+        page_size = struct.unpack('<I', header[36:40])[0]
+        header_version = struct.unpack('<I', header[40:44])[0]
+        
+        # Cmdline
+        cmdline_end = header[64:64+512].find(b'\x00')
+        cmdline = header[64:64+cmdline_end].decode('utf-8', errors='ignore') if cmdline_end > 0 else ''
+        
+        info['header_version'] = header_version
+        info['kernel_size'] = kernel_size
+        info['ramdisk_size'] = ramdisk_size
+        info['page_size'] = page_size
+        info['cmdline'] = cmdline
+        self.header_version = header_version
+        
+        # DTB size (v2+)
+        if header_version >= 2 and len(header) >= 1648:
+            dtb_size = struct.unpack('<I', header[1644:1648])[0]
+            info['dtb_size'] = dtb_size
+        
+        # Board name
+        board_name = header[48:64].rstrip(b'\x00').decode('utf-8', errors='ignore')
+        if board_name:
+            info['board_name'] = board_name
+    
+    def _analyze_ramdisk(self, recovery_path: str, info: dict):
+        """Extract and analyze ramdisk contents."""
+        import tempfile
+        import subprocess
+        
+        # Use BootImageExtractor to get ramdisk
+        extractor = BootImageExtractor()
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                extracted = extractor.extract(recovery_path, tmpdir)
+                
+                ramdisk_path = extracted.get('ramdisk')
+                if not ramdisk_path:
+                    info['warnings'].append('No ramdisk found in image')
+                    return
+                
+                # Detect compression and get raw cpio
+                ramdisk_dir = Path(tmpdir) / 'ramdisk_contents'
+                ramdisk_dir.mkdir()
+                
+                cpio_data = self._decompress_ramdisk(ramdisk_path)
+                if cpio_data:
+                    self._parse_cpio(cpio_data, ramdisk_dir, info)
+                    self._detect_recovery_type(ramdisk_dir, info)
+                    self._parse_fstab(ramdisk_dir, info)
+                
+            except Exception as e:
+                info['warnings'].append(f'Ramdisk analysis error: {e}')
+    
+    def _decompress_ramdisk(self, ramdisk_path: str) -> Optional[bytes]:
+        """Decompress ramdisk and return raw cpio data."""
+        with open(ramdisk_path, 'rb') as f:
+            data = f.read()
+        
+        # Detect compression
+        if data[:2] == b'\x1f\x8b':  # gzip
+            return gzip.decompress(data)
+        elif data[:4] == b'\x04\x22\x4d\x18':  # lz4
+            try:
+                import lz4.frame
+                return lz4.frame.decompress(data)
+            except ImportError:
+                # Try legacy lz4
+                try:
+                    import lz4.block
+                    return lz4.block.decompress(data)
+                except:
+                    return None
+        elif data[:6] == b'\xfd7zXZ\x00':  # xz
+            return lzma.decompress(data)
+        elif data[:2] == b'\x5d\x00':  # lzma
+            return lzma.decompress(data)
+        elif data[:6] == b'070701' or data[:6] == b'070702':  # uncompressed cpio
+            return data
+        else:
+            return data  # Try as-is
+    
+    def _parse_cpio(self, cpio_data: bytes, output_dir: Path, info: dict):
+        """Parse cpio archive and list contents."""
+        offset = 0
+        files = []
+        
+        while offset < len(cpio_data) - 110:
+            # Check for newc format
+            if cpio_data[offset:offset+6] != b'070701':
+                break
+            
+            # Parse header
+            header = cpio_data[offset:offset+110].decode('ascii')
+            namesize = int(header[94:102], 16)
+            filesize = int(header[54:62], 16)
+            mode = int(header[14:22], 16)
+            
+            # Get filename
+            name_start = offset + 110
+            name_end = name_start + namesize - 1  # Exclude null terminator
+            name = cpio_data[name_start:name_end].decode('utf-8', errors='ignore')
+            
+            if name == 'TRAILER!!!':
+                break
+            
+            # Determine type
+            file_type = 'file'
+            if (mode & 0o170000) == 0o040000:
+                file_type = 'dir'
+            elif (mode & 0o170000) == 0o120000:
+                file_type = 'symlink'
+            
+            files.append({
+                'name': name,
+                'size': filesize,
+                'mode': mode,
+                'type': file_type
+            })
+            
+            # Calculate next entry offset
+            header_pad = (4 - ((110 + namesize) % 4)) % 4
+            data_pad = (4 - (filesize % 4)) % 4 if filesize > 0 else 0
+            offset = name_start + namesize + header_pad + filesize + data_pad
+        
+        info['ramdisk_files'] = files
+        self.ramdisk_contents = {f['name']: f for f in files}
+    
+    def _detect_recovery_type(self, ramdisk_dir: Path, info: dict):
+        """Detect which recovery framework this is."""
+        # Check for known binaries and signatures
+        recovery_type = 'AOSP/Stock'
+        
+        # Common locations to check
+        checks = [
+            ('sbin/recovery', None),
+            ('system/bin/recovery', None),
+            ('res/images', 'Custom Recovery'),
+        ]
+        
+        # Check ramdisk file list for clues
+        files_str = ' '.join(f['name'] for f in info.get('ramdisk_files', []))
+        
+        if 'twres' in files_str or 'TWRP' in files_str:
+            recovery_type = 'TWRP'
+        elif 'Fox' in files_str or 'orangefox' in files_str.lower():
+            recovery_type = 'OrangeFox'
+        elif 'shrp' in files_str.lower():
+            recovery_type = 'SHRP'
+        elif 'pbrp' in files_str.lower():
+            recovery_type = 'PitchBlack'
+        elif 'lineage' in files_str.lower():
+            recovery_type = 'LineageOS'
+        
+        info['recovery_type'] = recovery_type
+        self.recovery_type = recovery_type
+    
+    def _parse_fstab(self, ramdisk_dir: Path, info: dict):
+        """Find and parse fstab files."""
+        fstab_entries = []
+        
+        # Look for fstab in ramdisk file list
+        fstab_files = [f['name'] for f in info.get('ramdisk_files', []) 
+                       if 'fstab' in f['name'].lower() or f['name'].endswith('.fstab')]
+        
+        info['fstab_files'] = fstab_files
+        
+        # Note: Full fstab parsing would require extracting the actual files
+        # For now, we just identify which fstab files exist
+        if not fstab_files:
+            info['warnings'].append('No fstab found - may need manual configuration')
+    
+    def extract_components(self, recovery_path: str, output_dir: str) -> dict:
+        """Extract all recovery components for modification.
+        
+        Args:
+            recovery_path: Path to recovery.img
+            output_dir: Where to extract components
+            
+        Returns:
+            Dict with paths to extracted components
+        """
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        
+        result = {
+            'kernel': None,
+            'ramdisk': None,
+            'ramdisk_dir': None,
+            'dtb': None,
+            'cmdline': '',
+            'header_version': 0,
+        }
+        
+        # Extract using BootImageExtractor
+        extractor = BootImageExtractor()
+        extracted = extractor.extract(recovery_path, str(output))
+        
+        result['kernel'] = extracted.get('kernel')
+        result['ramdisk'] = extracted.get('ramdisk')
+        result['dtb'] = extracted.get('dtb')
+        result['header_version'] = extracted.get('header_version', 0)
+        result['cmdline'] = extracted.get('cmdline', '')
+        
+        # Extract ramdisk contents
+        if result['ramdisk']:
+            ramdisk_dir = output / 'ramdisk'
+            ramdisk_dir.mkdir(exist_ok=True)
+            
+            cpio_data = self._decompress_ramdisk(result['ramdisk'])
+            if cpio_data:
+                self._extract_cpio(cpio_data, ramdisk_dir)
+                result['ramdisk_dir'] = str(ramdisk_dir)
+        
+        return result
+    
+    def _extract_cpio(self, cpio_data: bytes, output_dir: Path):
+        """Extract cpio archive to directory."""
+        offset = 0
+        
+        while offset < len(cpio_data) - 110:
+            if cpio_data[offset:offset+6] != b'070701':
+                break
+            
+            # Parse header
+            header = cpio_data[offset:offset+110].decode('ascii')
+            namesize = int(header[94:102], 16)
+            filesize = int(header[54:62], 16)
+            mode = int(header[14:22], 16)
+            
+            # Get filename
+            name_start = offset + 110
+            name_end = name_start + namesize - 1
+            name = cpio_data[name_start:name_end].decode('utf-8', errors='ignore')
+            
+            if name == 'TRAILER!!!':
+                break
+            
+            # Calculate data position
+            header_pad = (4 - ((110 + namesize) % 4)) % 4
+            data_start = name_start + namesize + header_pad
+            data_end = data_start + filesize
+            
+            # Create file/directory
+            out_path = output_dir / name
+            
+            if (mode & 0o170000) == 0o040000:  # Directory
+                out_path.mkdir(parents=True, exist_ok=True)
+            elif (mode & 0o170000) == 0o120000:  # Symlink
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                link_target = cpio_data[data_start:data_end].decode('utf-8', errors='ignore')
+                # On Windows, just save as text file
+                if sys.platform == 'win32':
+                    out_path.write_text(f'SYMLINK -> {link_target}')
+                else:
+                    try:
+                        out_path.symlink_to(link_target)
+                    except:
+                        out_path.write_text(f'SYMLINK -> {link_target}')
+            else:  # Regular file
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(cpio_data[data_start:data_end])
+                try:
+                    out_path.chmod(mode & 0o777)
+                except:
+                    pass
+            
+            # Next entry
+            data_pad = (4 - (filesize % 4)) % 4 if filesize > 0 else 0
+            offset = data_end + data_pad
+    
+    def repack(self, components: dict, output_path: str, 
+               header_version: Optional[int] = None) -> bool:
+        """Repack modified components into recovery image.
+        
+        Args:
+            components: Dict with kernel, ramdisk_dir, dtb, cmdline
+            output_path: Where to save new recovery.img
+            header_version: Override header version
+            
+        Returns:
+            True if successful
+        """
+        try:
+            kernel = components.get('kernel')
+            ramdisk_dir = components.get('ramdisk_dir')
+            dtb = components.get('dtb')
+            cmdline = components.get('cmdline', '')
+            version = header_version or components.get('header_version', 2)
+            
+            if not kernel:
+                logger.error("Kernel is required")
+                return False
+            
+            # Pack ramdisk if directory provided
+            ramdisk_path = components.get('ramdisk')
+            if ramdisk_dir and Path(ramdisk_dir).is_dir():
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix='.cpio.gz', delete=False) as tmp:
+                    ramdisk_path = tmp.name
+                
+                packer = RamdiskPacker()
+                if not packer.pack(ramdisk_dir, ramdisk_path, 'gzip'):
+                    logger.error("Failed to pack ramdisk")
+                    return False
+            
+            # Use BootImagePacker
+            packer = BootImagePacker()
+            success = packer.pack_boot_image(
+                output_path,
+                kernel=kernel,
+                ramdisk=ramdisk_path,
+                dtb=dtb if dtb and Path(dtb).exists() else None,
+                cmdline=cmdline,
+                header_version=version
+            )
+            
+            if success:
+                logger.info(f"Recovery image created: {output_path}")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Failed to repack recovery: {e}")
+            return False
+    
+    @staticmethod
+    def parse_fstab_file(fstab_path: str) -> list[dict]:
+        """Parse a fstab file and return entries.
+        
+        Args:
+            fstab_path: Path to fstab file
+            
+        Returns:
+            List of fstab entries
+        """
+        entries = []
+        
+        try:
+            with open(fstab_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        entry = {
+                            'mount_point': parts[0] if parts[0].startswith('/') else parts[1],
+                            'type': parts[1] if parts[0].startswith('/') else parts[0],
+                            'device': parts[2] if len(parts) > 2 else '',
+                            'flags': ' '.join(parts[3:]) if len(parts) > 3 else '',
+                            'raw': line
+                        }
+                        entries.append(entry)
+        except Exception as e:
+            logger.error(f"Failed to parse fstab: {e}")
+        
+        return entries
+    
+    @staticmethod
+    def generate_fstab(entries: list[dict], output_path: str) -> bool:
+        """Generate a fstab file from entries.
+        
+        Args:
+            entries: List of fstab entry dicts
+            output_path: Where to save fstab
+            
+        Returns:
+            True if successful
+        """
+        try:
+            with open(output_path, 'w') as f:
+                f.write("# Recovery fstab - Generated by Image Anarchy\n")
+                f.write("# Format: <mount_point> <type> <device> [<device2>] <flags>\n\n")
+                
+                for entry in entries:
+                    if 'raw' in entry:
+                        f.write(entry['raw'] + '\n')
+                    else:
+                        line = f"{entry['mount_point']}\t{entry['type']}\t{entry['device']}"
+                        if entry.get('flags'):
+                            line += f"\t{entry['flags']}"
+                        f.write(line + '\n')
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write fstab: {e}")
+            return False
+
+
 class Ext4ImageExtractor:
     """Extract files from ext4 filesystem images."""
     
@@ -4797,6 +6211,53 @@ class AndroidImageExtractor:
                 ]
             info['note'] = 'AVB vbmeta - contains verification data for partitions'
         
+        elif img_type == 'dtbo':
+            # Parse DTBO (Device Tree Blob Overlay) image
+            extractor = DtboExtractor()
+            analysis = extractor.analyze(path)
+            
+            if analysis['valid']:
+                info['dtbo_version'] = analysis['version']
+                info['entry_count'] = analysis['entry_count']
+                info['page_size'] = analysis['page_size']
+                info['total_size'] = analysis['total_size']
+                info['contents'] = [
+                    {
+                        'name': f"dtbo_{e['index']:02d}",
+                        'size': e['size'],
+                        'id': f"0x{e['id']:08X}",
+                        'info': e['info'][:40] if e['info'] else ''
+                    }
+                    for e in analysis['entries']
+                ]
+                info['note'] = f"DTBO v{analysis['version']} - {analysis['entry_count']} device tree overlays"
+            else:
+                info['note'] = 'DTBO - invalid or unsupported format'
+        
+        elif img_type == 'abl':
+            # Analyze ABL (Android Bootloader) - critical for LG, Pixel, and other devices
+            analyzer = AblAnalyzer(path)
+            abl_info = analyzer.analyze()
+            
+            info['abl_format'] = abl_info.get('format', 'Unknown')
+            info['abl_size'] = abl_info.get('size', 0)
+            info['is_elf'] = abl_info.get('is_elf', False)
+            info['is_64bit'] = abl_info.get('is_64bit', False)
+            info['unlock_checks'] = len(abl_info.get('unlock_checks', []))
+            info['secure_boot_refs'] = len(abl_info.get('secure_boot', []))
+            info['avb_references'] = len(abl_info.get('avb_references', []))
+            info['anti_rollback_refs'] = len(abl_info.get('anti_rollback', []))
+            info['lg_specific'] = len(abl_info.get('lg_specific', []))
+            info['pixel_specific'] = len(abl_info.get('pixel_specific', []))
+            info['fastboot_commands'] = len(abl_info.get('fastboot_commands', []))
+            info['is_lg_device'] = analyzer.is_lg_device()
+            info['is_pixel_device'] = analyzer.is_pixel_device()
+            info['note'] = f"ABL ({abl_info.get('format', 'Unknown')}) - unlock checks, AVB, fastboot"
+            if info['is_lg_device']:
+                info['note'] += ' - LG device (LAF mode)'
+            if info['is_pixel_device']:
+                info['note'] += ' - Google Pixel/Tensor device'
+        
         elif img_type == 'bootloader':
             # Analyze bootloader image
             analyzer = BootloaderImageAnalyzer(path, '')
@@ -4884,6 +6345,26 @@ class AndroidImageExtractor:
             else:
                 return {'type': 'elf', 'error': 'Failed to extract ELF segments'}
         
+        elif img_type == 'abl':
+            logger.info("Analyzing ABL (Android Bootloader)...")
+            analyzer = AblAnalyzer(path, output_dir, self.progress_callback)
+            analysis = analyzer.analyze()
+            report_path = analyzer.write_report()
+            
+            # Also extract ELF segments
+            elf_extractor = ElfExtractor(path, output_dir, self.progress_callback)
+            elf_extractor.extract()
+            
+            return {
+                'type': 'abl',
+                'analysis': analysis,
+                'report': report_path,
+                'summary': analyzer.get_summary(),
+                'is_lg': analyzer.is_lg_device(),
+                'unlock_checks': len(analysis.get('unlock_checks', [])),
+                'segments': len(elf_extractor.segments),
+            }
+        
         elif img_type == 'vbmeta':
             logger.info("Parsing AVB vbmeta image...")
             extractor = VbmetaExtractor(path, output_dir, self.progress_callback)
@@ -4894,6 +6375,22 @@ class AndroidImageExtractor:
                         'header': extractor.header}
             else:
                 return {'type': 'vbmeta', 'error': 'Failed to parse vbmeta'}
+        
+        elif img_type == 'dtbo':
+            logger.info("Extracting DTBO overlays...")
+            extractor = DtboExtractor(self.progress_callback)
+            analysis = extractor.analyze(path)
+            if analysis['valid']:
+                extracted = extractor.extract(path, output_dir)
+                return {
+                    'type': 'dtbo',
+                    'version': analysis['version'],
+                    'entry_count': analysis['entry_count'],
+                    'extracted': extracted,
+                    'entries': analysis['entries']
+                }
+            else:
+                return {'type': 'dtbo', 'error': 'Invalid DTBO format'}
         
         elif img_type == 'bootloader':
             logger.info("Analyzing bootloader image...")
@@ -5934,7 +7431,7 @@ def create_gui_app():
             
             self.repack_type_combo = QComboBox()
             self.repack_type_combo.addItems([
-                "Boot Image (boot.img)",
+                "Boot Image (boot.img / recovery.img)",
                 "Vendor Boot Image (vendor_boot.img)",
                 "Sparse Image (from raw)",
                 "vbmeta Image (disabled AVB)",
@@ -6209,6 +7706,173 @@ def create_gui_app():
             repack_img_layout.addLayout(repack_action_layout)
             
             self.tab_widget.addTab(repack_img_tab, "🔨 Image Repack")
+            
+            # =============================================================
+            # TAB 5: RECOVERY PORTER
+            # =============================================================
+            recovery_tab = QWidget()
+            recovery_layout = QVBoxLayout(recovery_tab)
+            
+            # Info banner
+            recovery_info = QLabel(
+                "🔧 Recovery Porter - Port custom recoveries (TWRP, OrangeFox) between devices\n"
+                "Load a recovery.img to analyze, modify, swap kernel, edit fstab, and repack."
+            )
+            recovery_info.setStyleSheet("color: #FFA500; padding: 10px; background-color: #2d2d2d; border-radius: 4px;")
+            recovery_info.setWordWrap(True)
+            recovery_layout.addWidget(recovery_info)
+            
+            # Splitter for left/right panels
+            recovery_splitter = QSplitter(Qt.Orientation.Horizontal)
+            
+            # Left panel - Source and components
+            recovery_left = QWidget()
+            recovery_left_layout = QVBoxLayout(recovery_left)
+            recovery_left_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Source recovery
+            source_group = QGroupBox("Source Recovery")
+            source_layout = QVBoxLayout(source_group)
+            
+            source_input_layout = QHBoxLayout()
+            self.recovery_source_edit = QLineEdit()
+            self.recovery_source_edit.setPlaceholderText("Path to recovery.img...")
+            source_input_layout.addWidget(self.recovery_source_edit, 1)
+            self.recovery_browse_btn = QPushButton("Browse...")
+            self.recovery_browse_btn.clicked.connect(self._browse_recovery_source)
+            source_input_layout.addWidget(self.recovery_browse_btn)
+            source_layout.addLayout(source_input_layout)
+            
+            self.recovery_analyze_btn = QPushButton("Analyze Recovery")
+            self.recovery_analyze_btn.clicked.connect(self._analyze_recovery)
+            source_layout.addWidget(self.recovery_analyze_btn)
+            
+            recovery_left_layout.addWidget(source_group)
+            
+            # Recovery info display
+            info_group = QGroupBox("Recovery Information")
+            info_layout = QVBoxLayout(info_group)
+            
+            self.recovery_info_tree = QTreeWidget()
+            self.recovery_info_tree.setHeaderLabels(["Property", "Value"])
+            self.recovery_info_tree.setAlternatingRowColors(True)
+            info_layout.addWidget(self.recovery_info_tree)
+            
+            recovery_left_layout.addWidget(info_group, 1)
+            
+            # Component modifications
+            mods_group = QGroupBox("Modifications")
+            mods_layout = QVBoxLayout(mods_group)
+            
+            # Kernel swap
+            kernel_layout = QHBoxLayout()
+            kernel_layout.addWidget(QLabel("Replace Kernel:"))
+            self.recovery_kernel_edit = QLineEdit()
+            self.recovery_kernel_edit.setPlaceholderText("Leave empty to keep original...")
+            kernel_layout.addWidget(self.recovery_kernel_edit, 1)
+            self.recovery_kernel_browse = QPushButton("...")
+            self.recovery_kernel_browse.setMaximumWidth(30)
+            self.recovery_kernel_browse.clicked.connect(self._browse_recovery_kernel)
+            kernel_layout.addWidget(self.recovery_kernel_browse)
+            mods_layout.addLayout(kernel_layout)
+            
+            # DTB swap
+            dtb_layout = QHBoxLayout()
+            dtb_layout.addWidget(QLabel("Replace DTB:"))
+            self.recovery_dtb_edit = QLineEdit()
+            self.recovery_dtb_edit.setPlaceholderText("Leave empty to keep original...")
+            dtb_layout.addWidget(self.recovery_dtb_edit, 1)
+            self.recovery_dtb_browse = QPushButton("...")
+            self.recovery_dtb_browse.setMaximumWidth(30)
+            self.recovery_dtb_browse.clicked.connect(self._browse_recovery_dtb)
+            dtb_layout.addWidget(self.recovery_dtb_browse)
+            mods_layout.addLayout(dtb_layout)
+            
+            # Cmdline
+            cmdline_layout = QHBoxLayout()
+            cmdline_layout.addWidget(QLabel("Cmdline:"))
+            self.recovery_cmdline_edit = QLineEdit()
+            self.recovery_cmdline_edit.setPlaceholderText("Kernel command line...")
+            cmdline_layout.addWidget(self.recovery_cmdline_edit, 1)
+            mods_layout.addLayout(cmdline_layout)
+            
+            recovery_left_layout.addWidget(mods_group)
+            
+            recovery_splitter.addWidget(recovery_left)
+            
+            # Right panel - Ramdisk contents
+            recovery_right = QWidget()
+            recovery_right_layout = QVBoxLayout(recovery_right)
+            recovery_right_layout.setContentsMargins(0, 0, 0, 0)
+            
+            ramdisk_group = QGroupBox("Ramdisk Contents")
+            ramdisk_layout = QVBoxLayout(ramdisk_group)
+            
+            self.ramdisk_tree = QTreeWidget()
+            self.ramdisk_tree.setHeaderLabels(["Name", "Size", "Type"])
+            self.ramdisk_tree.setAlternatingRowColors(True)
+            self.ramdisk_tree.itemDoubleClicked.connect(self._on_ramdisk_item_double_click)
+            ramdisk_layout.addWidget(self.ramdisk_tree)
+            
+            # Ramdisk actions
+            ramdisk_btn_layout = QHBoxLayout()
+            self.ramdisk_extract_btn = QPushButton("Extract All")
+            self.ramdisk_extract_btn.clicked.connect(self._extract_ramdisk)
+            self.ramdisk_extract_btn.setEnabled(False)
+            ramdisk_btn_layout.addWidget(self.ramdisk_extract_btn)
+            
+            self.ramdisk_edit_fstab_btn = QPushButton("Edit fstab")
+            self.ramdisk_edit_fstab_btn.clicked.connect(self._edit_fstab)
+            self.ramdisk_edit_fstab_btn.setEnabled(False)
+            ramdisk_btn_layout.addWidget(self.ramdisk_edit_fstab_btn)
+            
+            ramdisk_btn_layout.addStretch()
+            ramdisk_layout.addLayout(ramdisk_btn_layout)
+            
+            recovery_right_layout.addWidget(ramdisk_group, 1)
+            
+            # Log
+            recovery_log_group = QGroupBox("Log")
+            recovery_log_layout = QVBoxLayout(recovery_log_group)
+            self.recovery_log = QTextEdit()
+            self.recovery_log.setReadOnly(True)
+            self.recovery_log.setFont(QFont("Consolas", 9))
+            self.recovery_log.setMaximumHeight(150)
+            recovery_log_layout.addWidget(self.recovery_log)
+            recovery_right_layout.addWidget(recovery_log_group)
+            
+            recovery_splitter.addWidget(recovery_right)
+            recovery_splitter.setSizes([400, 400])
+            
+            recovery_layout.addWidget(recovery_splitter, 1)
+            
+            # Output and actions
+            recovery_output_layout = QHBoxLayout()
+            recovery_output_layout.addWidget(QLabel("Output:"))
+            self.recovery_output_edit = QLineEdit()
+            self.recovery_output_edit.setPlaceholderText("Path for new recovery.img...")
+            recovery_output_layout.addWidget(self.recovery_output_edit, 1)
+            self.recovery_output_browse = QPushButton("Browse...")
+            self.recovery_output_browse.clicked.connect(self._browse_recovery_output)
+            recovery_output_layout.addWidget(self.recovery_output_browse)
+            recovery_layout.addLayout(recovery_output_layout)
+            
+            # Progress and build button
+            recovery_action_layout = QHBoxLayout()
+            self.recovery_progress = QProgressBar()
+            self.recovery_progress.setMaximumWidth(200)
+            recovery_action_layout.addWidget(self.recovery_progress)
+            recovery_action_layout.addStretch()
+            
+            self.recovery_build_btn = QPushButton("Build Recovery")
+            self.recovery_build_btn.setProperty("primary", True)
+            self.recovery_build_btn.setMinimumWidth(150)
+            self.recovery_build_btn.clicked.connect(self._build_recovery)
+            self.recovery_build_btn.setEnabled(False)
+            recovery_action_layout.addWidget(self.recovery_build_btn)
+            recovery_layout.addLayout(recovery_action_layout)
+            
+            self.tab_widget.addTab(recovery_tab, "🔄 Recovery Porter")
             
             main_layout.addWidget(self.tab_widget)
             
@@ -7106,6 +8770,297 @@ def create_gui_app():
             else:
                 self._repack_log("❌ Failed to create ramdisk")
                 self.repack_img_progress_label.setText("Failed")
+        
+        # ===== Recovery Porter Methods =====
+        def _recovery_log(self, msg: str):
+            """Add message to recovery log."""
+            self.recovery_log.append(msg)
+        
+        def _browse_recovery_source(self):
+            """Browse for source recovery image."""
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select Recovery Image",
+                "",
+                "Image Files (*.img);;All Files (*.*)"
+            )
+            if path:
+                self.recovery_source_edit.setText(path)
+        
+        def _browse_recovery_kernel(self):
+            """Browse for replacement kernel."""
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select Kernel",
+                "",
+                "All Files (*.*)"
+            )
+            if path:
+                self.recovery_kernel_edit.setText(path)
+        
+        def _browse_recovery_dtb(self):
+            """Browse for replacement DTB."""
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select DTB",
+                "",
+                "DTB Files (*.dtb);;All Files (*.*)"
+            )
+            if path:
+                self.recovery_dtb_edit.setText(path)
+        
+        def _browse_recovery_output(self):
+            """Browse for recovery output path."""
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Recovery As",
+                "recovery_ported.img",
+                "Image Files (*.img);;All Files (*.*)"
+            )
+            if path:
+                self.recovery_output_edit.setText(path)
+        
+        def _analyze_recovery(self):
+            """Analyze the source recovery image."""
+            source = self.recovery_source_edit.text().strip()
+            if not source:
+                QMessageBox.warning(self, "Error", "Please select a recovery image")
+                return
+            
+            if not os.path.exists(source):
+                QMessageBox.warning(self, "Error", f"File not found:\n{source}")
+                return
+            
+            self.recovery_log.clear()
+            self._recovery_log(f"Analyzing: {Path(source).name}")
+            self._recovery_log("")
+            
+            self.recovery_progress.setRange(0, 0)  # Indeterminate
+            
+            try:
+                porter = RecoveryPorter()
+                info = porter.analyze(source)
+                
+                # Clear and populate info tree
+                self.recovery_info_tree.clear()
+                
+                # Basic info
+                basic = QTreeWidgetItem(["Basic Info", ""])
+                basic.addChild(QTreeWidgetItem(["Recovery Type", info.get('recovery_type', 'Unknown')]))
+                basic.addChild(QTreeWidgetItem(["Format", info.get('format', 'Unknown')]))
+                basic.addChild(QTreeWidgetItem(["Header Version", str(info.get('header_version', 0))]))
+                basic.addChild(QTreeWidgetItem(["Size", f"{info.get('size', 0) / (1024*1024):.2f} MB"]))
+                if info.get('board_name'):
+                    basic.addChild(QTreeWidgetItem(["Board Name", info['board_name']]))
+                self.recovery_info_tree.addTopLevelItem(basic)
+                basic.setExpanded(True)
+                
+                # Components
+                components = QTreeWidgetItem(["Components", ""])
+                components.addChild(QTreeWidgetItem(["Kernel", f"{info.get('kernel_size', 0) / 1024:.1f} KB"]))
+                components.addChild(QTreeWidgetItem(["Ramdisk", f"{info.get('ramdisk_size', 0) / 1024:.1f} KB"]))
+                if info.get('dtb_size', 0) > 0:
+                    components.addChild(QTreeWidgetItem(["DTB", f"{info['dtb_size'] / 1024:.1f} KB"]))
+                self.recovery_info_tree.addTopLevelItem(components)
+                components.setExpanded(True)
+                
+                # Cmdline
+                if info.get('cmdline'):
+                    cmdline_item = QTreeWidgetItem(["Cmdline", info['cmdline'][:50] + "..." if len(info.get('cmdline', '')) > 50 else info['cmdline']])
+                    self.recovery_info_tree.addTopLevelItem(cmdline_item)
+                    self.recovery_cmdline_edit.setText(info['cmdline'])
+                
+                # Fstab files
+                if info.get('fstab_files'):
+                    fstab = QTreeWidgetItem(["Fstab Files", ""])
+                    for f in info['fstab_files']:
+                        fstab.addChild(QTreeWidgetItem([f, ""]))
+                    self.recovery_info_tree.addTopLevelItem(fstab)
+                    fstab.setExpanded(True)
+                
+                # Warnings
+                if info.get('warnings'):
+                    warnings = QTreeWidgetItem(["⚠️ Warnings", ""])
+                    for w in info['warnings']:
+                        warnings.addChild(QTreeWidgetItem([w, ""]))
+                    self.recovery_info_tree.addTopLevelItem(warnings)
+                    warnings.setExpanded(True)
+                
+                # Populate ramdisk tree
+                self.ramdisk_tree.clear()
+                ramdisk_files = info.get('ramdisk_files', [])
+                
+                # Group by directory
+                dir_items = {}
+                for f in ramdisk_files:
+                    name = f['name']
+                    parts = name.split('/')
+                    
+                    if len(parts) == 1:
+                        # Root level
+                        item = QTreeWidgetItem([name, f"{f['size']}" if f['size'] > 0 else "", f['type']])
+                        self.ramdisk_tree.addTopLevelItem(item)
+                    else:
+                        # In subdirectory - simplified flat view with full path
+                        item = QTreeWidgetItem([name, f"{f['size']}" if f['size'] > 0 else "", f['type']])
+                        self.ramdisk_tree.addTopLevelItem(item)
+                
+                self._recovery_log(f"Recovery Type: {info.get('recovery_type', 'Unknown')}")
+                self._recovery_log(f"Header Version: {info.get('header_version', 0)}")
+                self._recovery_log(f"Kernel: {info.get('kernel_size', 0) / 1024:.1f} KB")
+                self._recovery_log(f"Ramdisk: {info.get('ramdisk_size', 0) / 1024:.1f} KB")
+                self._recovery_log(f"Ramdisk files: {len(ramdisk_files)}")
+                
+                if info.get('can_port', True):
+                    self._recovery_log("\n✅ Recovery can be ported/modified")
+                    self.recovery_build_btn.setEnabled(True)
+                    self.ramdisk_extract_btn.setEnabled(True)
+                    self.ramdisk_edit_fstab_btn.setEnabled(bool(info.get('fstab_files')))
+                else:
+                    self._recovery_log("\n❌ Recovery format not supported for porting")
+                
+                # Store for later use
+                self._current_recovery_info = info
+                self._current_recovery_path = source
+                
+            except Exception as e:
+                self._recovery_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to analyze recovery:\n{e}")
+            finally:
+                self.recovery_progress.setRange(0, 100)
+                self.recovery_progress.setValue(100)
+        
+        def _on_ramdisk_item_double_click(self, item, column):
+            """Handle double-click on ramdisk item."""
+            name = item.text(0)
+            file_type = item.text(2)
+            self._recovery_log(f"Selected: {name} ({file_type})")
+        
+        def _extract_ramdisk(self):
+            """Extract ramdisk contents to a directory."""
+            if not hasattr(self, '_current_recovery_path'):
+                return
+            
+            output_dir = QFileDialog.getExistingDirectory(
+                self, "Select Output Directory for Ramdisk"
+            )
+            if not output_dir:
+                return
+            
+            self._recovery_log(f"\nExtracting ramdisk to: {output_dir}")
+            self.recovery_progress.setRange(0, 0)
+            
+            try:
+                porter = RecoveryPorter()
+                result = porter.extract_components(self._current_recovery_path, output_dir)
+                
+                if result.get('ramdisk_dir'):
+                    self._recovery_log(f"✅ Ramdisk extracted to: {result['ramdisk_dir']}")
+                    self._recovery_log(f"   Kernel: {result.get('kernel', 'N/A')}")
+                    
+                    # Store for repacking
+                    self._extracted_components = result
+                    
+                    QMessageBox.information(self, "Success", 
+                        f"Ramdisk extracted to:\n{result['ramdisk_dir']}\n\n"
+                        "You can now modify files and rebuild.")
+                else:
+                    self._recovery_log("❌ Failed to extract ramdisk")
+                    
+            except Exception as e:
+                self._recovery_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Extraction failed:\n{e}")
+            finally:
+                self.recovery_progress.setRange(0, 100)
+                self.recovery_progress.setValue(100)
+        
+        def _edit_fstab(self):
+            """Open fstab editor dialog."""
+            if not hasattr(self, '_current_recovery_info'):
+                return
+            
+            fstab_files = self._current_recovery_info.get('fstab_files', [])
+            if not fstab_files:
+                QMessageBox.information(self, "Info", "No fstab files found in recovery")
+                return
+            
+            # For now, show info about fstab editing
+            QMessageBox.information(self, "Fstab Editor",
+                f"Found fstab files:\n" + "\n".join(f"• {f}" for f in fstab_files) +
+                "\n\nTo edit fstab:\n"
+                "1. Click 'Extract All' to extract ramdisk\n"
+                "2. Edit the fstab file(s) in the extracted directory\n"
+                "3. Modify partition paths for your target device\n"
+                "4. Click 'Build Recovery' to repack\n\n"
+                "Common fstab modifications:\n"
+                "• Change /dev/block/bootdevice paths\n"
+                "• Update partition names (system, vendor, data)\n"
+                "• Adjust filesystem types (ext4, f2fs, erofs)")
+        
+        def _build_recovery(self):
+            """Build the modified recovery image."""
+            output_path = self.recovery_output_edit.text().strip()
+            if not output_path:
+                QMessageBox.warning(self, "Error", "Please specify an output path")
+                return
+            
+            if not hasattr(self, '_current_recovery_path'):
+                QMessageBox.warning(self, "Error", "Please analyze a recovery first")
+                return
+            
+            self._recovery_log("\n" + "="*50)
+            self._recovery_log("Building recovery image...")
+            self.recovery_progress.setRange(0, 0)
+            
+            try:
+                porter = RecoveryPorter()
+                
+                # Extract if not already extracted
+                if not hasattr(self, '_extracted_components'):
+                    import tempfile
+                    temp_dir = tempfile.mkdtemp(prefix='recovery_')
+                    self._recovery_log(f"Extracting to temp: {temp_dir}")
+                    self._extracted_components = porter.extract_components(
+                        self._current_recovery_path, temp_dir)
+                
+                components = self._extracted_components.copy()
+                
+                # Apply modifications
+                new_kernel = self.recovery_kernel_edit.text().strip()
+                if new_kernel and os.path.exists(new_kernel):
+                    components['kernel'] = new_kernel
+                    self._recovery_log(f"Using replacement kernel: {Path(new_kernel).name}")
+                
+                new_dtb = self.recovery_dtb_edit.text().strip()
+                if new_dtb and os.path.exists(new_dtb):
+                    components['dtb'] = new_dtb
+                    self._recovery_log(f"Using replacement DTB: {Path(new_dtb).name}")
+                
+                new_cmdline = self.recovery_cmdline_edit.text().strip()
+                if new_cmdline:
+                    components['cmdline'] = new_cmdline
+                    self._recovery_log(f"Using cmdline: {new_cmdline[:50]}...")
+                
+                # Build
+                success = porter.repack(components, output_path)
+                
+                if success:
+                    size = os.path.getsize(output_path)
+                    self._recovery_log(f"\n✅ Recovery built successfully!")
+                    self._recovery_log(f"   Output: {output_path}")
+                    self._recovery_log(f"   Size: {size / (1024*1024):.2f} MB")
+                    
+                    QMessageBox.information(self, "Success",
+                        f"Recovery image created:\n{output_path}\n\n"
+                        f"Size: {size / (1024*1024):.2f} MB\n\n"
+                        "Flash with:\n"
+                        "fastboot flash recovery recovery.img")
+                else:
+                    self._recovery_log("❌ Failed to build recovery")
+                    QMessageBox.critical(self, "Error", "Failed to build recovery image")
+                    
+            except Exception as e:
+                self._recovery_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Build failed:\n{e}")
+            finally:
+                self.recovery_progress.setRange(0, 100)
+                self.recovery_progress.setValue(100 if 'success' in dir() and success else 0)
         
         def _start_image_extract(self):
             if not hasattr(self, 'current_image_path'):
