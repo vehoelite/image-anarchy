@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output directories
+output/
+extracted/
+extracted_images/
+super_extracted/
+
+# Android images (don't commit large binaries)
+*.img
+*.bin
+payload.bin
+*.zip
+*.tar
+*.gz
+*.xz
+*.zst
+
+# Keys (security - never commit private keys!)
+*.pem
+*.key
+avb_custom_key*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
