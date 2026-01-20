@@ -37,7 +37,7 @@
   </tr>
   <tr>
     <td align="center"><b>🔄 Recovery Porter</b><br><img src="screenshots/recovery.png" alt="Recovery Porter" width="400"></td>
-    <td align="center"><b>📊 ABL Analysis</b><br><img src="screenshots/analysis.png" alt="Analysis" width="400"></td>
+    <td align="center"><b>📊 Vbmeta Analysis</b><br><img src="screenshots/analysis.png" alt="Analysis" width="400"></td>
   </tr>
 </table>
 
