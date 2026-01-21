@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <center>Ⓐ Image Anarchy v1.1
+  <center>Ⓐ Image Anarchy v1.1 Ⓐ
 Android Image Swiss Army Knife
 Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.</center>
 </p>
@@ -368,6 +368,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
   <a href="https://github.com/vehoelite/image-anarchy/issues">🐛 Report Bug</a> •
   <a href="https://github.com/vehoelite/image-anarchy/issues">💡 Request Feature</a>
 </p>
+
 
 
 
