@@ -1,6 +1,10 @@
 # 🔓 Image Anarchy
 
 <p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Image Anarchy Logo" width="200">
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/Version-1.1-blue?style=for-the-badge" alt="Version 1.1">
   <img src="https://img.shields.io/badge/Python-3.8+-green?style=for-the-badge&logo=python" alt="Python 3.8+">
   <img src="https://img.shields.io/badge/Platform-Windows%20|%20Linux%20|%20macOS-orange?style=for-the-badge" alt="Platform">
