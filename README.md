@@ -256,17 +256,32 @@ image-anarchy/
 <details>
 <summary>Click to expand screenshots</summary>
 
-### Main Interface
+### Payload Extract Tool
 ![Payload Extract Tab](screenshots/extract.png)
 
-### Plugin System
-![Plugins Tab](screenshots/plugins.png)
+### Payload Repack Tool
+![Payload Repack Tab](screenshots/repack.png)
 
-### ADB Toolkit
-![ADB Toolkit](screenshots/adb_toolkit.png)
+### Image Extract Tool
+![Image Extract Tab](screenshots/image_extract.png)
 
-### Fastboot Toolkit
-![Fastboot Toolkit](screenshots/fastboot_toolkit.png)
+### Image Repack Tool
+![Image Repack Tool](screenshots/image_repack.png)
+
+### Recovery Porter Tool
+![Recovery Porter Tool](screenshots/recovery.png)
+
+### Vbmeta Analysis Tool
+![Analysis Tool](screenshots/analysis.png)
+
+### **New Plug-in System
+![Plugin System Tab](screenshots/plugin.png)
+
+### ADB Multi-Tool Plugin
+![ADB Plugin Tab](screenshots/adb.png)
+
+### Fastboot Multi-Tool Plugin
+![Fastboot Plugin Tab](screenshots/fastboot.png)
 
 </details>
 
@@ -368,6 +383,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
   <a href="https://github.com/vehoelite/image-anarchy/issues">🐛 Report Bug</a> •
   <a href="https://github.com/vehoelite/image-anarchy/issues">💡 Request Feature</a>
 </p>
+
 
 
 
