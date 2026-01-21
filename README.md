@@ -1,454 +1,365 @@
-```
-    ___                                  ___                        __         
-   /   |  ____  ____ ___________  ___   /   |  ____  ____ _____ ___/ /_  __  __
-  / /| | / __ \/ __ `/ ___/ ___/ / _ \ / /| | / __ \/ __ `/ __ `/ __ / / / / /
- / ___ |/ / / / /_/ / /  / /__  /  __// ___ |/ / / / /_/ / /_/ / /_/ / /_/ /  
-/_/  |_/_/ /_/\__,_/_/   \___/  \___//_/  |_/_/ /_/\__,_/\__, /\__,_/\__, /   
-                                                        /____/      /____/    
-```
+# 🔓 Image Anarchy
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-1.0-red" alt="Version">
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
-  <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
-  <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
-  <img src="https://img.shields.io/github/stars/vehoelite/image-anarchy?style=social" alt="Stars">
+  <img src="https://img.shields.io/badge/Version-1.1-blue?style=for-the-badge" alt="Version 1.1">
+  <img src="https://img.shields.io/badge/Python-3.8+-green?style=for-the-badge&logo=python" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/Platform-Windows%20|%20Linux%20|%20macOS-orange?style=for-the-badge" alt="Platform">
+  <img src="https://img.shields.io/badge/License-MIT-purple?style=for-the-badge" alt="License">
+  <img src="https://img.shields.io/badge/GUI-PyQt6-red?style=for-the-badge" alt="PyQt6">
 </p>
 
-<h1 align="center">Ⓐ Image Anarchy v1.0</h1>
-<h3 align="center">Android Image Swiss Army Knife</h3>
-
 <p align="center">
-  <i>Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.</i>
+  <b>The All-in-One Android Image Swiss Army Knife with Extensible Plugin System</b>
 </p>
 
 ---
 
-## 📸 Screenshots
+## 🆕 What's New in v1.1
 
-<table>
-  <tr>
-    <td align="center"><b>📦 Payload Extract</b><br><img src="screenshots/extract.png" alt="Extract Tab" width="400"></td>
-    <td align="center"><b>🔧 Payload Repack</b><br><img src="screenshots/repack.png" alt="Repack Tab" width="400"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>🔍 Image Extract</b><br><img src="screenshots/image_extract.png" alt="Image Extract" width="400"></td>
-    <td align="center"><b>🔨 Image Repack</b><br><img src="screenshots/image_repack.png" alt="Image Repack" width="400"></td>
-  </tr>
-  <tr>
-    <td align="center"><b>🔄 Recovery Porter</b><br><img src="screenshots/recovery.png" alt="Recovery Porter" width="400"></td>
-    <td align="center"><b>📊 Vbmeta Analysis</b><br><img src="screenshots/analysis.png" alt="Analysis" width="400"></td>
-  </tr>
-</table>
+### Plugin System 🔌
+- **Extensible Architecture** - Add new features without modifying core code
+- **Monetization Support** - Plugins can be free, paid, or donation-based
+- **Auto-Dependency Install** - Plugins can specify pip requirements that auto-install
+- **Hot-Reload Ready** - Discover new plugins without restarting
 
----
+### Bundled Platform Tools
+- **ADB & Fastboot Included** - No need to install Android SDK separately
+- **Zero Configuration** - Works out of the box
 
-## 🔥 Features
-
-### 📦 Payload Operations
-- **Extract** partitions from `payload.bin` OTA files
-- **Create** new `payload.bin` from partition images
-- Support for **differential OTA** (incremental updates)
-- Multiple compression: **ZSTD**, **XZ**, **BZ2**, **Brotli**
-- Remote file support: HTTP, HTTPS, S3, Google Cloud Storage
-
-### 🔍 Image Extraction
-| Format | Capabilities |
-|--------|-------------|
-| **Sparse** | Convert to raw images |
-| **Boot/Recovery/Vendor Boot** | Extract kernel, ramdisk, DTB (v0-v4) |
-| **Super (Dynamic)** | Extract all logical partitions |
-| **vbmeta** | Parse, patch (disable verity/verification), re-sign |
-| **DTBO** | Extract device tree overlays (all entries) |
-| **ABL (Android Bootloader)** | Deep analysis - Qualcomm ELF & Pixel/Tensor binary |
-| **ext4** | Extract filesystem contents |
-| **FAT** | Extract filesystem contents |
-| **ELF/Bootloader** | Analyze XBL, TZ, firmware |
-
-### 📱 Device Support
-| Vendor | ABL Format | Features |
-|--------|-----------|----------|
-| **Qualcomm** | ELF | Full analysis, unlock checks, secure boot |
-| **Google Pixel/Tensor** | Binary blob | Device detection, Tensor chip patterns |
-| **LG** | ELF + LAF | LAF mode detection, unlock bypass research |
-| **Samsung Exynos** | Binary blob | Basic detection |
-| **MediaTek** | LK format | Bootloader analysis |
-
-### 🔨 Image Repacking
-- **Boot/Recovery images** (v0, v1, v2, v3, v4) - custom kernel/ramdisk
-- **Vendor boot images** (v3, v4)
-- **Sparse images** from raw (for faster flashing)
-- **vbmeta images** with AVB disabled
-- **Ramdisk** from directory (cpio + compression)
-
-### � Recovery Porter
-- **Analyze** TWRP, OrangeFox, SHRP, PitchBlack, LineageOS recovery
-- **Extract** kernel, DTB, ramdisk, cmdline
-- **Browse** ramdisk contents (view fstab, init scripts)
-- **Swap** kernel/DTB from another device
-- **Modify** cmdline and rebuild
-- **Port** custom recoveries between devices
-- **Educational comments** explaining recovery internals
-
-### �🔐 Security Features
-- **vbmeta patching**: Disable dm-verity and AVB verification
-- **Custom AVB signing**: Re-sign with your own keys
-- Key generation (RSA-2048/4096/8192)
-
-### 🎨 User Experience
-- Modern **dark-themed GUI** (PyQt6)
-- **Drag & drop** support
-- **Non-blocking** threaded operations
-- Real-time progress and logging
-- CLI mode for scripting/automation
+### New Plugins Included
+- **ADB Toolkit** - Comprehensive device management (7 tools)
+- **Fastboot Toolkit** - Complete bootloader operations (8 tools)
+- **Plugin Developer Guide** - Tutorial for creating your own plugins
 
 ---
 
-## 📥 Installation
+## ✨ Features
 
-### 🎯 Portable EXE (Windows - Easiest)
+### Core Functionality
+| Feature | Description |
+|---------|-------------|
+| 📦 **Payload Extract** | Extract images from Android OTA `payload.bin` files |
+| 📦 **Payload Repack** | Repack modified images back into `payload.bin` |
+| 🖼️ **Image Extract** | Unpack `system.img`, `vendor.img`, and other sparse/raw images |
+| 🖼️ **Image Repack** | Rebuild ext4/sparse images from extracted folders |
+| 🔄 **Recovery Porter** | Port recovery/boot images between devices (kernel/ramdisk swap) |
+| 🔌 **Plugin System** | Extend functionality with community plugins |
 
-Download the pre-built executable from [Releases](https://github.com/vehoelite/image-anarchy/releases):
-- **No Python installation required**
-- **No dependencies to install**
-- Just download and run!
+### Plugin System
+| Feature | Description |
+|---------|-------------|
+| 📁 **Folder-Based Discovery** | Drop plugin folders into `plugins/` directory |
+| 💰 **Monetization Support** | Free, paid, or donation-based licensing |
+| 📋 **Auto-Requirements** | Plugins can auto-install their pip dependencies |
+| 🎨 **Full GUI Integration** | Plugins get their own tabs in the main window |
+| 📖 **Developer Guide** | Built-in tutorial for plugin developers |
 
-### Prerequisites (Python Version)
-- Python 3.9 or higher
-- pip (Python package manager)
+---
 
-### Quick Install
+## 🔌 Included Plugins
 
+### ADB Toolkit
+Complete Android Debug Bridge management with 7 specialized tabs:
+
+| Tab | Features |
+|-----|----------|
+| **📱 Info** | Device details, properties, battery status, display info |
+| **💾 Partitions** | List, pull, and backup device partitions |
+| **📁 Files** | Browse, push, pull, and delete files on device |
+| **📦 Apps** | List, install, uninstall, backup, and restore APKs |
+| **🖥️ Shell** | Interactive ADB shell with command history |
+| **🛠️ Tools** | Screenshots, screen recording, logcat, reboot options |
+| **🔄 Reboot** | System, recovery, bootloader, fastboot, EDL modes |
+
+### Fastboot Toolkit  
+Complete bootloader operations with 8 specialized tabs:
+
+| Tab | Features |
+|-----|----------|
+| **📱 Info** | Device info, all variables, partition list |
+| **⚡ Flash** | Flash any image to any partition with safety checks |
+| **🚀 Boot** | Temporarily boot images without flashing |
+| **📥 Fetch** | Pull partitions from device (device support required) |
+| **🗑️ Erase** | Erase partitions with confirmation dialogs |
+| **🔐 OEM** | OEM unlock/lock, critical operations |
+| **🔀 Slot** | A/B slot management for dual-slot devices |
+| **🔄 Reboot** | Bootloader, recovery, system, EDL modes |
+
+### Plugin Developer Guide
+Interactive tutorial showing how to create your own plugins with:
+- Plugin structure and manifest format
+- Monetization options (free, paid, donation)
+- GUI integration examples
+- Best practices and tips
+
+---
+
+## 📋 Requirements
+
+### System Requirements
+- Python 3.8 or higher
+- 4GB+ RAM recommended for large images
+- Windows, Linux, or macOS
+
+### Python Dependencies
+```bash
+pip install PyQt6 protobuf bsdiff4 lz4
+```
+
+### Optional (for advanced features)
+- `simg2img` / `img2simg` - For sparse image conversion (included in platform-tools)
+- `e2fsdroid` / `mke2fs` - For ext4 image packing (Linux)
+
+---
+
+## 🚀 Installation
+
+### Quick Start
 ```bash
 # Clone the repository
 git clone https://github.com/vehoelite/image-anarchy.git
 cd image-anarchy
 
-# Create virtual environment (recommended)
-python -m venv .venv
-
-# Activate virtual environment
-# Windows:
-.venv\Scripts\activate
-# Linux/macOS:
-source .venv/bin/activate
-
 # Install dependencies
-pip install -r requirements.txt
-```
+pip install PyQt6 protobuf bsdiff4 lz4
 
-### Dependencies
-
-**Required:**
-```bash
-pip install PyQt6 bsdiff4 brotli zstandard fsspec protobuf
-```
-
-**Optional (for AVB signing):**
-```bash
-pip install cryptography
-```
-
-### requirements.txt
-```
-PyQt6>=6.4.0
-bsdiff4>=1.2.0
-brotli>=1.0.9
-zstandard>=0.19.0
-fsspec>=2023.1.0
-protobuf>=4.21.0
-cryptography>=40.0.0  # Optional: for AVB key signing
-```
-
----
-
-## 🚀 Usage
-
-### GUI Mode (Default)
-
-```bash
+# Run Image Anarchy
 python image_anarchy.py
 ```
 
-The GUI provides 5 tabs:
-1. **📦 Extract** - Extract partitions from payload.bin
-2. **🔧 Repack** - Create new payload.bin from images
-3. **🔍 Image Extract** - Analyze and extract Android images
-4. **🔨 Image Repack** - Create boot, sparse, vbmeta images
-5. **🔄 Recovery Porter** - Port/modify custom recoveries
-
-### CLI Mode
-
-#### Extract Payload
-```bash
-# Extract all partitions
-python image_anarchy.py --extract payload.bin
-
-# Extract specific partitions
-python image_anarchy.py --extract payload.bin -i boot,system,vendor
-
-# Extract from OTA zip
-python image_anarchy.py --extract ota_update.zip -o ./extracted/
-
-# Extract from URL
-python image_anarchy.py --extract https://example.com/payload.bin
-```
-
-#### Create Payload
-```bash
-# Create payload from images directory
-python image_anarchy.py --create ./images/ -o new_payload.bin
-
-# With compression
-python image_anarchy.py --create ./images/ -o payload.bin --compression zstd --level 9
-
-# With block size
-python image_anarchy.py --create ./images/ -o payload.bin --block-size 262144
-```
-
-#### Process Images
-```bash
-# Convert sparse to raw
-python image_anarchy.py --image system.img
-
-# Extract boot image components
-python image_anarchy.py --image boot.img
-
-# Extract super partition
-python image_anarchy.py --image super.img
-
-# Analyze only (don't extract)
-python image_anarchy.py --image vbmeta.img --analyze
-```
+### From Release
+1. Download the latest release from [Releases](https://github.com/vehoelite/image-anarchy/releases)
+2. Extract the archive
+3. Install dependencies: `pip install PyQt6 protobuf bsdiff4 lz4`
+4. Run: `python image_anarchy.py`
 
 ---
 
-## 📖 Examples
+## 📖 Usage
 
-### Extract and Modify Boot Image
+### Payload Extract
+1. Go to the **Extract** tab
+2. Click **Browse** to select a `payload.bin` file
+3. Choose output directory
+4. Select which partitions to extract (or leave all checked)
+5. Click **Extract**
 
-```bash
-# 1. Extract boot.img from payload
-python image_anarchy.py --extract payload.bin -i boot
+### Payload Repack
+1. Go to the **Repack** tab
+2. Select the original `payload.bin` as reference
+3. Add modified images
+4. Click **Repack** to create new payload
 
-# 2. Extract boot image components (GUI: Image Extract tab)
-#    This gives you: kernel, ramdisk.cpio.gz, dtb, etc.
+### Image Extract
+1. Go to the **Image Extract** tab
+2. Select a system/vendor/product `.img` file
+3. Choose extraction directory
+4. Click **Extract** - handles both sparse and raw images
 
-# 3. Modify ramdisk contents
-#    Unpack: gunzip ramdisk.cpio.gz && cpio -idv < ramdisk.cpio
-#    Make changes...
-#    Repack using GUI: Image Repack tab -> Ramdisk
+### Image Repack
+1. Go to the **Image Repack** tab
+2. Select the extracted folder
+3. Configure image settings (size, label, etc.)
+4. Click **Repack** to create new image
 
-# 4. Create new boot.img (GUI: Image Repack tab -> Boot Image)
-```
+### Recovery Porter
+1. Go to the **Recovery Porter** tab
+2. Select source recovery/boot image (from donor device)
+3. Select target recovery/boot image (your device)
+4. Choose what to port (kernel, ramdisk, or both)
+5. Click **Port** to create hybrid image
 
-### Disable AVB for Custom ROM
-
-```bash
-# Using GUI:
-# 1. Image Extract tab -> Load vbmeta.img
-# 2. Check "Disable dm-verity" and "Disable AVB verification"  
-# 3. Optionally check "Re-sign with custom key"
-# 4. Extract
-
-# Or create fresh disabled vbmeta:
-# Image Repack tab -> vbmeta Image -> Check both disable options -> Create
-```
-
-### Create Sparse Image for Flashing
-
-```bash
-# GUI: Image Repack tab
-# 1. Select "Sparse Image (from raw)"
-# 2. Browse for your raw system.img
-# 3. Set output path
-# 4. Create Image
-
-# Results in smaller file that flashes faster via fastboot
-```
-
-### Analyze ABL (Android Bootloader)
-
-```bash
-# ABL is critical for LG devices (LAF mode), unlock verification, and fastboot
-# GUI: Image Extract tab
-# 1. Load abl.img
-# 2. Click Analyze - shows:
-#    - Unlock status checks (device locked/unlocked detection)
-#    - Secure boot references
-#    - AVB verification calls
-#    - Anti-rollback fuse reads
-#    - LG-specific LAF mode (if LG device)
-#    - Fastboot command handlers
-# 3. Extract to get:
-#    - abl_analysis_report.txt (detailed analysis)
-#    - ELF segments
-
-# Useful for:
-# - Understanding how your bootloader checks unlock status
-# - Finding LAF mode entry points on LG devices
-# - Researching anti-rollback protection
-# - Educational reverse engineering
-```
-
-### Port TWRP to Another Device
-
-```bash
-# GUI: Recovery Porter tab
-# 1. Load source TWRP recovery.img (working on similar device)
-# 2. Click "Analyze" to see recovery structure
-# 3. Replace kernel with target device's kernel
-#    - Get kernel from your device's boot.img
-# 4. Replace DTB if needed (device tree for hardware)
-# 5. Click "Extract All" to extract ramdisk
-# 6. Edit fstab to match target device partitions:
-#    - /dev/block/bootdevice/by-name/system -> your device path
-#    - Update partition names and filesystem types
-# 7. Set output path and click "Build Recovery"
-# 8. Flash: fastboot flash recovery recovery_ported.img
-
-# Recovery Porter detects: TWRP, OrangeFox, SHRP, PitchBlack, LineageOS
-```
+### Using Plugins
+1. Go to the **Plugins** tab
+2. Click on any plugin to open it in a new window
+3. For ADB/Fastboot: Connect your device and click **Refresh Devices**
 
 ---
 
-## 🏗️ Project Structure
+## 🔌 Creating Plugins
+
+### Plugin Structure
+```
+plugins/
+└── my_plugin/
+    ├── manifest.json    # Plugin metadata
+    └── plugin.py        # Plugin code
+```
+
+### manifest.json
+```json
+{
+    "id": "my-plugin",
+    "name": "My Awesome Plugin",
+    "version": "1.0.0",
+    "description": "What my plugin does",
+    "author": "Your Name",
+    "min_app_version": "1.1",
+    "license_type": "free",
+    "requirements": ["requests", "pillow"]
+}
+```
+
+### License Types
+| Type | Description |
+|------|-------------|
+| `free` | Completely free to use |
+| `donation` | Free with donation option |
+| `paid` | Requires purchase |
+
+### plugin.py Template
+```python
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
+
+class Plugin(QWidget):
+    """Your plugin must export a 'Plugin' class"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Hello from my plugin!"))
+```
+
+See the **Plugin Developer Guide** in the Plugins tab for a complete tutorial!
+
+---
+
+## 📁 Project Structure
 
 ```
 image-anarchy/
-├── image_anarchy.py    # Main application (single file, batteries included)
-├── requirements.txt    # Python dependencies
-├── README.md          # This file
-├── LICENSE            # MIT License
-└── .gitignore         # Git ignore rules
+├── image_anarchy.py      # Main application (~11,000 lines)
+├── update_metadata_pb2.py # Protobuf definitions for OTA
+├── README.md
+├── platform-tools/        # Bundled ADB & Fastboot
+│   ├── adb.exe
+│   ├── fastboot.exe
+│   └── ...
+└── plugins/               # Plugin directory
+    ├── adb_toolkit/       # ADB Toolkit plugin
+    ├── fastboot_toolkit/  # Fastboot Toolkit plugin
+    └── developer_guide/   # Plugin development tutorial
 ```
 
-The entire application is contained in a single Python file with embedded protobuf definitions - no external proto files needed!
+---
+
+## 🖼️ Screenshots
+
+<details>
+<summary>Click to expand screenshots</summary>
+
+### Main Interface
+![Payload Extract Tab](screenshots/extract.png)
+
+### Plugin System
+![Plugins Tab](screenshots/plugins.png)
+
+### ADB Toolkit
+![ADB Toolkit](screenshots/adb_toolkit.png)
+
+### Fastboot Toolkit
+![Fastboot Toolkit](screenshots/fastboot_toolkit.png)
+
+</details>
 
 ---
 
-## ✅ Tested On
+## 📜 Changelog
 
-### OTA Payloads
-- Google Pixel 6/7/8/9 (Tensor)
-- Samsung Galaxy S series (Snapdragon)
-- OnePlus devices
-- Xiaomi/Redmi devices
-- Nothing Phone
-- Motorola devices
+### v1.1 - Plugin System Release
+- ✨ **New:** Extensible plugin system with folder-based discovery
+- ✨ **New:** Plugin monetization support (free/paid/donation)
+- ✨ **New:** Auto pip requirements installation for plugins
+- ✨ **New:** ADB Toolkit plugin with 7 comprehensive tools
+- ✨ **New:** Fastboot Toolkit plugin with 8 comprehensive tools
+- ✨ **New:** Plugin Developer Guide with complete tutorial
+- ✨ **New:** Bundled platform-tools (ADB & Fastboot) - zero setup needed
+- 🔧 **Improved:** Expanded window size (1200x900 default)
+- 🔧 **Improved:** Better error handling throughout
 
-### Boot Image Versions
-- v0-v2: Legacy devices
-- v3: Android 11+ GKI
-- v4: Android 12+ GKI (Pixel 6+)
-
-### Recovery Images
-- TWRP 3.x
-- OrangeFox
-- SHRP (Skyhawk)
-- PitchBlack
-- LineageOS Recovery
-
-*If you test on other devices, let us know!*
-
----
-
-## 📋 Changelog
-
-### v1.0 (January 2026)
-- 🎉 Initial public release
-- ✅ Full payload.bin extraction and creation
-- ✅ Boot image v0-v4 support (including Pixel GKI)
-- ✅ Vendor boot image support
-- ✅ Super partition extraction
-- ✅ vbmeta parsing, patching, and custom key signing
-- ✅ DTBO image extraction (device tree overlays)
-- ✅ ABL analysis for Qualcomm, Pixel/Tensor, LG devices
-- ✅ Recovery Porter for TWRP, OrangeFox, etc.
-- ✅ ext4 and FAT filesystem extraction
-- ✅ Modern PyQt6 dark-themed GUI
-- ✅ Windows portable EXE
-
----
-
-## 🗺️ Roadmap
-
-### Planned for v1.x
-- [ ] EROFS filesystem extraction
-- [ ] F2FS filesystem support
-- [ ] Device tree decompiler (DTB → DTS)
-- [ ] Batch processing mode
-- [ ] Drag & drop folders
-- [ ] Bootloader exploit/unlocks
-
-### Planned for v2.0
-- [ ] Magisk-style boot patching (root)
-- [ ] build.prop editor
-- [ ] init.rc script editor
-- [ ] Partition size calculator
-- [ ] OTA diff viewer
-- [ ] Bootloader Replacement **
-- [ ] Multi-language support
-
-### Future Ideas
-- [ ] OTA generator (create OTA from two builds)
-- [ ] A/B slot switcher
-- [ ] Fastboot integration
-- [ ] ADB sideload support
-- [ ] Plugin system for custom extractors
-- [ ] Recovery maker and framework
-- [ ] Kernel Maker
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Feel free to:
-
-- 🐛 Report bugs
-- 💡 Suggest features
-- 🔧 Submit pull requests
+### v1.0 - Initial Release
+- 📦 Payload extraction from OTA files
+- 📦 Payload repacking
+- 🖼️ Sparse/raw image extraction
+- 🖼️ Image repacking with ext4 support
+- 🔄 Recovery/boot image porting
+- 🎨 Dark-themed PyQt6 GUI
+- 🚀 Multi-threaded operations
 
 ---
 
 ## ⚠️ Disclaimer
 
-This tool is provided for **educational and development/repair purposes**. 
+**USE AT YOUR OWN RISK!**
 
-- Modifying device images may void your warranty
-- Always backup your data before flashing modified images
-- Disabling AVB/dm-verity reduces device security
-- Always follow your state and federal laws 
-- Use at your own risk
+This tool modifies Android system images and interacts with device partitions. Improper use can:
+- Brick your device
+- Void your warranty
+- Cause data loss
+
+Always:
+- ✅ Backup your device before making changes
+- ✅ Understand what you're doing
+- ✅ Have a recovery method ready
+- ✅ Test on non-critical devices first
+
+The developers are not responsible for any damage to your devices.
 
 ---
 
-## � Support
+## 🤝 Contributing
 
-If this tool saved you time, consider supporting development:
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+### Plugin Contributions
+Want to share your plugin? 
+1. Create your plugin following the structure above
+2. Test thoroughly
+3. Submit a PR adding your plugin to the `plugins/` directory
+
+---
+
+## 💖 Support
+
+If you find Image Anarchy useful, consider supporting development:
 
 **Bitcoin:** `bc1qx5kp5sx67qe2fd32h6ne7jvw6xpzy2xhnph0rs`
 
----
-
-## �📜 License
-
-MIT License - See [LICENSE](LICENSE) for details.
+Or star ⭐ the repository to show your appreciation!
 
 ---
 
-## 🙏 Acknowledgments
+## 📄 License
 
-- Android Open Source Project
-- Chromium OS update_engine
-- The Android modding community
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Credits
+
+- **bsdiff4** - Binary diff/patch algorithms
+- **protobuf** - Protocol buffer support for OTA metadata
+- **PyQt6** - Modern GUI framework
+- **lz4** - Fast compression for payload data
+- **Android Open Source Project** - Platform tools and documentation
 
 ---
 
 <p align="center">
-  <b>Ⓐ Break the chains. Free your images. Ⓐ</b>
+  Made with ❤️ for the Android modding community
 </p>
 
 <p align="center">
-  Made with ☕ and rebellion
+  <a href="https://github.com/vehoelite/image-anarchy">⭐ Star on GitHub</a> •
+  <a href="https://github.com/vehoelite/image-anarchy/issues">🐛 Report Bug</a> •
+  <a href="https://github.com/vehoelite/image-anarchy/issues">💡 Request Feature</a>
 </p>
