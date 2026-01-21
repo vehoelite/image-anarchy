@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
+Version: 1.1
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -22,6 +23,10 @@ Features:
   * Sparse images from raw
   * vbmeta images (disabled AVB)
   * Ramdisk from directory
+- PLUGINS: Extensible plugin system with ADB/Fastboot toolkits
+  * ADB Toolkit - Device info, partitions, files, apps, shell, reboot
+  * Fastboot Toolkit - Flash, boot, fetch, erase, OEM unlock, slots
+  * Create your own plugins with monetization support!
 - Support for local files and remote URLs (http, https, s3, gs)
 - Automatic zip file handling
 - Differential OTA support (extract only)
@@ -57,9 +62,12 @@ import bz2
 import gzip
 import hashlib
 import io
+import json
 import logging
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import urllib.parse
 import zipfile
@@ -6452,6 +6460,703 @@ def run_image_extract(args) -> None:
 
 
 # =============================================================================
+# PLUGIN SYSTEM
+# =============================================================================
+
+@dataclass
+class PluginManifest:
+    """Plugin metadata from manifest.json."""
+    id: str
+    name: str
+    version: str
+    description: str
+    author: str
+    icon: str = "🔌"
+    # Monetization
+    license_type: str = "free"  # free, paid, donation
+    price: float = 0.0
+    currency: str = "USD"
+    payment_address: str = ""  # BTC address, PayPal, etc.
+    payment_type: str = ""  # btc, paypal, kofi, etc.
+    # Links
+    website: str = ""
+    support_url: str = ""
+    # Requirements
+    min_version: str = "1.0"
+    requirements: List[str] = None  # pip packages needed, e.g. ["requests", "pillow>=9.0"]
+    # State
+    enabled: bool = True
+    licensed: bool = False  # For paid plugins
+    
+    def __post_init__(self):
+        if self.requirements is None:
+            self.requirements = []
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], plugin_id: str) -> 'PluginManifest':
+        """Create manifest from dictionary."""
+        return cls(
+            id=plugin_id,
+            name=data.get('name', plugin_id),
+            version=data.get('version', '1.0'),
+            description=data.get('description', ''),
+            author=data.get('author', 'Unknown'),
+            icon=data.get('icon', '🔌'),
+            license_type=data.get('license_type', 'free'),
+            price=float(data.get('price', 0.0)),
+            currency=data.get('currency', 'USD'),
+            payment_address=data.get('payment_address', ''),
+            payment_type=data.get('payment_type', ''),
+            website=data.get('website', ''),
+            support_url=data.get('support_url', ''),
+            min_version=data.get('min_version', '1.0'),
+            requirements=data.get('requirements', []),
+            enabled=data.get('enabled', True),
+            licensed=data.get('licensed', False)
+        )
+
+
+class PluginBase:
+    """Base class for Image Anarchy plugins.
+    
+    To create a plugin:
+    1. Create a folder in 'plugins/' with your plugin id
+    2. Add manifest.json with plugin metadata
+    3. Add plugin.py with a class that inherits from PluginBase
+    4. Implement: get_name(), get_icon(), get_description(), create_widget()
+    
+    Example manifest.json:
+    {
+        "name": "My Plugin",
+        "version": "1.0",
+        "description": "Does something cool",
+        "author": "Your Name",
+        "icon": "🚀",
+        "license_type": "donation",
+        "payment_address": "bc1q...",
+        "payment_type": "btc",
+        "requirements": ["requests", "pillow"]
+    }
+    """
+    
+    manifest: Optional[PluginManifest] = None
+    
+    def get_name(self) -> str:
+        """Return the plugin name."""
+        return self.manifest.name if self.manifest else "Unknown Plugin"
+    
+    def get_icon(self) -> str:
+        """Return emoji icon."""
+        return self.manifest.icon if self.manifest else "🔌"
+    
+    def get_description(self) -> str:
+        """Return plugin description."""
+        return self.manifest.description if self.manifest else ""
+    
+    def get_version(self) -> str:
+        """Return plugin version."""
+        return self.manifest.version if self.manifest else "1.0"
+    
+    def get_author(self) -> str:
+        """Return plugin author."""
+        return self.manifest.author if self.manifest else "Unknown"
+    
+    def create_widget(self, parent_window) -> Any:
+        """Create and return the main QWidget for this plugin.
+        
+        Args:
+            parent_window: The main ImageAnarchyGUI window instance
+            
+        Returns:
+            QWidget: The plugin's widget
+        """
+        raise NotImplementedError("Plugins must implement create_widget()")
+    
+    def on_load(self):
+        """Called when plugin is loaded."""
+        pass
+    
+    def on_unload(self):
+        """Called when plugin is unloaded."""
+        pass
+    
+    def is_licensed(self) -> bool:
+        """Check if plugin is licensed (for paid plugins)."""
+        if not self.manifest:
+            return True
+        if self.manifest.license_type == "free":
+            return True
+        return self.manifest.licensed
+    
+    def validate_license(self, license_key: str) -> bool:
+        """Validate a license key. Override for custom validation."""
+        # Default: accept any non-empty key
+        return bool(license_key and len(license_key) > 0)
+
+
+class PluginManager:
+    """Manages plugin discovery, loading, and lifecycle."""
+    
+    PLUGINS_DIR = "plugins"
+    CONFIG_FILE = "plugins_config.json"
+    
+    def __init__(self):
+        self.plugins: Dict[str, PluginBase] = {}
+        self.manifests: Dict[str, PluginManifest] = {}
+        self.config: Dict[str, Any] = {}
+        self._load_config()
+    
+    def _get_plugins_dir(self) -> str:
+        """Get the plugins directory path."""
+        # Check multiple locations
+        if getattr(sys, 'frozen', False):
+            # Running as compiled exe
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            # Running as script
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        plugins_dir = os.path.join(base_dir, self.PLUGINS_DIR)
+        os.makedirs(plugins_dir, exist_ok=True)
+        return plugins_dir
+    
+    def _get_config_path(self) -> str:
+        """Get the config file path."""
+        return os.path.join(self._get_plugins_dir(), self.CONFIG_FILE)
+    
+    def _load_config(self):
+        """Load plugin configuration (enabled states, licenses)."""
+        config_path = self._get_config_path()
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    self.config = json.load(f)
+            except Exception:
+                self.config = {}
+        else:
+            self.config = {}
+    
+    def _save_config(self):
+        """Save plugin configuration."""
+        config_path = self._get_config_path()
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save plugin config: {e}")
+    
+    def discover_plugins(self) -> List[PluginManifest]:
+        """Discover all plugins in the plugins directory."""
+        plugins_dir = self._get_plugins_dir()
+        discovered = []
+        
+        if not os.path.exists(plugins_dir):
+            return discovered
+        
+        for item in os.listdir(plugins_dir):
+            plugin_path = os.path.join(plugins_dir, item)
+            manifest_path = os.path.join(plugin_path, "manifest.json")
+            
+            if os.path.isdir(plugin_path) and os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    manifest = PluginManifest.from_dict(data, item)
+                    
+                    # Apply saved config
+                    plugin_config = self.config.get(item, {})
+                    manifest.enabled = plugin_config.get('enabled', True)
+                    manifest.licensed = plugin_config.get('licensed', False)
+                    
+                    self.manifests[item] = manifest
+                    discovered.append(manifest)
+                    
+                except Exception as e:
+                    print(f"Failed to load plugin manifest {item}: {e}")
+        
+        return discovered
+    
+    def load_plugin(self, plugin_id: str) -> Optional[PluginBase]:
+        """Load a plugin by its ID."""
+        if plugin_id in self.plugins:
+            return self.plugins[plugin_id]
+        
+        plugins_dir = self._get_plugins_dir()
+        plugin_path = os.path.join(plugins_dir, plugin_id)
+        plugin_file = os.path.join(plugin_path, "plugin.py")
+        
+        if not os.path.exists(plugin_file):
+            print(f"Plugin file not found: {plugin_file}")
+            return None
+        
+        try:
+            # Load the plugin module
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(f"plugin_{plugin_id}", plugin_file)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[f"plugin_{plugin_id}"] = module
+                spec.loader.exec_module(module)
+                
+                # Find the plugin class - first check for 'Plugin' export (preferred)
+                plugin_class = None
+                if hasattr(module, 'Plugin'):
+                    plugin_class = module.Plugin
+                else:
+                    # Fallback: look for PluginBase subclass
+                    for name, obj in module.__dict__.items():
+                        if isinstance(obj, type) and issubclass(obj, PluginBase) and obj != PluginBase:
+                            plugin_class = obj
+                            break
+                
+                if plugin_class:
+                    plugin = plugin_class()
+                    plugin.manifest = self.manifests.get(plugin_id)
+                    if hasattr(plugin, 'on_load'):
+                        plugin.on_load()
+                    self.plugins[plugin_id] = plugin
+                    return plugin
+                else:
+                    print(f"No Plugin class found in {plugin_file}")
+                    
+        except Exception as e:
+            print(f"Failed to load plugin {plugin_id}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return None
+    
+    def unload_plugin(self, plugin_id: str):
+        """Unload a plugin."""
+        if plugin_id in self.plugins:
+            self.plugins[plugin_id].on_unload()
+            del self.plugins[plugin_id]
+    
+    def enable_plugin(self, plugin_id: str, enabled: bool):
+        """Enable or disable a plugin."""
+        if plugin_id in self.manifests:
+            self.manifests[plugin_id].enabled = enabled
+            
+            if plugin_id not in self.config:
+                self.config[plugin_id] = {}
+            self.config[plugin_id]['enabled'] = enabled
+            self._save_config()
+    
+    def set_licensed(self, plugin_id: str, licensed: bool):
+        """Set plugin license status."""
+        if plugin_id in self.manifests:
+            self.manifests[plugin_id].licensed = licensed
+            
+            if plugin_id not in self.config:
+                self.config[plugin_id] = {}
+            self.config[plugin_id]['licensed'] = licensed
+            self._save_config()
+    
+    def get_plugin(self, plugin_id: str) -> Optional[PluginBase]:
+        """Get a loaded plugin."""
+        return self.plugins.get(plugin_id)
+    
+    def get_manifest(self, plugin_id: str) -> Optional[PluginManifest]:
+        """Get a plugin's manifest."""
+        return self.manifests.get(plugin_id)
+    
+    def get_all_manifests(self) -> List[PluginManifest]:
+        """Get all discovered plugin manifests."""
+        return list(self.manifests.values())
+    
+    def check_requirements(self, plugin_id: str) -> tuple:
+        """Check if a plugin's requirements are installed.
+        
+        Returns:
+            tuple: (all_installed: bool, missing: List[str], installed: List[str])
+        """
+        manifest = self.manifests.get(plugin_id)
+        if not manifest or not manifest.requirements:
+            return True, [], []
+        
+        missing = []
+        installed = []
+        
+        for req in manifest.requirements:
+            # Parse package name (handle version specs like "requests>=2.0")
+            pkg_name = req.split('>=')[0].split('<=')[0].split('==')[0].split('<')[0].split('>')[0].strip()
+            
+            try:
+                __import__(pkg_name.replace('-', '_'))
+                installed.append(req)
+            except ImportError:
+                missing.append(req)
+        
+        return len(missing) == 0, missing, installed
+    
+    def install_requirements(self, requirements: List[str]) -> tuple:
+        """Install pip packages.
+        
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        if not requirements:
+            return True, "No requirements to install"
+        
+        try:
+            import subprocess
+            import sys
+            
+            # Use pip to install
+            cmd = [sys.executable, '-m', 'pip', 'install'] + requirements
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            
+            if result.returncode == 0:
+                return True, f"Successfully installed: {', '.join(requirements)}"
+            else:
+                return False, f"pip error: {result.stderr}"
+                
+        except subprocess.TimeoutExpired:
+            return False, "Installation timed out (5 minutes)"
+        except Exception as e:
+            return False, f"Installation failed: {str(e)}"
+    
+    def create_example_plugin(self):
+        """Create a developer guide plugin to show how to create plugins."""
+        plugins_dir = self._get_plugins_dir()
+        guide_dir = os.path.join(plugins_dir, "developer_guide")
+        
+        if os.path.exists(guide_dir):
+            return  # Already exists
+        
+        os.makedirs(guide_dir, exist_ok=True)
+        
+        # Create manifest.json
+        manifest = {
+            "name": "Plugin Developer Guide",
+            "version": "1.0",
+            "description": "Learn how to create plugins for Image Anarchy - earn money doing what you love!",
+            "author": "Image Anarchy",
+            "icon": "🛠️",
+            "license_type": "free",
+            "website": "https://github.com/vehoelite/image-anarchy",
+            "min_version": "1.0"
+        }
+        
+        with open(os.path.join(guide_dir, "manifest.json"), 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2)
+        
+        # Create plugin.py - Developer Guide
+        plugin_code = '''"""
+Plugin Developer Guide for Image Anarchy
+Learn how to create plugins and monetize your skills!
+"""
+
+from __main__ import PluginBase
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, 
+    QTextEdit, QGroupBox, QScrollArea, QFrame
+)
+from PyQt6.QtCore import Qt
+import webbrowser
+import os
+import subprocess
+import sys
+
+
+class DeveloperGuidePlugin(PluginBase):
+    """Interactive developer guide for creating Image Anarchy plugins."""
+    
+    def create_widget(self, parent_window):
+        """Create the developer guide widget."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+        
+        # Hero Section
+        hero = QLabel("Create Plugins for Image Anarchy")
+        hero.setStyleSheet("font-size: 24px; font-weight: bold; color: #4fc3f7;")
+        hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(hero)
+        
+        subtitle = QLabel("Build powerful tools for Android enthusiasts - and earn money doing it!")
+        subtitle.setStyleSheet("font-size: 14px; color: #aaa; margin-bottom: 20px;")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+        
+        # Why Create Plugins
+        why_group = QGroupBox("Why Create Plugins?")
+        why_layout = QVBoxLayout(why_group)
+        why_items = [
+            "Reach thousands of users - Image Anarchy is used by Android enthusiasts worldwide",
+            "Monetize your skills - Set your price, accept BTC, PayPal, Ko-fi, or Patreon",
+            "It is incredibly easy - Just 2 files: manifest.json + plugin.py",
+            "Full PyQt6 power - Create any UI you can imagine",
+            "Access core features - Use Image Anarchy extractors, packers, and utilities"
+        ]
+        for item in why_items:
+            lbl = QLabel("* " + item)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("font-size: 13px; padding: 4px 0;")
+            why_layout.addWidget(lbl)
+        layout.addWidget(why_group)
+        
+        # How Easy Section
+        easy_group = QGroupBox("How Easy Is It? Just 3 Steps!")
+        easy_layout = QVBoxLayout(easy_group)
+        
+        steps = [
+            ("Step 1:", "Create a folder in the plugins directory"),
+            ("Step 2:", "Add manifest.json with your plugin info (name, author, price)"),
+            ("Step 3:", "Add plugin.py with your code - implement create_widget()"),
+        ]
+        for title, desc in steps:
+            step_lbl = QLabel(f"<b>{title}</b> {desc}")
+            step_lbl.setTextFormat(Qt.TextFormat.RichText)
+            step_lbl.setStyleSheet("font-size: 13px; padding: 6px 0;")
+            easy_layout.addWidget(step_lbl)
+        layout.addWidget(easy_group)
+        
+        # Code Example
+        code_group = QGroupBox("Minimal Plugin Example (plugin.py)")
+        code_layout = QVBoxLayout(code_group)
+        
+        code_text = QTextEdit()
+        code_text.setReadOnly(True)
+        code_text.setMaximumHeight(260)
+        code_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #1a1a2e;
+                color: #4fc3f7;
+                font-family: Consolas, Courier New, monospace;
+                font-size: 11px;
+                padding: 10px;
+                border: 1px solid #333;
+            }
+        """)
+        code_text.setPlainText("""# plugin.py - This is ALL you need!
+
+from __main__ import PluginBase
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
+
+class MyPlugin(PluginBase):
+    
+    def create_widget(self, parent_window):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        layout.addWidget(QLabel("Hello from my plugin!"))
+        
+        btn = QPushButton("Do Something Cool")
+        btn.clicked.connect(self.do_something)
+        layout.addWidget(btn)
+        
+        return widget
+    
+    def do_something(self):
+        print("Plugin is working!")""")
+        code_layout.addWidget(code_text)
+        layout.addWidget(code_group)
+        
+        # Monetization Section
+        money_group = QGroupBox("Monetization Options")
+        money_layout = QVBoxLayout(money_group)
+        
+        money_intro = QLabel("Set license_type in your manifest.json:")
+        money_intro.setStyleSheet("font-size: 13px; font-weight: bold;")
+        money_layout.addWidget(money_intro)
+        
+        license_types = [
+            '"free" - Open to everyone',
+            '"donation" - Free with optional tip jar shown to users',
+            '"paid" - Users see your price and payment info before using',
+        ]
+        for lt in license_types:
+            lbl = QLabel("* " + lt)
+            lbl.setStyleSheet("font-size: 12px; padding: 2px 0;")
+            money_layout.addWidget(lbl)
+        
+        payment_label = QLabel("\\nSupported payment methods:")
+        payment_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+        money_layout.addWidget(payment_label)
+        
+        payments = ["Bitcoin (BTC) - Direct wallet", "PayPal - Payment links", 
+                   "Ko-fi - Creator support", "Patreon - Subscriptions", "GitHub Sponsors"]
+        for p in payments:
+            lbl = QLabel("* " + p)
+            lbl.setStyleSheet("font-size: 12px; padding: 2px 0;")
+            money_layout.addWidget(lbl)
+        layout.addWidget(money_group)
+        
+        # Requirements Section
+        req_group = QGroupBox("Using pip Packages")
+        req_layout = QVBoxLayout(req_group)
+        
+        req_intro = QLabel("Need external packages? Add them to manifest.json:")
+        req_intro.setStyleSheet("font-size: 13px; font-weight: bold;")
+        req_layout.addWidget(req_intro)
+        
+        req_example = QTextEdit()
+        req_example.setReadOnly(True)
+        req_example.setMaximumHeight(80)
+        req_example.setStyleSheet("""
+            QTextEdit {
+                background-color: #1a1a2e;
+                color: #4fc3f7;
+                font-family: Consolas, Courier New, monospace;
+                font-size: 11px;
+                padding: 8px;
+                border: 1px solid #333;
+            }
+        """)
+        req_example.setPlainText('{\n    "requirements": ["requests", "pillow>=9.0", "beautifulsoup4"]\n}')
+        req_layout.addWidget(req_example)
+        
+        req_note = QLabel("Users will be prompted to install missing packages automatically!")
+        req_note.setStyleSheet("font-size: 12px; color: #4caf50; padding: 4px 0;")
+        req_layout.addWidget(req_note)
+        layout.addWidget(req_group)
+        
+        # Plugin Ideas
+        ideas_group = QGroupBox("Plugin Ideas to Get You Started")
+        ideas_layout = QVBoxLayout(ideas_group)
+        
+        ideas = [
+            "Build.prop Editor - Visual editor for system properties",
+            "Boot Animation Creator - Design custom boot animations", 
+            "Partition Analyzer - Deep analysis of partition contents",
+            "Device Profiles - Save/restore device configurations",
+            "Batch Processor - Process multiple images at once",
+            "OTA Downloader - Download OTAs from manufacturers",
+        ]
+        for idea in ideas:
+            lbl = QLabel("* " + idea)
+            lbl.setStyleSheet("font-size: 12px; padding: 2px 0;")
+            ideas_layout.addWidget(lbl)
+        layout.addWidget(ideas_group)
+        
+        # Action Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        docs_btn = QPushButton("Documentation")
+        docs_btn.setStyleSheet("padding: 10px 20px;")
+        docs_btn.clicked.connect(lambda: webbrowser.open("https://github.com/vehoelite/image-anarchy"))
+        btn_layout.addWidget(docs_btn)
+        
+        folder_btn = QPushButton("Open Plugins Folder")
+        folder_btn.setStyleSheet("padding: 10px 20px;")
+        folder_btn.clicked.connect(self._open_folder)
+        btn_layout.addWidget(folder_btn)
+        
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # Footer
+        footer = QLabel("Questions? Join our community on GitHub or XDA!")
+        footer.setStyleSheet("color: #666; font-style: italic; margin-top: 20px;")
+        footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(footer)
+        
+        layout.addStretch()
+        scroll.setWidget(widget)
+        return scroll
+    
+    def _open_folder(self):
+        plugins_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if sys.platform == "win32":
+            os.startfile(plugins_dir)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", plugins_dir])
+        else:
+            subprocess.run(["xdg-open", plugins_dir])
+'''
+        
+        with open(os.path.join(guide_dir, "plugin.py"), 'w', encoding='utf-8') as f:
+            f.write(plugin_code)
+        
+        # Create README
+        readme = """# Plugin Developer Guide
+
+Learn how to create plugins for Image Anarchy!
+
+## Quick Start
+
+1. Create a folder in `plugins/`
+2. Add `manifest.json` with your plugin info
+3. Add `plugin.py` with your PluginBase class
+4. Restart Image Anarchy - your plugin appears automatically!
+
+## Manifest Example
+
+```json
+{
+    "name": "My Cool Plugin",
+    "version": "1.0",
+    "description": "Does amazing things",
+    "author": "Your Name",
+    "icon": "rocket",
+    "license_type": "paid",
+    "price": 5.00,
+    "currency": "USD",
+    "payment_address": "your-btc-address",
+    "payment_type": "btc"
+}
+```
+
+## Resources
+
+- Documentation: https://github.com/vehoelite/image-anarchy
+- Community: XDA Forums
+"""
+        
+        with open(os.path.join(guide_dir, "README.md"), 'w', encoding='utf-8') as f:
+            f.write(readme)
+
+
+# Global plugin manager
+plugin_manager = PluginManager()
+
+
+# =============================================================================
+# BUILT-IN PLUGINS (bundled with the app)
+# =============================================================================
+
+class AdbPartitionPullerBuiltin(PluginBase):
+    """Built-in ADB Partition Puller plugin."""
+    
+    def __init__(self):
+        self.manifest = PluginManifest(
+            id="adb_puller",
+            name="ADB Partition Puller",
+            version="1.0",
+            description="Pull partitions directly from Android devices via ADB. Supports rooted and recovery mode devices.",
+            author="Image Anarchy",
+            icon="📱",
+            license_type="free"
+        )
+        self.worker_thread = None
+        self.devices = []
+        self.partitions = []
+        self._pull_queue = []
+    
+    def create_widget(self, parent_window):
+        """Create the ADB puller widget - will be set up in GUI context."""
+        self.parent_window = parent_window
+        return None  # Will be created in GUI context
+
+
+# Register built-in plugins
+_builtin_plugins = [AdbPartitionPullerBuiltin()]
+
+
+# =============================================================================
 # GUI COMPONENTS (PyQt6)
 # =============================================================================
 
@@ -6466,7 +7171,7 @@ def create_gui_app():
         QComboBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QHeaderView,
         QFormLayout, QRadioButton
     )
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal
+    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
     from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor
 
     @dataclass
@@ -6889,8 +7594,8 @@ def create_gui_app():
         
         def _setup_ui(self):
             self.setWindowTitle("Image Anarchy - Android Image Swiss Army Knife")
-            self.setMinimumSize(900, 700)
-            self.resize(1000, 750)
+            self.setMinimumSize(1100, 800)
+            self.resize(1200, 900)
             
             central = QWidget()
             self.setCentralWidget(central)
@@ -9596,7 +10301,468 @@ def create_gui_app():
             self.log.emit(f"Copied to: {dst_path}")
             self.progress.emit(1, 1, "Copy complete")
 
-    return QApplication, ImageAnarchyGUI, QPalette, QColor
+    # =========================================================================
+    # PLUGINS MANAGEMENT TAB
+    # =========================================================================
+    
+    class PluginsTab(QWidget):
+        """Tab for managing plugins - browse, enable/disable, view info, open."""
+        
+        def __init__(self, parent_window):
+            super().__init__()
+            self.parent_window = parent_window
+            self.loaded_widgets: Dict[str, QWidget] = {}
+            self.builtin_plugins = {}
+            
+            self._setup_ui()
+            self._load_plugins()
+        
+        def _log(self, message: str):
+            """Log a message (print to console for now)."""
+            print(f"[Plugins] {message}")
+        
+        def _setup_ui(self):
+            layout = QVBoxLayout(self)
+            layout.setSpacing(12)
+            layout.setContentsMargins(8, 12, 8, 8)
+            
+            # Header
+            header_layout = QHBoxLayout()
+            title = QLabel("🔌 Plugin Manager")
+            title.setStyleSheet("font-size: 16px; font-weight: bold;")
+            header_layout.addWidget(title)
+            header_layout.addStretch()
+            
+            refresh_btn = QPushButton("🔄 Refresh")
+            refresh_btn.clicked.connect(self._load_plugins)
+            header_layout.addWidget(refresh_btn)
+            
+            open_folder_btn = QPushButton("📁 Open Plugins Folder")
+            open_folder_btn.clicked.connect(self._open_plugins_folder)
+            header_layout.addWidget(open_folder_btn)
+            
+            layout.addLayout(header_layout)
+            
+            # Splitter for plugin list and details
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+            
+            # Plugin list
+            list_widget = QWidget()
+            list_layout = QVBoxLayout(list_widget)
+            list_layout.setContentsMargins(0, 0, 0, 0)
+            
+            list_label = QLabel("Installed Plugins")
+            list_label.setStyleSheet("font-weight: bold;")
+            list_layout.addWidget(list_label)
+            
+            self.plugin_list = QListWidget()
+            self.plugin_list.setMinimumWidth(250)
+            self.plugin_list.currentItemChanged.connect(self._on_plugin_selected)
+            self.plugin_list.itemDoubleClicked.connect(self._open_plugin)
+            list_layout.addWidget(self.plugin_list)
+            
+            splitter.addWidget(list_widget)
+            
+            # Plugin details
+            details_widget = QWidget()
+            details_layout = QVBoxLayout(details_widget)
+            details_layout.setContentsMargins(0, 0, 0, 0)
+            
+            details_label = QLabel("Plugin Details")
+            details_label.setStyleSheet("font-weight: bold;")
+            details_layout.addWidget(details_label)
+            
+            self.details_group = QGroupBox()
+            self.details_layout = QVBoxLayout(self.details_group)
+            
+            # Plugin info labels
+            self.plugin_icon = QLabel("🔌")
+            self.plugin_icon.setStyleSheet("font-size: 48px;")
+            self.plugin_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.details_layout.addWidget(self.plugin_icon)
+            
+            self.plugin_name = QLabel("Select a plugin")
+            self.plugin_name.setStyleSheet("font-size: 18px; font-weight: bold;")
+            self.plugin_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.details_layout.addWidget(self.plugin_name)
+            
+            self.plugin_version = QLabel("")
+            self.plugin_version.setStyleSheet("color: #888;")
+            self.plugin_version.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.details_layout.addWidget(self.plugin_version)
+            
+            self.plugin_author = QLabel("")
+            self.plugin_author.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.details_layout.addWidget(self.plugin_author)
+            
+            self.plugin_desc = QLabel("")
+            self.plugin_desc.setWordWrap(True)
+            self.plugin_desc.setStyleSheet("margin: 10px;")
+            self.details_layout.addWidget(self.plugin_desc)
+            
+            # License/Payment info
+            self.payment_group = QGroupBox("Support the Developer")
+            payment_layout = QVBoxLayout(self.payment_group)
+            
+            self.license_label = QLabel("")
+            self.license_label.setWordWrap(True)
+            payment_layout.addWidget(self.license_label)
+            
+            self.payment_btn = QPushButton("💰 Support / Purchase")
+            self.payment_btn.clicked.connect(self._open_payment)
+            self.payment_btn.setVisible(False)
+            payment_layout.addWidget(self.payment_btn)
+            
+            self.payment_group.setVisible(False)
+            self.details_layout.addWidget(self.payment_group)
+            
+            self.details_layout.addStretch()
+            
+            # Action buttons
+            btn_layout = QHBoxLayout()
+            
+            self.enable_btn = QPushButton("✓ Enable")
+            self.enable_btn.clicked.connect(self._toggle_enable)
+            self.enable_btn.setEnabled(False)
+            btn_layout.addWidget(self.enable_btn)
+            
+            self.open_btn = QPushButton("▶ Open Plugin")
+            self.open_btn.setProperty("primary", True)
+            self.open_btn.clicked.connect(self._open_plugin)
+            self.open_btn.setEnabled(False)
+            btn_layout.addWidget(self.open_btn)
+            
+            self.details_layout.addLayout(btn_layout)
+            
+            details_layout.addWidget(self.details_group)
+            splitter.addWidget(details_widget)
+            
+            splitter.setSizes([300, 500])
+            layout.addWidget(splitter)
+            
+            # Plugin content area (shown when a plugin is opened)
+            self.plugin_container = QWidget()
+            self.plugin_container_layout = QVBoxLayout(self.plugin_container)
+            self.plugin_container_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Back button header
+            back_header = QHBoxLayout()
+            self.back_btn = QPushButton("← Back to Plugins")
+            self.back_btn.clicked.connect(self._close_plugin)
+            back_header.addWidget(self.back_btn)
+            
+            self.active_plugin_label = QLabel("")
+            self.active_plugin_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+            back_header.addWidget(self.active_plugin_label)
+            back_header.addStretch()
+            self.plugin_container_layout.addLayout(back_header)
+            
+            # Plugin widget holder
+            self.plugin_widget_holder = QWidget()
+            self.plugin_widget_layout = QVBoxLayout(self.plugin_widget_holder)
+            self.plugin_widget_layout.setContentsMargins(0, 0, 0, 0)
+            self.plugin_container_layout.addWidget(self.plugin_widget_holder)
+            
+            self.plugin_container.setVisible(False)
+            layout.addWidget(self.plugin_container)
+            
+            # Store reference to main view
+            self.main_view = splitter
+            
+            # Info label at bottom
+            info_label = QLabel(
+                "💡 Drop plugins into the 'plugins' folder to install them. "
+                "Double-click a plugin to open it."
+            )
+            info_label.setStyleSheet("color: #888; font-style: italic;")
+            layout.addWidget(info_label)
+        
+        def _load_plugins(self):
+            """Load and display all available plugins."""
+            self.plugin_list.clear()
+            
+            # Create example plugin if plugins folder is empty
+            plugin_manager.create_example_plugin()
+            
+            # Discover external plugins
+            external_plugins = plugin_manager.discover_plugins()
+            
+            # Add built-in plugins first
+            for plugin_id, plugin in self.builtin_plugins.items():
+                manifest = plugin.manifest
+                item = QListWidgetItem(f"{manifest.icon} {manifest.name}")
+                item.setData(Qt.ItemDataRole.UserRole, {
+                    'id': plugin_id,
+                    'builtin': True,
+                    'manifest': manifest
+                })
+                if manifest.license_type == "free":
+                    item.setToolTip("Free (built-in)")
+                self.plugin_list.addItem(item)
+            
+            # Add external plugins
+            for manifest in external_plugins:
+                icon = manifest.icon
+                if not manifest.enabled:
+                    icon = "⭕"  # Disabled indicator
+                
+                item = QListWidgetItem(f"{icon} {manifest.name}")
+                item.setData(Qt.ItemDataRole.UserRole, {
+                    'id': manifest.id,
+                    'builtin': False,
+                    'manifest': manifest
+                })
+                
+                # Tooltip with license info
+                tip = f"v{manifest.version} by {manifest.author}"
+                if manifest.license_type == "paid":
+                    tip += f" - ${manifest.price} {manifest.currency}"
+                elif manifest.license_type == "donation":
+                    tip += " - Donations welcome"
+                item.setToolTip(tip)
+                
+                self.plugin_list.addItem(item)
+        
+        def _on_plugin_selected(self, current, previous):
+            """Show details for selected plugin."""
+            if not current:
+                return
+            
+            data = current.data(Qt.ItemDataRole.UserRole)
+            manifest = data['manifest']
+            
+            self.plugin_icon.setText(manifest.icon)
+            self.plugin_name.setText(manifest.name)
+            self.plugin_version.setText(f"Version {manifest.version}")
+            self.plugin_author.setText(f"by {manifest.author}")
+            self.plugin_desc.setText(manifest.description)
+            
+            # Update enable button
+            if data['builtin']:
+                self.enable_btn.setText("✓ Built-in")
+                self.enable_btn.setEnabled(False)
+            else:
+                if manifest.enabled:
+                    self.enable_btn.setText("✓ Enabled")
+                else:
+                    self.enable_btn.setText("○ Disabled")
+                self.enable_btn.setEnabled(True)
+            
+            self.open_btn.setEnabled(manifest.enabled)
+            
+            # Payment/license info
+            if manifest.license_type in ("paid", "donation"):
+                self.payment_group.setVisible(True)
+                
+                if manifest.license_type == "paid":
+                    if manifest.licensed:
+                        self.license_label.setText("✓ Licensed - Thank you for your support!")
+                        self.payment_btn.setText("💝 Tip the Developer")
+                    else:
+                        self.license_label.setText(
+                            f"This plugin costs ${manifest.price:.2f} {manifest.currency}.\n"
+                            "Please support the developer to unlock all features."
+                        )
+                        self.payment_btn.setText(f"💰 Purchase (${manifest.price:.2f})")
+                else:
+                    self.license_label.setText(
+                        "This plugin is free, but donations help the developer\n"
+                        "continue creating great tools!"
+                    )
+                    self.payment_btn.setText("💝 Donate")
+                
+                self.payment_btn.setVisible(bool(manifest.payment_address))
+                self._current_payment_info = {
+                    'address': manifest.payment_address,
+                    'type': manifest.payment_type,
+                    'price': manifest.price
+                }
+            else:
+                self.payment_group.setVisible(False)
+        
+        def _toggle_enable(self):
+            """Toggle the selected plugin's enabled state."""
+            current = self.plugin_list.currentItem()
+            if not current:
+                return
+            
+            data = current.data(Qt.ItemDataRole.UserRole)
+            if data['builtin']:
+                return
+            
+            manifest = data['manifest']
+            new_state = not manifest.enabled
+            plugin_manager.enable_plugin(manifest.id, new_state)
+            
+            # Refresh list
+            self._load_plugins()
+        
+        def _open_payment(self):
+            """Open payment link or show payment address."""
+            if not hasattr(self, '_current_payment_info'):
+                return
+            
+            info = self._current_payment_info
+            if info['type'] == 'btc':
+                # Show BTC address with copy option
+                QMessageBox.information(
+                    self,
+                    "Bitcoin Payment",
+                    f"Send payment to:\n\n{info['address']}\n\n"
+                    "After payment, the developer will provide a license key."
+                )
+            elif info['type'] in ('paypal', 'kofi', 'patreon', 'github'):
+                # Open URL
+                import webbrowser
+                webbrowser.open(info['address'])
+            else:
+                QMessageBox.information(
+                    self,
+                    "Payment",
+                    f"Payment address:\n{info['address']}"
+                )
+        
+        def _open_plugin(self, item=None):
+            """Open the selected plugin."""
+            # Handle case where called from button click (passes bool) vs double-click (passes item)
+            if item is None or isinstance(item, bool):
+                item = self.plugin_list.currentItem()
+            if not item:
+                return
+            
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not data:
+                return
+            
+            manifest = data['manifest']
+            plugin_id = data['id']
+            
+            if not manifest.enabled:
+                QMessageBox.warning(
+                    self,
+                    "Plugin Disabled",
+                    "This plugin is disabled. Enable it first to use it."
+                )
+                return
+            
+            # Check requirements for external plugins
+            if not data['builtin'] and manifest.requirements:
+                all_installed, missing, installed = plugin_manager.check_requirements(plugin_id)
+                
+                if not all_installed:
+                    # Ask user if they want to install missing packages
+                    msg = (
+                        f"Plugin '{manifest.name}' requires the following packages:\n\n"
+                        f"Missing: {', '.join(missing)}\n\n"
+                        "Would you like to install them now?\n"
+                        "(This requires an internet connection)"
+                    )
+                    
+                    reply = QMessageBox.question(
+                        self,
+                        "Missing Requirements",
+                        msg,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    )
+                    
+                    if reply == QMessageBox.StandardButton.Yes:
+                        # Show progress
+                        self._log(f"Installing requirements: {', '.join(missing)}...")
+                        QApplication.processEvents()
+                        
+                        success, message = plugin_manager.install_requirements(missing)
+                        
+                        if success:
+                            self._log(f"✓ {message}")
+                            QMessageBox.information(
+                                self,
+                                "Installation Complete",
+                                f"Successfully installed:\n{', '.join(missing)}\n\n"
+                                "The plugin is now ready to use."
+                            )
+                        else:
+                            self._log(f"✗ {message}")
+                            QMessageBox.critical(
+                                self,
+                                "Installation Failed",
+                                f"Failed to install requirements:\n{message}\n\n"
+                                "You can try installing manually:\n"
+                                f"pip install {' '.join(missing)}"
+                            )
+                            return
+                    else:
+                        return
+            
+            # Load plugin if not already loaded
+            if plugin_id in self.loaded_widgets:
+                widget = self.loaded_widgets[plugin_id]
+            else:
+                if data['builtin']:
+                    plugin = self.builtin_plugins[plugin_id]
+                else:
+                    plugin = plugin_manager.load_plugin(plugin_id)
+                
+                if not plugin:
+                    QMessageBox.critical(
+                        self,
+                        "Error",
+                        f"Failed to load plugin: {manifest.name}"
+                    )
+                    return
+                
+                try:
+                    widget = plugin.create_widget(self.parent_window)
+                    if widget is None:
+                        QMessageBox.critical(
+                            self,
+                            "Error",
+                            f"Plugin '{manifest.name}' returned no widget."
+                        )
+                        return
+                    self.loaded_widgets[plugin_id] = widget
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    QMessageBox.critical(
+                        self,
+                        "Error",
+                        f"Failed to create plugin widget:\n{str(e)}"
+                    )
+                    return
+            
+            # Show plugin view
+            self.main_view.setVisible(False)
+            
+            # Clear old widget from layout (but don't destroy it)
+            while self.plugin_widget_layout.count():
+                child = self.plugin_widget_layout.takeAt(0)
+                if child.widget():
+                    child.widget().setParent(None)
+            
+            # Add widget to layout
+            self.plugin_widget_layout.addWidget(widget)
+            widget.setVisible(True)
+            self.active_plugin_label.setText(f"{manifest.icon} {manifest.name}")
+            self.plugin_container.setVisible(True)
+        
+        def _close_plugin(self):
+            """Close the current plugin and return to list."""
+            self.plugin_container.setVisible(False)
+            self.main_view.setVisible(True)
+        
+        def _open_plugins_folder(self):
+            """Open the plugins folder in file explorer."""
+            plugins_dir = plugin_manager._get_plugins_dir()
+            os.makedirs(plugins_dir, exist_ok=True)
+            
+            if sys.platform == 'win32':
+                os.startfile(plugins_dir)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', plugins_dir])
+            else:
+                subprocess.run(['xdg-open', plugins_dir])
+
+    return QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab
 
 
 # =============================================================================
@@ -9898,7 +11064,7 @@ Examples:
     else:
         # GUI mode
         try:
-            QApplication, ImageAnarchyGUI, QPalette, QColor = create_gui_app()
+            QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab = create_gui_app()
         except ImportError:
             print("PyQt6 is required for GUI mode. Install with: pip install PyQt6")
             print("Or use CLI mode: python image_anarchy.py --cli payload.bin")
@@ -9922,6 +11088,11 @@ Examples:
         app.setPalette(palette)
         
         window = ImageAnarchyGUI()
+        
+        # Add Plugins tab
+        plugins_tab = PluginsTab(window)
+        window.tab_widget.addTab(plugins_tab, "🔌 Plugins")
+        
         window.show()
         
         sys.exit(app.exec())
