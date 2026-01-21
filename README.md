@@ -1,5 +1,3 @@
-# 🔓 Image Anarchy
-
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Image Anarchy Logo" width="200">
 </p>
@@ -12,9 +10,17 @@
 </p>
 
 <p align="center">
-  <center>Ⓐ Image Anarchy v1.1 Ⓐ
-Android Image Swiss Army Knife
-Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.</center>
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
+  <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
+  <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
+  <img src="https://img.shields.io/github/stars/vehoelite/image-anarchy?style=social" alt="Stars">
+</p>
+
+<h1 align="center">Ⓐ Image Anarchy</h1>
+<h3 align="center">Android Image Swiss Army Knife</h3>
+
+<p align="center">
+  <i>Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.</i>
 </p>
 
 ---
@@ -368,6 +374,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
   <a href="https://github.com/vehoelite/image-anarchy/issues">🐛 Report Bug</a> •
   <a href="https://github.com/vehoelite/image-anarchy/issues">💡 Request Feature</a>
 </p>
+
 
 
 
