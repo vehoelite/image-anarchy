@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
-Version: 1.1
+Version: 2.0
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -70,10 +70,88 @@ import struct
 import subprocess
 import sys
 import urllib.parse
+import uuid
+import webbrowser
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Dict, List, Optional
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
+
+# Fix for PyInstaller windowed mode: sys.stdout/stderr are None, but some
+# libraries (like mtkclient) call sys.stdout.detach() which crashes.
+# Create a proper mock stream that supports detach() for binary mode conversion.
+if sys.stdout is None or sys.stderr is None:
+    class _NullStream:
+        """Null stream that supports both text and binary operations including detach()."""
+        def write(self, *args, **kwargs): return 0
+        def read(self, *args, **kwargs): return ''
+        def flush(self, *args, **kwargs): pass
+        def close(self, *args, **kwargs): pass
+        def fileno(self, *args, **kwargs): raise OSError("Null stream has no file descriptor")
+        def isatty(self): return False
+        def readable(self): return False
+        def writable(self): return True
+        def seekable(self): return False
+        def detach(self): return _NullBinaryStream()
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        encoding = 'utf-8'
+        errors = 'strict'
+        newlines = None
+        buffer = None
+        closed = False
+        
+    class _NullBinaryStream:
+        """Null binary stream returned by detach()."""
+        def write(self, *args, **kwargs): return 0
+        def read(self, *args, **kwargs): return b''
+        def flush(self, *args, **kwargs): pass
+        def close(self, *args, **kwargs): pass
+        def fileno(self, *args, **kwargs): raise OSError("Null stream has no file descriptor")
+        def isatty(self): return False
+        def readable(self): return False
+        def writable(self): return True
+        def seekable(self): return False
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        mode = 'wb'
+        closed = False
+    
+    if sys.stdout is None:
+        sys.stdout = _NullStream()
+    if sys.stderr is None:
+        sys.stderr = _NullStream()
+
+# Plugin dependency support: When running as a frozen exe, plugins install their
+# pip dependencies to a local site-packages directory. Add it to sys.path so
+# the bundled Python can find packages installed after the exe was built.
+def _setup_plugin_site_packages():
+    """Add local plugin site-packages to sys.path for frozen exe support."""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller exe
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        # Running from source
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Local site-packages for plugin dependencies
+    local_site_packages = os.path.join(base_dir, 'plugin_packages')
+    
+    # Create if doesn't exist
+    if not os.path.exists(local_site_packages):
+        try:
+            os.makedirs(local_site_packages, exist_ok=True)
+        except Exception:
+            pass  # May fail if no write permission, that's OK
+    
+    # Add to sys.path if not already there (insert at front for priority)
+    if local_site_packages not in sys.path:
+        sys.path.insert(0, local_site_packages)
+    
+    return local_site_packages
+
+# Initialize plugin site-packages path
+_PLUGIN_PACKAGES_DIR = _setup_plugin_site_packages()
 
 # Third-party imports
 import brotli
@@ -92,6 +170,61 @@ try:
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
+
+
+def _extract_bundled_resources():
+    """Extract bundled resources from PyInstaller _MEIPASS to app directory.
+    
+    When running as a frozen exe, PyInstaller extracts files to a temp directory.
+    This function copies necessary resources (drivers, platform-tools, etc.) to
+    the app's directory so they persist and can be used by plugins.
+    """
+    if not getattr(sys, 'frozen', False):
+        return  # Not running as frozen exe
+    
+    # PyInstaller temp directory with bundled files
+    meipass = getattr(sys, '_MEIPASS', None)
+    if not meipass:
+        return
+    
+    # App directory (where exe is located)
+    app_dir = os.path.dirname(sys.executable)
+    
+    # Resources to extract if they don't exist
+    resources = ['drivers', 'platform-tools', 'PortableGit', 'plugins']
+    
+    for resource in resources:
+        src = os.path.join(meipass, resource)
+        dst = os.path.join(app_dir, resource)
+        
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                if os.path.isdir(src):
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+            except Exception:
+                pass  # Silently continue if extraction fails
+
+
+# Extract bundled resources on import (runs once on first launch)
+_extract_bundled_resources()
+
+
+def _get_python_executable() -> Optional[str]:
+    """Get the Python interpreter path, handling frozen exe case.
+    
+    When running as a PyInstaller frozen exe, sys.executable points to the exe,
+    not Python. This function finds the actual Python interpreter.
+    
+    Returns:
+        Path to Python interpreter, or None if not found when frozen.
+    """
+    if getattr(sys, 'frozen', False):
+        # Running as frozen exe - find Python in PATH
+        return shutil.which('python') or shutil.which('python3') or shutil.which('py')
+    return sys.executable
+
 
 try:
     import lzma
@@ -485,7 +618,7 @@ class PayloadCreator:
         block_size: int = DEFAULT_BLOCK_SIZE,
         compression: str = CompressionType.ZSTD,
         compression_level: int = 9,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[Callable] = None
     ):
         self.output_path = Path(output_path)
         self.block_size = block_size
@@ -887,7 +1020,7 @@ class SparseImageConverter:
     CHUNK_TYPE_DONT_CARE = 0xCAC3
     CHUNK_TYPE_CRC32 = 0xCAC4
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
     
     def convert(self, input_path: str, output_path: str) -> None:
@@ -986,7 +1119,7 @@ class BootImageExtractor:
     Extracts: kernel, ramdisk, DTB, second bootloader, recovery_dtbo
     """
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
     
     def extract(self, input_path: str, output_dir: str) -> dict:
@@ -1353,7 +1486,7 @@ class BootImageExtractor:
 class FatImageExtractor:
     """Extract files from FAT filesystem images (modem, firmware, etc.)."""
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
     
     def list_files(self, input_path: str) -> list[dict]:
@@ -2523,7 +2656,7 @@ class DtboExtractor:
     ENTRY_SIZE = 32
     FDT_MAGIC = 0xD00DFEED  # Device Tree magic
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
         self.header = {}
         self.entries = []
@@ -4013,9 +4146,7 @@ class VbmetaPatcher:
             return result
             
         except Exception as e:
-            logger.error(f"Failed to re-sign vbmeta: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception(f"Failed to re-sign vbmeta: {e}")
             return None
     
     @staticmethod
@@ -4059,7 +4190,7 @@ class BootImagePacker:
     BOOT_MAGIC = b'ANDROID!'
     VENDOR_BOOT_MAGIC = b'VNDRBOOT'
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
         self.header_version = 2  # Default to v2
     
@@ -4434,7 +4565,7 @@ class SparseImageCreator:
     SPARSE_HEADER_SIZE = 28
     CHUNK_HEADER_SIZE = 12
     
-    def __init__(self, block_size: int = 4096, progress_callback: Optional[callable] = None):
+    def __init__(self, block_size: int = 4096, progress_callback: Optional[Callable] = None):
         self.block_size = block_size
         self.progress_callback = progress_callback
     
@@ -4767,7 +4898,7 @@ class RamdiskPacker:
     - gzip, lz4 compression
     """
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
     
     def pack(self, input_dir: str, output_path: str, 
@@ -5047,7 +5178,7 @@ class RecoveryPorter:
         '/misc', '/persist', '/metadata'
     ]
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
         self.recovery_type = None
         self.ramdisk_contents = {}
@@ -5522,7 +5653,7 @@ class Ext4ImageExtractor:
     EXT4_FEATURE_INCOMPAT_EXTENTS = 0x0040
     EXT4_FEATURE_INCOMPAT_64BIT = 0x0080
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
         self.superblock = None
         self.block_size = 4096
@@ -5893,7 +6024,7 @@ class SuperImageExtractor:
     LP_PARTITION_ATTR_READONLY = (1 << 0)
     LP_PARTITION_ATTR_SLOT_SUFFIXED = (1 << 1)
     
-    def __init__(self, progress_callback: Optional[callable] = None):
+    def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
     
     def list_partitions(self, input_path: str) -> list[LpMetadataPartition]:
@@ -6062,10 +6193,316 @@ class SuperImageExtractor:
         }
 
 
+class SuperImageCreator:
+    """Create Android super (dynamic partition) images.
+    
+    This is a pure Python implementation of lpmake functionality.
+    Creates a super.img with LP metadata and partition data.
+    """
+    
+    LP_METADATA_GEOMETRY_MAGIC = 0x616c4467  # "gDla"
+    LP_METADATA_HEADER_MAGIC = 0x414c5030   # "0PLA"
+    LP_SECTOR_SIZE = 512
+    LP_METADATA_GEOMETRY_SIZE = 4096
+    LP_METADATA_HEADER_SIZE = 256
+    LP_PARTITION_ENTRY_SIZE = 52
+    LP_EXTENT_ENTRY_SIZE = 24
+    LP_GROUP_ENTRY_SIZE = 48
+    
+    # Partition attributes
+    LP_PARTITION_ATTR_READONLY = (1 << 0)
+    LP_PARTITION_ATTR_SLOT_SUFFIXED = (1 << 1)
+    LP_PARTITION_ATTR_UPDATED = (1 << 2)
+    LP_PARTITION_ATTR_DISABLED = (1 << 3)
+    
+    def __init__(self, progress_callback: Optional[Callable] = None):
+        self.progress_callback = progress_callback
+        self.partitions = []  # List of (name, image_path, group_name, readonly)
+        self.groups = {}  # group_name -> max_size
+        self.metadata_size = 65536  # 64KB default
+        self.metadata_slots = 2  # A/B slots
+        self.block_size = 4096
+        self.super_size = 0  # Will be calculated or set
+        self.sparse_output = False
+    
+    def add_partition(self, name: str, image_path: str, group_name: str = "default", 
+                      readonly: bool = True) -> 'SuperImageCreator':
+        """Add a partition to the super image.
+        
+        Args:
+            name: Partition name (e.g., 'system', 'vendor')
+            image_path: Path to the partition image file
+            group_name: Partition group name
+            readonly: Whether partition should be read-only
+        """
+        self.partitions.append({
+            'name': name,
+            'image_path': image_path,
+            'group_name': group_name,
+            'readonly': readonly,
+            'size': os.path.getsize(image_path) if os.path.exists(image_path) else 0
+        })
+        return self
+    
+    def add_group(self, name: str, max_size: int) -> 'SuperImageCreator':
+        """Add a partition group with maximum size.
+        
+        Args:
+            name: Group name (e.g., 'qti_dynamic_partitions')
+            max_size: Maximum size for all partitions in group
+        """
+        self.groups[name] = max_size
+        return self
+    
+    def set_metadata_size(self, size: int) -> 'SuperImageCreator':
+        """Set metadata region size (default 65536)."""
+        self.metadata_size = size
+        return self
+    
+    def set_super_size(self, size: int) -> 'SuperImageCreator':
+        """Set total super partition size."""
+        self.super_size = size
+        return self
+    
+    def set_block_size(self, size: int) -> 'SuperImageCreator':
+        """Set logical block size (default 4096)."""
+        self.block_size = size
+        return self
+    
+    def set_sparse(self, sparse: bool) -> 'SuperImageCreator':
+        """Output as sparse image."""
+        self.sparse_output = sparse
+        return self
+    
+    def create(self, output_path: str) -> bool:
+        """Create the super.img file.
+        
+        Args:
+            output_path: Path for output super.img
+            
+        Returns:
+            True if successful
+        """
+        try:
+            # Validate inputs
+            if not self.partitions:
+                raise PayloadError("No partitions added")
+            
+            # Ensure all partitions have a group
+            for part in self.partitions:
+                if part['group_name'] not in self.groups:
+                    # Auto-create group with enough space
+                    total_size = sum(p['size'] for p in self.partitions 
+                                    if p['group_name'] == part['group_name'])
+                    self.groups[part['group_name']] = total_size + 1024 * 1024  # Add 1MB buffer
+            
+            # Calculate required size
+            total_partition_size = sum(p['size'] for p in self.partitions)
+            metadata_region_size = self.metadata_size * self.metadata_slots * 2  # Primary + backup
+            
+            # Align to block size
+            data_start = self._align_up(4096 + metadata_region_size, self.block_size)
+            required_size = data_start + self._align_up(total_partition_size, self.block_size)
+            
+            if self.super_size == 0:
+                # Auto-calculate with 5% buffer
+                self.super_size = self._align_up(int(required_size * 1.05), self.block_size)
+            elif self.super_size < required_size:
+                raise PayloadError(f"Super size {self.super_size} too small for partitions ({required_size} needed)")
+            
+            logger.info(f"Creating super.img: {output_path}")
+            logger.info(f"  Total size: {self.super_size / (1024*1024):.2f} MB")
+            logger.info(f"  Partitions: {len(self.partitions)}")
+            logger.info(f"  Groups: {len(self.groups)}")
+            logger.info(f"  Metadata size: {self.metadata_size}")
+            logger.info(f"  Data starts at: {data_start}")
+            
+            # Create the image
+            with open(output_path, 'wb') as f:
+                # Write primary geometry at offset 4096
+                f.seek(4096)
+                self._write_geometry(f)
+                
+                # Write primary metadata
+                f.seek(4096 + self.LP_METADATA_GEOMETRY_SIZE)
+                partition_offsets = self._write_metadata(f, data_start)
+                
+                # Write backup geometry
+                backup_geometry_offset = 4096 + self.metadata_size
+                f.seek(backup_geometry_offset)
+                self._write_geometry(f)
+                
+                # Write backup metadata
+                f.seek(backup_geometry_offset + self.LP_METADATA_GEOMETRY_SIZE)
+                self._write_metadata(f, data_start)
+                
+                # Write partition data
+                self._write_partition_data(f, partition_offsets)
+                
+                # Pad to super_size
+                f.seek(self.super_size - 1)
+                f.write(b'\x00')
+            
+            # Convert to sparse if requested
+            if self.sparse_output:
+                logger.info("Converting to sparse format...")
+                sparse_path = output_path + '.sparse'
+                converter = SparseImageCreator(self.block_size, self.progress_callback)
+                if converter.convert(output_path, sparse_path):
+                    os.replace(sparse_path, output_path)
+            
+            logger.info(f"Super image created: {output_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to create super image: {e}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            raise
+    
+    def _align_up(self, value: int, alignment: int) -> int:
+        """Align value up to alignment boundary."""
+        return ((value + alignment - 1) // alignment) * alignment
+    
+    def _write_geometry(self, f: BinaryIO):
+        """Write LP metadata geometry."""
+        # Geometry structure:
+        # magic (4) + struct_size (4) + checksum (4) + 
+        # metadata_max_size (4) + metadata_slot_count (4) + logical_block_size (4)
+        
+        geometry = struct.pack('<III',
+            self.LP_METADATA_GEOMETRY_MAGIC,
+            40,  # struct_size
+            0    # checksum (will be calculated)
+        )
+        geometry += struct.pack('<III',
+            self.metadata_size,
+            self.metadata_slots,
+            self.block_size
+        )
+        
+        # Pad to 4096 bytes
+        geometry = geometry.ljust(self.LP_METADATA_GEOMETRY_SIZE, b'\x00')
+        f.write(geometry)
+    
+    def _write_metadata(self, f: BinaryIO, data_start: int) -> dict:
+        """Write LP metadata header and tables. Returns partition offsets."""
+        
+        # Calculate table sizes
+        partitions_count = len(self.partitions)
+        extents_count = len(self.partitions)  # One extent per partition
+        groups_count = len(self.groups)
+        
+        partitions_size = partitions_count * self.LP_PARTITION_ENTRY_SIZE
+        extents_size = extents_count * self.LP_EXTENT_ENTRY_SIZE
+        groups_size = groups_count * self.LP_GROUP_ENTRY_SIZE
+        
+        tables_size = partitions_size + extents_size + groups_size
+        
+        # Build partition offsets
+        partition_offsets = {}
+        current_offset = data_start
+        
+        for i, part in enumerate(self.partitions):
+            aligned_size = self._align_up(part['size'], self.block_size)
+            partition_offsets[part['name']] = {
+                'offset': current_offset,
+                'size': part['size'],
+                'aligned_size': aligned_size,
+                'extent_index': i
+            }
+            current_offset += aligned_size
+        
+        # Write header
+        header = struct.pack('<I', self.LP_METADATA_HEADER_MAGIC)  # magic
+        header += struct.pack('<HH', 10, 2)  # major, minor version
+        header += struct.pack('<II', self.LP_METADATA_HEADER_SIZE, 0)  # header_size, checksum
+        header += struct.pack('<II', tables_size, 0)  # tables_size, tables_checksum
+        
+        # Partition table info
+        header += struct.pack('<III', 0, partitions_count, self.LP_PARTITION_ENTRY_SIZE)
+        # Extent table info  
+        header += struct.pack('<III', partitions_size, extents_count, self.LP_EXTENT_ENTRY_SIZE)
+        # Group table info
+        header += struct.pack('<III', partitions_size + extents_size, groups_count, self.LP_GROUP_ENTRY_SIZE)
+        
+        # Pad header
+        header = header.ljust(self.LP_METADATA_HEADER_SIZE, b'\x00')
+        f.write(header)
+        
+        # Write partition entries
+        group_names = list(self.groups.keys())
+        for i, part in enumerate(self.partitions):
+            attrs = 0
+            if part['readonly']:
+                attrs |= self.LP_PARTITION_ATTR_READONLY
+            
+            group_idx = group_names.index(part['group_name']) if part['group_name'] in group_names else 0
+            
+            # Partition entry: name[36] + attrs(4) + first_extent_index(4) + num_extents(4) + group_index(4)
+            name_bytes = part['name'].encode('utf-8')[:36].ljust(36, b'\x00')
+            entry = name_bytes + struct.pack('<IIII', attrs, i, 1, group_idx)
+            f.write(entry)
+        
+        # Write extent entries
+        for part in self.partitions:
+            pinfo = partition_offsets[part['name']]
+            # Extent: num_sectors(8) + target_type(4) + target_data(8) + target_source(4)
+            num_sectors = pinfo['aligned_size'] // self.LP_SECTOR_SIZE
+            target_data = pinfo['offset'] // self.LP_SECTOR_SIZE
+            extent = struct.pack('<QIQI', num_sectors, 0, target_data, 0)
+            f.write(extent)
+        
+        # Write group entries
+        for group_name, max_size in self.groups.items():
+            # Group: name[36] + flags(4) + max_size(8)
+            name_bytes = group_name.encode('utf-8')[:36].ljust(36, b'\x00')
+            entry = name_bytes + struct.pack('<IQ', 0, max_size)
+            entry = entry.ljust(self.LP_GROUP_ENTRY_SIZE, b'\x00')
+            f.write(entry)
+        
+        return partition_offsets
+    
+    def _write_partition_data(self, f: BinaryIO, partition_offsets: dict):
+        """Write actual partition data."""
+        total = len(self.partitions)
+        
+        for idx, part in enumerate(self.partitions):
+            pinfo = partition_offsets[part['name']]
+            
+            logger.info(f"  Writing {part['name']}: {part['size'] / (1024*1024):.2f} MB at offset {pinfo['offset']}")
+            
+            if self.progress_callback:
+                self.progress_callback(idx, total, f"Writing {part['name']}...")
+            
+            f.seek(pinfo['offset'])
+            
+            # Copy partition data
+            with open(part['image_path'], 'rb') as src:
+                remaining = part['size']
+                chunk_size = 64 * 1024 * 1024  # 64MB chunks
+                
+                while remaining > 0:
+                    to_read = min(chunk_size, remaining)
+                    data = src.read(to_read)
+                    if not data:
+                        break
+                    f.write(data)
+                    remaining -= len(data)
+            
+            # Pad to aligned size
+            padding = pinfo['aligned_size'] - part['size']
+            if padding > 0:
+                f.write(b'\x00' * padding)
+        
+        if self.progress_callback:
+            self.progress_callback(total, total, "Complete")
+
+
 class AndroidImageExtractor:
     """Main class for extracting various Android image formats."""
     
-    def __init__(self, input_path: Optional[str] = None, progress_callback: Optional[callable] = None):
+    def __init__(self, input_path: Optional[str] = None, progress_callback: Optional[Callable] = None):
         self.input_path = input_path
         self.progress_callback = progress_callback
     
@@ -6484,6 +6921,13 @@ class PluginManifest:
     # Requirements
     min_version: str = "1.0"
     requirements: List[str] = None  # pip packages needed, e.g. ["requests", "pillow>=9.0"]
+    # Git repository to clone (optional) - e.g. {"repo": "https://github.com/user/repo", "target": "subdir_name", "requirements_file": "requirements.txt"}
+    git_clone: Dict[str, Any] = None
+    # Bundled binaries that need to be downloaded (list of URLs or {url, target_path, sha256} dicts)
+    bundled_binaries: List[Any] = None
+    # Setup commands to run after git clone and pip install (bash-compatible)
+    setup_commands: List[str] = None
+    post_install: List[Dict[str, Any]] = None  # Post-install steps [{"type": "driver", "file": "..."}, {"type": "git_clone", "repo": "..."}]
     # State
     enabled: bool = True
     licensed: bool = False  # For paid plugins
@@ -6491,6 +6935,12 @@ class PluginManifest:
     def __post_init__(self):
         if self.requirements is None:
             self.requirements = []
+        if self.post_install is None:
+            self.post_install = []
+        if self.bundled_binaries is None:
+            self.bundled_binaries = []
+        if self.setup_commands is None:
+            self.setup_commands = []
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any], plugin_id: str) -> 'PluginManifest':
@@ -6511,6 +6961,10 @@ class PluginManifest:
             support_url=data.get('support_url', ''),
             min_version=data.get('min_version', '1.0'),
             requirements=data.get('requirements', []),
+            git_clone=data.get('git_clone'),
+            bundled_binaries=data.get('bundled_binaries', []),
+            setup_commands=data.get('setup_commands', []),
+            post_install=data.get('post_install', []),
             enabled=data.get('enabled', True),
             licensed=data.get('licensed', False)
         )
@@ -6643,7 +7097,7 @@ class PluginManager:
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, indent=2)
         except Exception as e:
-            print(f"Failed to save plugin config: {e}")
+            logger.warning(f"Failed to save plugin config: {e}")
     
     def discover_plugins(self) -> List[PluginManifest]:
         """Discover all plugins in the plugins directory."""
@@ -6673,7 +7127,7 @@ class PluginManager:
                     discovered.append(manifest)
                     
                 except Exception as e:
-                    print(f"Failed to load plugin manifest {item}: {e}")
+                    logger.warning(f"Failed to load plugin manifest {item}: {e}")
         
         return discovered
     
@@ -6687,7 +7141,7 @@ class PluginManager:
         plugin_file = os.path.join(plugin_path, "plugin.py")
         
         if not os.path.exists(plugin_file):
-            print(f"Plugin file not found: {plugin_file}")
+            logger.warning(f"Plugin file not found: {plugin_file}")
             return None
         
         try:
@@ -6718,12 +7172,10 @@ class PluginManager:
                     self.plugins[plugin_id] = plugin
                     return plugin
                 else:
-                    print(f"No Plugin class found in {plugin_file}")
+                    logger.warning(f"No Plugin class found in {plugin_file}")
                     
         except Exception as e:
-            print(f"Failed to load plugin {plugin_id}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error(f"Failed to load plugin {plugin_id}: {e}")
         
         return None
     
@@ -6778,20 +7230,40 @@ class PluginManager:
         missing = []
         installed = []
         
+        # Use importlib.metadata for accurate package detection
+        try:
+            from importlib.metadata import distributions
+            installed_packages = {dist.metadata['Name'].lower() for dist in distributions()}
+        except ImportError:
+            # Fallback for older Python
+            try:
+                import pkg_resources
+                installed_packages = {pkg.key.lower() for pkg in pkg_resources.working_set}
+            except ImportError:
+                installed_packages = set()
+        
         for req in manifest.requirements:
             # Parse package name (handle version specs like "requests>=2.0")
             pkg_name = req.split('>=')[0].split('<=')[0].split('==')[0].split('<')[0].split('>')[0].strip()
             
-            try:
-                __import__(pkg_name.replace('-', '_'))
+            # Check if package is installed (case-insensitive, handle underscores/hyphens)
+            pkg_normalized = pkg_name.lower().replace('_', '-')
+            pkg_alt = pkg_name.lower().replace('-', '_')
+            
+            if pkg_normalized in installed_packages or pkg_alt in installed_packages or pkg_name.lower() in installed_packages:
                 installed.append(req)
-            except ImportError:
+            else:
                 missing.append(req)
         
         return len(missing) == 0, missing, installed
     
     def install_requirements(self, requirements: List[str]) -> tuple:
-        """Install pip packages.
+        """Install pip packages to local plugin_packages directory.
+        
+        When running as a frozen PyInstaller exe, packages are installed to
+        a local 'plugin_packages' directory using pip --target. This allows
+        plugins to install their dependencies without requiring the packages
+        to be bundled in the exe at build time.
         
         Returns:
             tuple: (success: bool, message: str)
@@ -6803,8 +7275,30 @@ class PluginManager:
             import subprocess
             import sys
             
-            # Use pip to install
-            cmd = [sys.executable, '-m', 'pip', 'install'] + requirements
+            # Determine target directory for frozen exe
+            if getattr(sys, 'frozen', False):
+                # Running as PyInstaller exe - install to local plugin_packages
+                base_dir = os.path.dirname(sys.executable)
+                target_dir = os.path.join(base_dir, 'plugin_packages')
+                
+                # Ensure target directory exists
+                os.makedirs(target_dir, exist_ok=True)
+                
+                # Find Python interpreter
+                python_cmd = shutil.which('python') or shutil.which('python3') or shutil.which('py')
+                if not python_cmd:
+                    return False, (
+                        "Python interpreter not found in PATH.\n\n"
+                        "Please install Python and ensure it's in your PATH, then try again.\n\n"
+                        f"You can try installing manually:\npip install --target \"{target_dir}\" {' '.join(requirements)}"
+                    )
+                
+                # Install to local target directory so bundled Python can find them
+                cmd = [python_cmd, '-m', 'pip', 'install', '--target', target_dir, '--upgrade'] + requirements
+            else:
+                # Running from source - install normally
+                cmd = [sys.executable, '-m', 'pip', 'install'] + requirements
+            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -6815,12 +7309,661 @@ class PluginManager:
             if result.returncode == 0:
                 return True, f"Successfully installed: {', '.join(requirements)}"
             else:
-                return False, f"pip error: {result.stderr}"
+                return False, f"pip error: {result.stderr}\n\nYou can try installing manually:\npip install {' '.join(requirements)}"
                 
         except subprocess.TimeoutExpired:
             return False, "Installation timed out (5 minutes)"
         except Exception as e:
             return False, f"Installation failed: {str(e)}"
+    
+    def get_git_executable(self) -> Optional[str]:
+        """Find Git executable, preferring bundled portable Git."""
+        # Check for bundled portable Git first
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Check bundled git locations
+        bundled_paths = [
+            os.path.join(base_dir, "git", "bin", "git.exe"),
+            os.path.join(base_dir, "git", "cmd", "git.exe"),
+            os.path.join(base_dir, "PortableGit", "bin", "git.exe"),
+            os.path.join(base_dir, "PortableGit", "cmd", "git.exe"),
+        ]
+        
+        for git_path in bundled_paths:
+            if os.path.exists(git_path):
+                return git_path
+        
+        # Fallback to system Git
+        git_in_path = shutil.which("git")
+        if git_in_path:
+            return git_in_path
+        
+        return None
+    
+    def run_post_install(self, plugin_id: str, progress_callback=None) -> Tuple[bool, str]:
+        """Run post-install steps for a plugin.
+        
+        Args:
+            plugin_id: The plugin identifier
+            progress_callback: Optional callback(step_name: str, status: str)
+            
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        manifest = self.manifests.get(plugin_id)
+        if not manifest or not manifest.post_install:
+            return True, "No post-install steps"
+        
+        plugins_dir = self._get_plugins_dir()
+        plugin_dir = os.path.join(plugins_dir, plugin_id)
+        
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        drivers_dir = os.path.join(base_dir, "drivers")
+        
+        errors = []
+        
+        for step in manifest.post_install:
+            step_type = step.get('type', '')
+            step_name = step.get('name', step_type)
+            optional = step.get('optional', False)
+            
+            if progress_callback:
+                progress_callback(step_name, "running")
+            
+            try:
+                if step_type == 'driver':
+                    # Install a driver (MSI or EXE)
+                    filename = step.get('file', '')
+                    driver_path = os.path.join(drivers_dir, filename)
+                    
+                    if not os.path.exists(driver_path):
+                        msg = f"Driver not found: {filename}"
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"skipped: {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    # Launch installer and wait
+                    if filename.endswith('.msi'):
+                        # MSI with quiet install
+                        result = subprocess.run(
+                            ['msiexec', '/i', driver_path, '/passive', '/norestart'],
+                            capture_output=True, text=True, timeout=300
+                        )
+                    else:
+                        # EXE installer
+                        result = subprocess.run(
+                            [driver_path, '/S', '/silent', '/quiet'],  # Common silent flags
+                            capture_output=True, text=True, timeout=300
+                        )
+                    
+                    if progress_callback:
+                        progress_callback(step_name, "completed")
+                        
+                elif step_type == 'git_clone':
+                    # Clone a git repository
+                    repo = step.get('repo', '')
+                    target = step.get('target', '')  # Relative to plugin dir
+                    
+                    if not repo:
+                        errors.append("git_clone: No repository specified")
+                        continue
+                    
+                    # Determine target directory
+                    if target:
+                        clone_dir = os.path.join(plugin_dir, target)
+                    else:
+                        # Extract repo name from URL
+                        repo_name = repo.rstrip('/').split('/')[-1].replace('.git', '')
+                        clone_dir = os.path.join(plugin_dir, repo_name)
+                    
+                    # Check if already exists
+                    if os.path.exists(clone_dir):
+                        if progress_callback:
+                            progress_callback(step_name, "already exists - skipped")
+                        continue
+                    
+                    # Find git executable
+                    git_exe = self.get_git_executable()
+                    if not git_exe:
+                        msg = "Git not found. Please install Git or ensure portable Git is bundled."
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"skipped: {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    # Clone the repository
+                    result = subprocess.run(
+                        [git_exe, 'clone', '--depth', '1', repo, clone_dir],
+                        capture_output=True, text=True, timeout=600,
+                        cwd=plugin_dir
+                    )
+                    
+                    if result.returncode != 0:
+                        msg = f"Git clone failed: {result.stderr}"
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"failed (optional): {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    # Apply known fixes for cloned repositories
+                    self._apply_repo_fixes(clone_dir, repo)
+                    
+                    if progress_callback:
+                        progress_callback(step_name, "completed")
+                        
+                elif step_type == 'pip_requirements':
+                    # Install pip requirements from a file in the cloned repo
+                    req_file = step.get('file', 'requirements.txt')
+                    target = step.get('target', '')
+                    
+                    if target:
+                        req_path = os.path.join(plugin_dir, target, req_file)
+                    else:
+                        req_path = os.path.join(plugin_dir, req_file)
+                    
+                    if not os.path.exists(req_path):
+                        msg = f"Requirements file not found: {req_path}"
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"skipped: {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    python_exe = _get_python_executable()
+                    if not python_exe:
+                        msg = "Python interpreter not found in PATH. Please install Python."
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"skipped: {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    result = subprocess.run(
+                        [python_exe, '-m', 'pip', 'install', '-r', req_path],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    
+                    if result.returncode != 0:
+                        msg = f"pip install failed: {result.stderr}"
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"failed (optional): {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    if progress_callback:
+                        progress_callback(step_name, "completed")
+                        
+                elif step_type == 'command':
+                    # Run a custom command
+                    cmd = step.get('cmd', [])
+                    cwd = step.get('cwd', plugin_dir)
+                    
+                    if isinstance(cmd, str):
+                        cmd = cmd.split()
+                    
+                    if not cmd:
+                        errors.append("command: No command specified")
+                        continue
+                    
+                    # Resolve relative cwd
+                    if not os.path.isabs(cwd):
+                        cwd = os.path.join(plugin_dir, cwd)
+                    
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True,
+                        timeout=300, cwd=cwd,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    )
+                    
+                    if result.returncode != 0:
+                        msg = f"Command failed: {result.stderr}"
+                        if optional:
+                            if progress_callback:
+                                progress_callback(step_name, f"failed (optional): {msg}")
+                            continue
+                        else:
+                            errors.append(msg)
+                            continue
+                    
+                    if progress_callback:
+                        progress_callback(step_name, "completed")
+                        
+                else:
+                    errors.append(f"Unknown post-install type: {step_type}")
+                    
+            except subprocess.TimeoutExpired:
+                msg = f"Step '{step_name}' timed out"
+                if optional:
+                    if progress_callback:
+                        progress_callback(step_name, f"timed out (optional)")
+                else:
+                    errors.append(msg)
+            except Exception as e:
+                msg = f"Step '{step_name}' failed: {str(e)}"
+                if optional:
+                    if progress_callback:
+                        progress_callback(step_name, f"error (optional): {str(e)}")
+                else:
+                    errors.append(msg)
+        
+        if errors:
+            return False, "\n".join(errors)
+        return True, "All post-install steps completed"
+    
+    def _apply_repo_fixes(self, clone_dir: str, repo_url: str):
+        """Apply known fixes to cloned repositories.
+        
+        Some repositories have bugs in their requirements.txt or other files
+        that need to be patched for proper installation on Windows.
+        """
+        # Fix mtkclient requirements.txt - has 'keystone' (OpenStack) instead of just 'keystone-engine'
+        if 'mtkclient' in repo_url.lower():
+            req_file = os.path.join(clone_dir, 'requirements.txt')
+            if os.path.exists(req_file):
+                try:
+                    with open(req_file, 'r', encoding='utf-8') as f:
+                        lines = f.readlines()
+                    
+                    # Remove 'keystone' line (OpenStack identity service)
+                    # Keep 'keystone-engine' (the assembler library)
+                    fixed_lines = []
+                    for line in lines:
+                        stripped = line.strip().lower()
+                        # Skip lines that are exactly 'keystone' but keep 'keystone-engine'
+                        if stripped == 'keystone':
+                            continue
+                        fixed_lines.append(line)
+                    
+                    with open(req_file, 'w', encoding='utf-8') as f:
+                        f.writelines(fixed_lines)
+                except Exception:
+                    pass  # Best effort - if it fails, pip will just fail later
+    
+    def setup_plugin_dependencies(self, plugin_id: str, progress_callback=None) -> Tuple[bool, str]:
+        """
+        Complete setup of a plugin's dependencies AFTER extraction.
+        
+        Setup follows 4 phases in order:
+        Phase 1: Git clone (if manifest.git_clone specified)
+        Phase 2: Download binaries (if manifest.bundled_binaries has URLs)
+        Phase 3: Install pip packages (manifest.requirements)
+        Phase 4: Run setup commands (manifest.setup_commands like "pip install .")
+        
+        Args:
+            plugin_id: The plugin identifier
+            progress_callback: Optional callback(phase_info: str, status: str, progress: int)
+                              phase_info format: "Phase X/4: Description"
+            
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        # Load manifest from disk
+        plugins_dir = self._get_plugins_dir()
+        plugin_dir = os.path.join(plugins_dir, plugin_id)
+        manifest_path = os.path.join(plugin_dir, 'manifest.json')
+        
+        if not os.path.exists(manifest_path):
+            return False, f"manifest.json not found in {plugin_dir}"
+        
+        try:
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest_data = json.load(f)
+        except Exception as e:
+            return False, f"Failed to read manifest.json: {str(e)}"
+        
+        manifest = PluginManifest.from_dict(manifest_data, plugin_id)
+        self.manifests[plugin_id] = manifest
+        
+        errors = []
+        
+        # Determine which phases are active
+        has_git_clone = bool(manifest.git_clone and manifest.git_clone.get('repo'))
+        has_binaries = bool(manifest.bundled_binaries)
+        has_requirements = bool(manifest.requirements)
+        has_setup_commands = bool(manifest.setup_commands)
+        has_post_install = bool(manifest.post_install)
+        
+        # Calculate total phases and their weights for progress
+        # Phase weights represent relative time/importance
+        phases = []
+        if has_git_clone:
+            phases.append(('git_clone', 25))
+        if has_binaries:
+            phases.append(('binaries', 15))
+        if has_requirements:
+            phases.append(('pip_install', 30))
+        if has_setup_commands:
+            phases.append(('setup_commands', 25))
+        if has_post_install:
+            phases.append(('post_install', 5))
+        
+        total_phases = len(phases)
+        if total_phases == 0:
+            # No setup needed
+            if progress_callback:
+                progress_callback("No setup required", "completed", 100)
+            return True, "No setup required"
+        
+        # Normalize weights to 100%
+        total_weight = sum(p[1] for p in phases)
+        progress_base = 0
+        
+        def get_phase_progress(phase_idx: int, sub_progress: float = 0.0) -> int:
+            """Calculate overall progress percentage based on phase and sub-progress within phase."""
+            nonlocal progress_base
+            if phase_idx >= len(phases):
+                return 100
+            
+            # Calculate base progress from completed phases
+            base = sum(phases[i][1] for i in range(phase_idx)) * 100 // total_weight
+            # Add sub-progress within current phase
+            current_phase_weight = phases[phase_idx][1] * 100 // total_weight
+            return min(99, base + int(current_phase_weight * sub_progress))
+        
+        phase_idx = 0
+        phase_num = 0
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 1: Git Clone
+        # ═══════════════════════════════════════════════════════════════════════
+        if has_git_clone:
+            phase_num += 1
+            git_config = manifest.git_clone
+            repo = git_config.get('repo', '')
+            target = git_config.get('target', '')
+            
+            phase_label = f"Step {phase_num}/{total_phases}: Cloning repository"
+            if progress_callback:
+                progress_callback(phase_label, f"Cloning {repo.split('/')[-1]}...", get_phase_progress(phase_idx, 0.0))
+            
+            # Determine target directory
+            if target:
+                clone_dir = os.path.join(plugin_dir, target)
+            else:
+                repo_name = repo.rstrip('/').split('/')[-1].replace('.git', '')
+                clone_dir = os.path.join(plugin_dir, repo_name)
+            
+            if os.path.exists(clone_dir):
+                if progress_callback:
+                    progress_callback(phase_label, "Already cloned ✓", get_phase_progress(phase_idx, 1.0))
+            else:
+                git_exe = self.get_git_executable()
+                if not git_exe:
+                    errors.append("Git not found. Please install Git to complete setup.")
+                else:
+                    try:
+                        if progress_callback:
+                            progress_callback(phase_label, f"Cloning {repo.split('/')[-1]}...", get_phase_progress(phase_idx, 0.3))
+                        
+                        result = subprocess.run(
+                            [git_exe, 'clone', '--depth', '1', repo, clone_dir],
+                            capture_output=True, text=True, timeout=600,
+                            cwd=plugin_dir
+                        )
+                        if result.returncode != 0:
+                            errors.append(f"Git clone failed: {result.stderr[:200]}")
+                        else:
+                            # Apply known fixes for specific repositories
+                            self._apply_repo_fixes(clone_dir, repo)
+                            if progress_callback:
+                                progress_callback(phase_label, "Clone complete ✓", get_phase_progress(phase_idx, 1.0))
+                    except subprocess.TimeoutExpired:
+                        errors.append("Git clone timed out")
+                    except Exception as e:
+                        errors.append(f"Git clone error: {str(e)}")
+            
+            phase_idx += 1
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 2: Download Binaries
+        # ═══════════════════════════════════════════════════════════════════════
+        if has_binaries:
+            import urllib.request
+            import urllib.error
+            
+            phase_num += 1
+            phase_label = f"Step {phase_num}/{total_phases}: Downloading binaries"
+            
+            # Filter to only URL-based binaries
+            url_binaries = []
+            for binary in manifest.bundled_binaries:
+                if isinstance(binary, str) and binary.startswith(('http://', 'https://')):
+                    url_binaries.append({'url': binary, 'target_path': os.path.basename(binary)})
+                elif isinstance(binary, dict) and binary.get('url', '').startswith(('http://', 'https://')):
+                    url_binaries.append(binary)
+            
+            if not url_binaries:
+                if progress_callback:
+                    progress_callback(phase_label, "No downloads needed ✓", get_phase_progress(phase_idx, 1.0))
+            else:
+                for i, binary in enumerate(url_binaries):
+                    url = binary.get('url', '')
+                    target_path = binary.get('target_path', os.path.basename(url))
+                    expected_sha256 = binary.get('sha256')
+                    binary_name = os.path.basename(target_path)
+                    
+                    sub_progress = i / len(url_binaries)
+                    if progress_callback:
+                        progress_callback(phase_label, f"Downloading {binary_name}...", get_phase_progress(phase_idx, sub_progress))
+                    
+                    full_path = os.path.join(plugin_dir, target_path)
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    
+                    if os.path.exists(full_path):
+                        continue  # Already exists
+                    
+                    try:
+                        req = urllib.request.Request(url)
+                        req.add_header('User-Agent', 'ImageAnarchy/2.0')
+                        
+                        with urllib.request.urlopen(req, timeout=120) as response:
+                            data = response.read()
+                        
+                        if expected_sha256:
+                            import hashlib
+                            actual_sha256 = hashlib.sha256(data).hexdigest()
+                            if actual_sha256.lower() != expected_sha256.lower():
+                                errors.append(f"Binary {binary_name} SHA256 mismatch!")
+                                continue
+                        
+                        with open(full_path, 'wb') as f:
+                            f.write(data)
+                            
+                    except Exception as e:
+                        errors.append(f"Failed to download {binary_name}: {str(e)}")
+                
+                if progress_callback:
+                    progress_callback(phase_label, "Downloads complete ✓", get_phase_progress(phase_idx, 1.0))
+            
+            phase_idx += 1
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 3: Install pip packages
+        # ═══════════════════════════════════════════════════════════════════════
+        if has_requirements:
+            phase_num += 1
+            phase_label = f"Step {phase_num}/{total_phases}: Installing pip packages"
+            
+            if progress_callback:
+                progress_callback(phase_label, "Checking installed packages...", get_phase_progress(phase_idx, 0.1))
+            
+            all_installed, missing, _ = self.check_requirements(plugin_id)
+            
+            if all_installed:
+                if progress_callback:
+                    progress_callback(phase_label, "All packages installed ✓", get_phase_progress(phase_idx, 1.0))
+            else:
+                if progress_callback:
+                    pkg_list = ", ".join(missing[:3]) + ("..." if len(missing) > 3 else "")
+                    progress_callback(phase_label, f"Installing {len(missing)} packages: {pkg_list}", get_phase_progress(phase_idx, 0.3))
+                
+                success, msg = self.install_requirements(missing)
+                if not success:
+                    errors.append(f"Pip install failed: {msg}")
+                else:
+                    if progress_callback:
+                        progress_callback(phase_label, "Packages installed ✓", get_phase_progress(phase_idx, 1.0))
+            
+            phase_idx += 1
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 4: Run setup commands (e.g., "pip install .")
+        # ═══════════════════════════════════════════════════════════════════════
+        if has_setup_commands:
+            phase_num += 1
+            phase_label = f"Step {phase_num}/{total_phases}: Running setup commands"
+            
+            for i, cmd in enumerate(manifest.setup_commands):
+                if not cmd or not isinstance(cmd, str):
+                    continue
+                
+                cmd_display = cmd[:40] + "..." if len(cmd) > 40 else cmd
+                sub_progress = i / len(manifest.setup_commands)
+                
+                if progress_callback:
+                    progress_callback(phase_label, f"Running: {cmd_display}", get_phase_progress(phase_idx, sub_progress))
+                
+                try:
+                    # Determine working directory
+                    run_cwd = plugin_dir
+                    if manifest.git_clone:
+                        target = manifest.git_clone.get('target', '')
+                        if target:
+                            potential_cwd = os.path.join(plugin_dir, target)
+                        else:
+                            repo = manifest.git_clone.get('repo', '')
+                            repo_name = repo.rstrip('/').split('/')[-1].replace('.git', '')
+                            potential_cwd = os.path.join(plugin_dir, repo_name)
+                        if os.path.exists(potential_cwd):
+                            run_cwd = potential_cwd
+                    
+                    # Handle pip install specially
+                    if os.name == 'nt' and 'pip install' in cmd.lower():
+                        python_exe = _get_python_executable()
+                        if python_exe and 'pip install .' in cmd:
+                            if getattr(sys, 'frozen', False):
+                                base_dir = os.path.dirname(sys.executable)
+                                target_dir = os.path.join(base_dir, 'plugin_packages')
+                                os.makedirs(target_dir, exist_ok=True)
+                                win_cmd = f'"{python_exe}" -m pip install --target "{target_dir}" .'
+                            else:
+                                win_cmd = f'"{python_exe}" -m pip install .'
+                        else:
+                            win_cmd = cmd
+                        
+                        result = subprocess.run(
+                            win_cmd, shell=True, capture_output=True, text=True,
+                            timeout=600, cwd=run_cwd
+                        )
+                    else:
+                        result = subprocess.run(
+                            cmd, shell=True, capture_output=True, text=True,
+                            timeout=300, cwd=run_cwd
+                        )
+                    
+                    if result.returncode != 0:
+                        stderr = result.stderr[:300] if result.stderr else "Unknown error"
+                        errors.append(f"Setup command failed: {cmd_display}\n{stderr}")
+                        
+                except subprocess.TimeoutExpired:
+                    errors.append(f"Setup command timed out: {cmd_display}")
+                except Exception as e:
+                    errors.append(f"Setup command error: {cmd_display}\n{str(e)}")
+            
+            if progress_callback:
+                progress_callback(phase_label, "Setup commands complete ✓", get_phase_progress(phase_idx, 1.0))
+            
+            phase_idx += 1
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # PHASE 5: Post-install (drivers, etc.) - runs last
+        # ═══════════════════════════════════════════════════════════════════════
+        if has_post_install:
+            phase_num += 1
+            phase_label = f"Step {phase_num}/{total_phases}: Post-install steps"
+            
+            if progress_callback:
+                progress_callback(phase_label, "Running post-install...", get_phase_progress(phase_idx, 0.5))
+            
+            success, msg = self.run_post_install(plugin_id, lambda name, status: None)
+            if not success:
+                errors.append(f"Post-install: {msg}")
+            
+            if progress_callback:
+                progress_callback(phase_label, "Post-install complete ✓", get_phase_progress(phase_idx, 1.0))
+            
+            phase_idx += 1
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # FINALIZE: Mark setup complete
+        # ═══════════════════════════════════════════════════════════════════════
+        if progress_callback:
+            progress_callback("Setup Complete", "Finalizing...", 100)
+        
+        # Mark setup as complete in config
+        if plugin_id not in self.config:
+            self.config[plugin_id] = {}
+        self.config[plugin_id]['setup_complete'] = True
+        self.config[plugin_id]['post_install_done'] = True
+        self._save_config()
+        
+        if errors:
+            return False, "\n".join(errors)
+        return True, "Plugin setup completed successfully"
+    
+    def is_plugin_setup_complete(self, plugin_id: str) -> bool:
+        """Check if a plugin's setup has been completed."""
+        plugin_config = self.config.get(plugin_id, {})
+        if plugin_config.get('setup_complete', False):
+            return True
+        
+        # Also check if manifest has any setup requirements
+        manifest = self.manifests.get(plugin_id)
+        if not manifest:
+            # Try to load manifest
+            plugins_dir = self._get_plugins_dir()
+            manifest_path = os.path.join(plugins_dir, plugin_id, 'manifest.json')
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    manifest = PluginManifest.from_dict(data, plugin_id)
+                except Exception:
+                    return True  # Can't read manifest, assume setup done
+        
+        if not manifest:
+            return True  # No manifest, assume setup done
+        
+        # If no setup requirements, consider it complete
+        has_requirements = bool(manifest.requirements or manifest.git_clone or manifest.bundled_binaries or manifest.setup_commands or manifest.post_install)
+        if not has_requirements:
+            return True
+        
+        return False
     
     def create_example_plugin(self):
         """Create a developer guide plugin to show how to create plugins."""
@@ -7125,38 +8268,6 @@ plugin_manager = PluginManager()
 
 
 # =============================================================================
-# BUILT-IN PLUGINS (bundled with the app)
-# =============================================================================
-
-class AdbPartitionPullerBuiltin(PluginBase):
-    """Built-in ADB Partition Puller plugin."""
-    
-    def __init__(self):
-        self.manifest = PluginManifest(
-            id="adb_puller",
-            name="ADB Partition Puller",
-            version="1.0",
-            description="Pull partitions directly from Android devices via ADB. Supports rooted and recovery mode devices.",
-            author="Image Anarchy",
-            icon="📱",
-            license_type="free"
-        )
-        self.worker_thread = None
-        self.devices = []
-        self.partitions = []
-        self._pull_queue = []
-    
-    def create_widget(self, parent_window):
-        """Create the ADB puller widget - will be set up in GUI context."""
-        self.parent_window = parent_window
-        return None  # Will be created in GUI context
-
-
-# Register built-in plugins
-_builtin_plugins = [AdbPartitionPullerBuiltin()]
-
-
-# =============================================================================
 # GUI COMPONENTS (PyQt6)
 # =============================================================================
 
@@ -7169,10 +8280,378 @@ def create_gui_app():
         QListWidgetItem, QProgressBar, QTextEdit, QGroupBox, QCheckBox,
         QSplitter, QStatusBar, QMessageBox, QAbstractItemView, QTabWidget,
         QComboBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QHeaderView,
-        QFormLayout, QRadioButton
+        QFormLayout, QRadioButton, QScrollArea, QFrame, QMenu, QDoubleSpinBox,
+        QGridLayout, QDialog, QInputDialog, QSystemTrayIcon, QGraphicsOpacityEffect
     )
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor
+    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QPoint, QEasingCurve
+    from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor, QAction, QIcon, QPixmap, QPainter
+
+    # =========================================================================
+    # ANARCHY TOAST NOTIFICATION SYSTEM
+    # =========================================================================
+    
+    class AnarchyToast(QLabel):
+        """Rebellious toast notification - burns bright and fades away."""
+        
+        TOAST_STYLES = {
+            'success': ('🔥', '#2e7d32', '#1b5e20'),
+            'error': ('💀', '#c62828', '#b71c1c'),
+            'warning': ('⚠️', '#f57c00', '#e65100'),
+            'info': ('Ⓐ', '#1565c0', '#0d47a1'),
+            'chaos': ('🏴', '#6a1b9a', '#4a148c'),
+        }
+        
+        def __init__(self, parent, message: str, toast_type: str = 'info', duration: int = 3000):
+            super().__init__(parent)
+            
+            icon, bg_color, border_color = self.TOAST_STYLES.get(toast_type, self.TOAST_STYLES['info'])
+            
+            self.setText(f"  {icon}  {message}  ")
+            self.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {bg_color};
+                    color: white;
+                    padding: 12px 20px;
+                    border-radius: 8px;
+                    border: 2px solid {border_color};
+                    font-size: 13px;
+                    font-weight: bold;
+                }}
+            """)
+            self.setWordWrap(True)
+            self.setMaximumWidth(400)
+            self.adjustSize()
+            
+            # Position at bottom-right of parent
+            self._position_toast()
+            
+            # Fade in animation
+            self.opacity_effect = QGraphicsOpacityEffect(self)
+            self.setGraphicsEffect(self.opacity_effect)
+            
+            self.fade_in = QPropertyAnimation(self.opacity_effect, b"opacity")
+            self.fade_in.setDuration(200)
+            self.fade_in.setStartValue(0)
+            self.fade_in.setEndValue(1)
+            
+            # Fade out after duration
+            self.fade_out = QPropertyAnimation(self.opacity_effect, b"opacity")
+            self.fade_out.setDuration(500)
+            self.fade_out.setStartValue(1)
+            self.fade_out.setEndValue(0)
+            self.fade_out.finished.connect(self.deleteLater)
+            
+            # Timer to start fade out
+            self.timer = QTimer(self)
+            self.timer.setSingleShot(True)
+            self.timer.timeout.connect(self.fade_out.start)
+            self.timer.start(duration)
+            
+            self.show()
+            self.fade_in.start()
+        
+        def _position_toast(self):
+            """Position toast at bottom-right with offset for stacking."""
+            if self.parent():
+                parent_rect = self.parent().rect()
+                # Count existing toasts for stacking
+                existing_toasts = [c for c in self.parent().children() 
+                                   if isinstance(c, AnarchyToast) and c != self and c.isVisible()]
+                offset = len(existing_toasts) * 60
+                
+                x = parent_rect.width() - self.width() - 20
+                y = parent_rect.height() - self.height() - 20 - offset
+                self.move(x, max(20, y))
+
+    # =========================================================================
+    # PRE-READY CHECKLIST SPLASH SCREEN
+    # =========================================================================
+    
+    class PreReadyChecklistDialog(QDialog):
+        """Splash screen that checks user's environment before starting."""
+        
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Image Anarchy - Environment Check")
+            self.setMinimumSize(650, 550)
+            self.setModal(True)
+            
+            # Get app directory for drivers
+            self.app_dir = Path(__file__).parent if '__file__' in dir() else Path.cwd()
+            self.drivers_dir = self.app_dir / "drivers"
+            
+            self._setup_ui()
+            self._check_environment()
+        
+        def _setup_ui(self):
+            layout = QVBoxLayout(self)
+            layout.setSpacing(16)
+            layout.setContentsMargins(24, 24, 24, 24)
+            
+            # Header
+            header = QLabel("🔧 Pre-Ready Checklist")
+            header.setStyleSheet("font-size: 22px; font-weight: bold; color: #4fc3f7;")
+            header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(header)
+            
+            subtitle = QLabel("Checking your environment for Android development tools...")
+            subtitle.setStyleSheet("font-size: 13px; color: #aaa;")
+            subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(subtitle)
+            
+            # OS Detection
+            os_group = QGroupBox("Operating System")
+            os_layout = QVBoxLayout(os_group)
+            
+            self.os_label = QLabel()
+            self.os_label.setStyleSheet("font-size: 14px; padding: 8px;")
+            os_layout.addWidget(self.os_label)
+            
+            layout.addWidget(os_group)
+            
+            # Windows-specific section
+            self.windows_group = QGroupBox("Windows Driver Signing (Required for unsigned USB drivers)")
+            self.windows_layout = QVBoxLayout(self.windows_group)
+            
+            info_label = QLabel(
+                "⚠️ These commands disable driver signature enforcement.\n"
+                "Required to use unsigned Android USB drivers. Run as Administrator."
+            )
+            info_label.setStyleSheet("color: #FFA500; font-size: 11px; padding: 4px;")
+            info_label.setWordWrap(True)
+            self.windows_layout.addWidget(info_label)
+            
+            # Command 1: nointegritychecks
+            self.cmd1_layout = QHBoxLayout()
+            self.cmd1_status = QLabel("⏳")
+            self.cmd1_status.setFixedWidth(30)
+            self.cmd1_label = QLabel("bcdedit.exe -set nointegritychecks on")
+            self.cmd1_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #2d2d2d; border-radius: 4px;")
+            self.cmd1_btn = QPushButton("Run")
+            self.cmd1_btn.setFixedWidth(80)
+            self.cmd1_btn.clicked.connect(lambda: self._run_bcdedit_command("bcdedit.exe -set nointegritychecks on"))
+            self.cmd1_layout.addWidget(self.cmd1_status)
+            self.cmd1_layout.addWidget(self.cmd1_label, 1)
+            self.cmd1_layout.addWidget(self.cmd1_btn)
+            self.windows_layout.addLayout(self.cmd1_layout)
+            
+            # Command 2: DISABLE_INTEGRITY_CHECKS
+            self.cmd2_layout = QHBoxLayout()
+            self.cmd2_status = QLabel("⏳")
+            self.cmd2_status.setFixedWidth(30)
+            self.cmd2_label = QLabel("bcdedit.exe -set loadoptions DISABLE_INTEGRITY_CHECKS")
+            self.cmd2_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #2d2d2d; border-radius: 4px;")
+            self.cmd2_btn = QPushButton("Run")
+            self.cmd2_btn.setFixedWidth(80)
+            self.cmd2_btn.clicked.connect(lambda: self._run_bcdedit_command("bcdedit.exe -set loadoptions DISABLE_INTEGRITY_CHECKS"))
+            self.cmd2_layout.addWidget(self.cmd2_status)
+            self.cmd2_layout.addWidget(self.cmd2_label, 1)
+            self.cmd2_layout.addWidget(self.cmd2_btn)
+            self.windows_layout.addLayout(self.cmd2_layout)
+            
+            # Command 3: TESTSIGNING
+            self.cmd3_layout = QHBoxLayout()
+            self.cmd3_status = QLabel("⏳")
+            self.cmd3_status.setFixedWidth(30)
+            self.cmd3_label = QLabel("bcdedit.exe -set TESTSIGNING ON")
+            self.cmd3_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #2d2d2d; border-radius: 4px;")
+            self.cmd3_btn = QPushButton("Run")
+            self.cmd3_btn.setFixedWidth(80)
+            self.cmd3_btn.clicked.connect(lambda: self._run_bcdedit_command("bcdedit.exe -set TESTSIGNING ON"))
+            self.cmd3_layout.addWidget(self.cmd3_status)
+            self.cmd3_layout.addWidget(self.cmd3_label, 1)
+            self.cmd3_layout.addWidget(self.cmd3_btn)
+            self.windows_layout.addLayout(self.cmd3_layout)
+            
+            # Run All button
+            run_all_btn = QPushButton("⚡ Run All Commands (Admin Required)")
+            run_all_btn.setStyleSheet("padding: 10px; font-weight: bold;")
+            run_all_btn.clicked.connect(self._run_all_commands)
+            self.windows_layout.addWidget(run_all_btn)
+            
+            layout.addWidget(self.windows_group)
+            
+            # Drivers section
+            self.drivers_group = QGroupBox("USB Drivers (Click to Install)")
+            drivers_layout = QGridLayout(self.drivers_group)
+            drivers_layout.setSpacing(8)
+            
+            # Driver buttons with their installers
+            self.driver_buttons = []
+            drivers = [
+                ("📱 ZTE USB Drivers", "ZTE_Android_Driver.exe", "ZTE devices"),
+                ("📱 Samsung USB Drivers", "SAMSUNG_USB_Driver_for_Mobile_Phones_v1.9.0.0.exe", "Samsung Galaxy"),
+                ("📱 MTK USB Drivers", "MTK_Driver_Setup.exe", "MediaTek devices"),
+                ("📱 Motorola USB Drivers", "Motorola_Mobile_Drivers_64bit.msi", "Motorola/Lenovo"),
+                ("📱 Alcatel USB Drivers", "Mobile_Upgrade_S_Gotu2_v6.1.0_Setup.exe", "Alcatel devices"),
+                ("📱 LG USB Drivers", "LG_Mobile _Driver_v4.8.0.exe", "LG devices"),
+            ]
+            
+            for i, (name, filename, tooltip) in enumerate(drivers):
+                btn = QPushButton(name)
+                btn.setToolTip(f"Install drivers for {tooltip}")
+                btn.setStyleSheet("padding: 10px; text-align: left;")
+                driver_path = self.drivers_dir / filename
+                if driver_path.exists():
+                    btn.clicked.connect(lambda checked, p=str(driver_path): self._install_driver(p))
+                else:
+                    btn.setEnabled(False)
+                    btn.setToolTip(f"Driver not found: {filename}")
+                    btn.setText(f"{name} (Not found)")
+                drivers_layout.addWidget(btn, i // 2, i % 2)
+                self.driver_buttons.append(btn)
+            
+            layout.addWidget(self.drivers_group)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            refresh_btn = QPushButton("🔄 Refresh Status")
+            refresh_btn.clicked.connect(self._check_environment)
+            btn_layout.addWidget(refresh_btn)
+            
+            skip_btn = QPushButton("Skip →")
+            skip_btn.setStyleSheet("padding: 10px 20px;")
+            skip_btn.clicked.connect(self.accept)
+            btn_layout.addWidget(skip_btn)
+            
+            continue_btn = QPushButton("Continue ✓")
+            continue_btn.setProperty("primary", True)
+            continue_btn.setStyleSheet("padding: 10px 20px; background-color: #0078d4; color: white; font-weight: bold;")
+            continue_btn.clicked.connect(self.accept)
+            btn_layout.addWidget(continue_btn)
+            
+            layout.addLayout(btn_layout)
+        
+        def _check_environment(self):
+            """Check the current environment and update UI."""
+            is_windows = sys.platform == 'win32'
+            is_linux = sys.platform.startswith('linux')
+            is_mac = sys.platform == 'darwin'
+            
+            if is_linux:
+                self.os_label.setText("🐧 Linux Detected - Good to go! No driver signing issues.")
+                self.os_label.setStyleSheet("font-size: 14px; padding: 8px; color: #4CAF50; background: #1b3d1b; border-radius: 4px;")
+                self.windows_group.setVisible(False)
+                self.drivers_group.setVisible(False)
+            elif is_mac:
+                self.os_label.setText("🍎 macOS Detected - Good to go! No driver signing issues.")
+                self.os_label.setStyleSheet("font-size: 14px; padding: 8px; color: #4CAF50; background: #1b3d1b; border-radius: 4px;")
+                self.windows_group.setVisible(False)
+                self.drivers_group.setVisible(False)
+            elif is_windows:
+                self.os_label.setText("🪟 Windows Detected - Driver signing configuration may be needed.")
+                self.os_label.setStyleSheet("font-size: 14px; padding: 8px; color: #FFA500; background: #3d3520; border-radius: 4px;")
+                self.windows_group.setVisible(True)
+                self.drivers_group.setVisible(True)
+                self._check_windows_signing()
+            else:
+                self.os_label.setText(f"❓ Unknown OS: {sys.platform}")
+                self.os_label.setStyleSheet("font-size: 14px; padding: 8px;")
+                self.windows_group.setVisible(False)
+        
+        def _check_windows_signing(self):
+            """Check Windows BCD settings for driver signing."""
+            try:
+                # Run bcdedit to get current settings
+                result = subprocess.run(
+                    ['bcdedit', '/enum', '{current}'],
+                    capture_output=True,
+                    text=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                output = result.stdout.lower()
+                
+                # Check nointegritychecks
+                if 'nointegritychecks' in output and 'yes' in output:
+                    self.cmd1_status.setText("✅")
+                    self.cmd1_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #1b3d1b; border-radius: 4px; color: #4CAF50; text-decoration: line-through;")
+                    self.cmd1_btn.setEnabled(False)
+                    self.cmd1_btn.setText("Done")
+                else:
+                    self.cmd1_status.setText("❌")
+                    self.cmd1_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #2d2d2d; border-radius: 4px;")
+                    self.cmd1_btn.setEnabled(True)
+                    self.cmd1_btn.setText("Run")
+                
+                # Check loadoptions DISABLE_INTEGRITY_CHECKS
+                if 'disable_integrity_checks' in output:
+                    self.cmd2_status.setText("✅")
+                    self.cmd2_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #1b3d1b; border-radius: 4px; color: #4CAF50; text-decoration: line-through;")
+                    self.cmd2_btn.setEnabled(False)
+                    self.cmd2_btn.setText("Done")
+                else:
+                    self.cmd2_status.setText("❌")
+                    self.cmd2_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #2d2d2d; border-radius: 4px;")
+                    self.cmd2_btn.setEnabled(True)
+                    self.cmd2_btn.setText("Run")
+                
+                # Check TESTSIGNING
+                if 'testsigning' in output and 'yes' in output:
+                    self.cmd3_status.setText("✅")
+                    self.cmd3_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #1b3d1b; border-radius: 4px; color: #4CAF50; text-decoration: line-through;")
+                    self.cmd3_btn.setEnabled(False)
+                    self.cmd3_btn.setText("Done")
+                else:
+                    self.cmd3_status.setText("❌")
+                    self.cmd3_label.setStyleSheet("font-family: Consolas; font-size: 12px; padding: 4px; background: #2d2d2d; border-radius: 4px;")
+                    self.cmd3_btn.setEnabled(True)
+                    self.cmd3_btn.setText("Run")
+                    
+            except Exception as e:
+                # Can't check - likely not admin
+                self.cmd1_status.setText("❓")
+                self.cmd2_status.setText("❓")
+                self.cmd3_status.setText("❓")
+        
+        def _run_bcdedit_command(self, command):
+            """Run a bcdedit command with admin privileges."""
+            try:
+                if sys.platform == 'win32':
+                    # Use PowerShell Start-Process with -Verb RunAs for elevation
+                    ps_command = f'Start-Process cmd -ArgumentList "/c {command}" -Verb RunAs -Wait'
+                    subprocess.run(['powershell', '-Command', ps_command], check=False)
+                    # Refresh status after command
+                    QTimer.singleShot(1000, self._check_windows_signing)
+                    QMessageBox.information(self, "Command Executed", 
+                        f"Command executed. A reboot may be required for changes to take effect.\n\n{command}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to run command:\n{e}")
+        
+        def _run_all_commands(self):
+            """Run all bcdedit commands at once."""
+            try:
+                if sys.platform == 'win32':
+                    commands = [
+                        "bcdedit.exe -set nointegritychecks on",
+                        "bcdedit.exe -set loadoptions DISABLE_INTEGRITY_CHECKS",
+                        "bcdedit.exe -set TESTSIGNING ON"
+                    ]
+                    combined = " && ".join(commands)
+                    ps_command = f'Start-Process cmd -ArgumentList "/c {combined}" -Verb RunAs -Wait'
+                    subprocess.run(['powershell', '-Command', ps_command], check=False)
+                    QTimer.singleShot(1000, self._check_windows_signing)
+                    QMessageBox.information(self, "Commands Executed",
+                        "All commands executed. A reboot is required for changes to take effect.")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to run commands:\n{e}")
+        
+        def _install_driver(self, driver_path):
+            """Install a driver package."""
+            try:
+                if sys.platform == 'win32':
+                    if driver_path.endswith('.msi'):
+                        # MSI installer
+                        subprocess.Popen(['msiexec', '/i', driver_path], creationflags=subprocess.CREATE_NO_WINDOW)
+                    else:
+                        # EXE installer - run with elevation
+                        ps_command = f'Start-Process "{driver_path}" -Verb RunAs'
+                        subprocess.run(['powershell', '-Command', ps_command], check=False)
+                    QMessageBox.information(self, "Driver Installer", 
+                        f"Driver installer launched:\n{Path(driver_path).name}\n\nFollow the on-screen instructions.")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Failed to launch installer:\n{e}")
 
     @dataclass
     class PartitionDisplayInfo:
@@ -7589,11 +9068,195 @@ def create_gui_app():
             self.partitions: list[PartitionDisplayInfo] = []
             self.repack_images: list[str] = []
             
+            self._force_quit = False  # Flag to allow actual quit vs minimize to tray
             self._setup_ui()
             self._apply_styles()
+            self._setup_system_tray()
+            self._setup_drag_drop()
+        
+        def _setup_system_tray(self):
+            """Setup the rebellious system tray icon."""
+            self.tray_icon = QSystemTrayIcon(self)
+            
+            # Create anarchy icon programmatically
+            pixmap = QPixmap(64, 64)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            
+            # Draw circle-A anarchy symbol
+            from PyQt6.QtGui import QPen, QBrush
+            from PyQt6.QtCore import QRectF
+            
+            # Outer circle
+            pen = QPen(QColor('#ff4444'))
+            pen.setWidth(4)
+            painter.setPen(pen)
+            painter.drawEllipse(QRectF(4, 4, 56, 56))
+            
+            # The 'A'
+            pen.setWidth(5)
+            painter.setPen(pen)
+            # Left leg
+            painter.drawLine(32, 8, 12, 52)
+            # Right leg  
+            painter.drawLine(32, 8, 52, 52)
+            # Crossbar
+            painter.drawLine(18, 36, 46, 36)
+            # Extended bottom (the anarchy style)
+            painter.drawLine(32, 8, 32, 58)
+            
+            painter.end()
+            self.tray_icon.setIcon(QIcon(pixmap))
+            
+            # Create context menu
+            tray_menu = QMenu()
+            tray_menu.setStyleSheet("""
+                QMenu {
+                    background-color: #2d2d2d;
+                    color: #d4d4d4;
+                    border: 1px solid #3c3c3c;
+                    padding: 4px;
+                }
+                QMenu::item {
+                    padding: 8px 20px;
+                }
+                QMenu::item:selected {
+                    background-color: #c62828;
+                }
+            """)
+            
+            # Actions with anarchy flair
+            show_action = QAction("🏴 Unleash Anarchy", self)
+            show_action.triggered.connect(self._tray_show_window)
+            tray_menu.addAction(show_action)
+            
+            tray_menu.addSeparator()
+            
+            extract_action = QAction("💣 Quick Extract", self)
+            extract_action.triggered.connect(self._tray_quick_extract)
+            tray_menu.addAction(extract_action)
+            
+            tray_menu.addSeparator()
+            
+            quit_action = QAction("💀 Burn It Down", self)
+            quit_action.triggered.connect(self._force_quit_app)
+            tray_menu.addAction(quit_action)
+            
+            self.tray_icon.setContextMenu(tray_menu)
+            self.tray_icon.setToolTip("Image Anarchy - Right-click for chaos")
+            self.tray_icon.activated.connect(self._tray_activated)
+            self.tray_icon.show()
+        
+        def _setup_drag_drop(self):
+            """Enable drag and drop for the main window."""
+            self.setAcceptDrops(True)
+        
+        def dragEnterEvent(self, event: QDragEnterEvent):
+            """Accept drags with file URLs."""
+            if event.mimeData().hasUrls():
+                # Check if any file is a supported type
+                for url in event.mimeData().urls():
+                    path = url.toLocalFile().lower()
+                    if any(path.endswith(ext) for ext in ['.bin', '.img', '.zip', '.payload']):
+                        event.acceptProposedAction()
+                        self._show_toast("💣 Drop it like it's hot!", 'chaos')
+                        return
+            event.ignore()
+        
+        def dropEvent(self, event: QDropEvent):
+            """Handle dropped files - route to appropriate handler."""
+            files = [url.toLocalFile() for url in event.mimeData().urls()]
+            
+            for file_path in files:
+                lower_path = file_path.lower()
+                
+                if lower_path.endswith('.bin') or 'payload' in lower_path:
+                    # Payload file - go to extract tab
+                    self.tab_widget.setCurrentIndex(0)  # Extract tab
+                    self.path_input.setText(file_path)
+                    self._show_toast(f"🔥 Payload locked and loaded!", 'success')
+                    self._load_payload()
+                    break
+                    
+                elif lower_path.endswith('.img'):
+                    # Image file - go to Image Extract tab
+                    for i in range(self.tab_widget.count()):
+                        if 'Image' in self.tab_widget.tabText(i):
+                            self.tab_widget.setCurrentIndex(i)
+                            break
+                    if hasattr(self, 'image_path_input'):
+                        self.image_path_input.setText(file_path)
+                        self._show_toast(f"🛠️ Image ready for destruction!", 'success')
+                    break
+                    
+                elif lower_path.endswith('.zip'):
+                    # ZIP file - could be OTA
+                    self.tab_widget.setCurrentIndex(0)
+                    self.path_input.setText(file_path)
+                    self._show_toast(f"📦 OTA package detected - unleashing!", 'success')
+                    self._load_payload()
+                    break
+            
+            event.acceptProposedAction()
+        
+        def _tray_activated(self, reason):
+            """Handle tray icon activation."""
+            if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+                self._tray_show_window()
+        
+        def _tray_show_window(self):
+            """Show and raise the main window."""
+            self.showNormal()
+            self.activateWindow()
+            self.raise_()
+        
+        def _tray_quick_extract(self):
+            """Open file dialog for quick extraction from tray."""
+            self._tray_show_window()
+            self._browse_payload()
+        
+        def _show_toast(self, message: str, toast_type: str = 'info'):
+            """Show a rebellious toast notification."""
+            AnarchyToast(self, message, toast_type)
+        
+        def _show_tray_notification(self, title: str, message: str, icon_type: str = 'info'):
+            """Show a system notification from tray."""
+            icons = {
+                'info': QSystemTrayIcon.MessageIcon.Information,
+                'warning': QSystemTrayIcon.MessageIcon.Warning,
+                'error': QSystemTrayIcon.MessageIcon.Critical,
+            }
+            self.tray_icon.showMessage(title, message, icons.get(icon_type, icons['info']), 3000)
+        
+        def _force_quit_app(self):
+            """Force quit the application - no minimize to tray."""
+            self._force_quit = True
+            # Hide tray icon first to prevent orphaned icons
+            self.tray_icon.hide()
+            # Close the application
+            QApplication.instance().quit()
+        
+        def closeEvent(self, event):
+            """Minimize to tray instead of closing, unless force quit."""
+            if self._force_quit:
+                # User chose to quit - actually close
+                self.tray_icon.hide()  # Ensure tray icon is removed
+                event.accept()
+            elif self.tray_icon.isVisible():
+                self._show_toast("👻 Anarchy lurks in the shadows...", 'chaos')
+                self.hide()
+                self._show_tray_notification(
+                    "Image Anarchy",
+                    "Still running in the tray. Right-click to unleash chaos!",
+                    'info'
+                )
+                event.ignore()
+            else:
+                event.accept()
         
         def _setup_ui(self):
-            self.setWindowTitle("Image Anarchy - Android Image Swiss Army Knife")
+            self.setWindowTitle("Image Anarchy 2.0 - Android Image Swiss Army Knife")
             self.setMinimumSize(1100, 800)
             self.resize(1200, 900)
             
@@ -8143,7 +9806,8 @@ def create_gui_app():
                 "Vendor Boot Image (vendor_boot.img)",
                 "Sparse Image (from raw)",
                 "vbmeta Image (disabled AVB)",
-                "Ramdisk (from directory)"
+                "Ramdisk (from directory)",
+                "Super Partition (dynamic partitions)"
             ])
             self.repack_type_combo.currentIndexChanged.connect(self._on_repack_type_changed)
             repack_type_layout.addWidget(self.repack_type_combo)
@@ -8370,6 +10034,118 @@ def create_gui_app():
             ramdisk_layout.addStretch()
             self.ramdisk_widget.setVisible(False)
             self.repack_stack_layout.addWidget(self.ramdisk_widget)
+            
+            # === Super Partition Options ===
+            self.super_widget = QWidget()
+            super_layout = QVBoxLayout(self.super_widget)
+            
+            super_info = QLabel(
+                "🔥 Create a super.img (dynamic partition) from individual partition images.\n"
+                "Add partitions like system, vendor, product, odm, etc."
+            )
+            super_info.setStyleSheet("color: #FF6B35; font-style: italic;")
+            super_info.setWordWrap(True)
+            super_layout.addWidget(super_info)
+            
+            # Partition list with add/remove
+            super_parts_group = QGroupBox("Partitions")
+            super_parts_layout = QVBoxLayout(super_parts_group)
+            
+            self.super_partitions_list = QListWidget()
+            self.super_partitions_list.setAlternatingRowColors(True)
+            self.super_partitions_list.setMinimumHeight(120)
+            super_parts_layout.addWidget(self.super_partitions_list)
+            
+            super_part_btns = QHBoxLayout()
+            self.super_add_part_btn = QPushButton("+ Add Partition")
+            self.super_add_part_btn.clicked.connect(self._super_add_partition)
+            self.super_remove_part_btn = QPushButton("- Remove")
+            self.super_remove_part_btn.clicked.connect(self._super_remove_partition)
+            self.super_scan_parts_btn = QPushButton("📁 Scan Directory")
+            self.super_scan_parts_btn.clicked.connect(self._super_scan_directory)
+            super_part_btns.addWidget(self.super_add_part_btn)
+            super_part_btns.addWidget(self.super_remove_part_btn)
+            super_part_btns.addWidget(self.super_scan_parts_btn)
+            super_part_btns.addStretch()
+            super_parts_layout.addLayout(super_part_btns)
+            
+            super_layout.addWidget(super_parts_group)
+            
+            # Group configuration
+            super_group_layout = QHBoxLayout()
+            super_group_layout.addWidget(QLabel("Partition Group:"))
+            self.super_group_name = QLineEdit("qti_dynamic_partitions")
+            self.super_group_name.setPlaceholderText("Group name (e.g., qti_dynamic_partitions)")
+            super_group_layout.addWidget(self.super_group_name, 1)
+            super_layout.addLayout(super_group_layout)
+            
+            # Size settings
+            super_size_group = QGroupBox("Size Configuration")
+            super_size_layout = QFormLayout(super_size_group)
+            
+            # Super size
+            super_size_row = QHBoxLayout()
+            self.super_size_spin = QSpinBox()
+            self.super_size_spin.setRange(1, 32768)  # 1MB to 32GB
+            self.super_size_spin.setValue(8192)  # Default 8GB
+            self.super_size_spin.setSuffix(" MB")
+            self.super_size_spin.setToolTip("Total size of super.img (0 = auto-calculate)")
+            super_size_row.addWidget(self.super_size_spin)
+            self.super_size_auto = QCheckBox("Auto-calculate")
+            self.super_size_auto.setChecked(True)
+            self.super_size_auto.toggled.connect(lambda checked: self.super_size_spin.setEnabled(not checked))
+            self.super_size_spin.setEnabled(False)
+            super_size_row.addWidget(self.super_size_auto)
+            super_size_row.addStretch()
+            super_size_layout.addRow("Super Size:", super_size_row)
+            
+            # Group max size
+            group_size_row = QHBoxLayout()
+            self.super_group_size_spin = QSpinBox()
+            self.super_group_size_spin.setRange(1, 32768)
+            self.super_group_size_spin.setValue(8000)  # Default ~8GB
+            self.super_group_size_spin.setSuffix(" MB")
+            self.super_group_size_spin.setToolTip("Maximum size for partition group (0 = auto)")
+            group_size_row.addWidget(self.super_group_size_spin)
+            self.super_group_size_auto = QCheckBox("Auto-calculate")
+            self.super_group_size_auto.setChecked(True)
+            self.super_group_size_auto.toggled.connect(lambda checked: self.super_group_size_spin.setEnabled(not checked))
+            self.super_group_size_spin.setEnabled(False)
+            group_size_row.addStretch()
+            super_size_layout.addRow("Group Max Size:", group_size_row)
+            
+            # Metadata size
+            metadata_row = QHBoxLayout()
+            self.super_metadata_size = QComboBox()
+            self.super_metadata_size.addItems(["65536 (64KB)", "131072 (128KB)", "262144 (256KB)"])
+            self.super_metadata_size.setToolTip("Metadata region size")
+            metadata_row.addWidget(self.super_metadata_size)
+            metadata_row.addStretch()
+            super_size_layout.addRow("Metadata Size:", metadata_row)
+            
+            super_layout.addWidget(super_size_group)
+            
+            # Options
+            super_opts_layout = QHBoxLayout()
+            self.super_sparse_check = QCheckBox("Output as sparse image")
+            self.super_sparse_check.setToolTip("Create sparse super.img (smaller, faster to flash)")
+            self.super_sparse_check.setChecked(True)
+            self.super_readonly_check = QCheckBox("Read-only partitions")
+            self.super_readonly_check.setToolTip("Mark all partitions as read-only")
+            self.super_readonly_check.setChecked(True)
+            super_opts_layout.addWidget(self.super_sparse_check)
+            super_opts_layout.addWidget(self.super_readonly_check)
+            super_opts_layout.addStretch()
+            super_layout.addLayout(super_opts_layout)
+            
+            # Calculated size display
+            self.super_calc_label = QLabel("Total partition size: 0 MB")
+            self.super_calc_label.setStyleSheet("color: #888; font-size: 11px;")
+            super_layout.addWidget(self.super_calc_label)
+            
+            super_layout.addStretch()
+            self.super_widget.setVisible(False)
+            self.repack_stack_layout.addWidget(self.super_widget)
             
             repack_img_layout.addWidget(self.repack_stack)
             
@@ -8714,6 +10490,7 @@ def create_gui_app():
             self._select_all()
             self.extract_btn.setEnabled(True)
             self.status_bar.showMessage(f"Loaded {len(partitions)} partitions")
+            self._show_toast(f"⚡ {len(partitions)} partitions ready for liberation!", 'success')
         
         def _on_load_error(self, error: str):
             self.progress_bar.setRange(0, 100)
@@ -8721,6 +10498,7 @@ def create_gui_app():
             self.load_btn.setEnabled(True)
             self._log(f"Error: {error}")
             self.status_bar.showMessage("Error loading payload")
+            self._show_toast("💀 Failed to crack the payload!", 'error')
             QMessageBox.critical(self, "Error", f"Failed to load payload:\n{error}")
         
         def _select_all(self):
@@ -8804,6 +10582,7 @@ def create_gui_app():
             self._set_extraction_mode(False)
             self._log(f"\nError: {error}")
             self.status_bar.showMessage("Extraction failed")
+            self._show_toast(f"💀 Extraction failed! The system fought back.", 'error')
             QMessageBox.critical(self, "Error", f"Extraction failed:\n{error}")
         
         def _on_extraction_finished(self):
@@ -8811,6 +10590,10 @@ def create_gui_app():
             self.progress_bar.setValue(self.progress_bar.maximum())
             self.progress_label.setText("Complete")
             self.status_bar.showMessage("Extraction complete!")
+            
+            # Anarchy toast and tray notification
+            self._show_toast("🔥 Extraction complete! Partitions liberated!", 'success')
+            self._show_tray_notification("Image Anarchy", "💣 Extraction complete! The system has been dismantled.", 'info')
             
             result = QMessageBox.question(
                 self, "Extraction Complete",
@@ -9172,18 +10955,31 @@ def create_gui_app():
             self.sparse_widget.setVisible(False)
             self.vbmeta_widget.setVisible(False)
             self.ramdisk_widget.setVisible(False)
+            self.super_widget.setVisible(False)
             
-            # Show selected widget
+            # Show selected widget and set default output filename
             if index == 0:  # Boot Image
                 self.boot_repack_widget.setVisible(True)
+                if not self.repack_img_output_edit.text():
+                    self.repack_img_output_edit.setText("boot.img")
             elif index == 1:  # Vendor Boot
                 self.vendor_boot_widget.setVisible(True)
+                if not self.repack_img_output_edit.text():
+                    self.repack_img_output_edit.setText("vendor_boot.img")
             elif index == 2:  # Sparse
                 self.sparse_widget.setVisible(True)
             elif index == 3:  # vbmeta
                 self.vbmeta_widget.setVisible(True)
+                if not self.repack_img_output_edit.text():
+                    self.repack_img_output_edit.setText("vbmeta.img")
             elif index == 4:  # Ramdisk
                 self.ramdisk_widget.setVisible(True)
+                if not self.repack_img_output_edit.text():
+                    self.repack_img_output_edit.setText("ramdisk.cpio.gz")
+            elif index == 5:  # Super Partition
+                self.super_widget.setVisible(True)
+                if not self.repack_img_output_edit.text():
+                    self.repack_img_output_edit.setText("super.img")
         
         def _on_boot_version_changed(self, index: int):
             """Handle boot image version change."""
@@ -9259,6 +11055,8 @@ def create_gui_app():
                     self._repack_vbmeta(output_path)
                 elif repack_type == 4:
                     self._repack_ramdisk(output_path)
+                elif repack_type == 5:
+                    self._repack_super(output_path)
             except Exception as e:
                 self._repack_log(f"Error: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to create image:\n{e}")
@@ -9478,6 +11276,191 @@ def create_gui_app():
             else:
                 self._repack_log("❌ Failed to create ramdisk")
                 self.repack_img_progress_label.setText("Failed")
+        
+        # ===== Super Partition Methods =====
+        def _super_add_partition(self):
+            """Add a partition image to the super list."""
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Select Partition Image(s)",
+                "",
+                "Image Files (*.img);;All Files (*.*)"
+            )
+            for path in paths:
+                # Extract partition name from filename
+                name = Path(path).stem
+                # Remove common suffixes
+                for suffix in ['_a', '_b', '-sign', '.raw', '_raw']:
+                    if name.endswith(suffix):
+                        name = name[:-len(suffix)]
+                
+                size = os.path.getsize(path)
+                size_mb = size / (1024 * 1024)
+                
+                item = QListWidgetItem(f"{name}: {size_mb:.2f} MB - {path}")
+                item.setData(Qt.ItemDataRole.UserRole, {'name': name, 'path': path, 'size': size})
+                self.super_partitions_list.addItem(item)
+            
+            self._super_update_calc()
+        
+        def _super_remove_partition(self):
+            """Remove selected partition from the super list."""
+            for item in self.super_partitions_list.selectedItems():
+                self.super_partitions_list.takeItem(self.super_partitions_list.row(item))
+            self._super_update_calc()
+        
+        def _super_scan_directory(self):
+            """Scan a directory for partition images."""
+            dir_path = QFileDialog.getExistingDirectory(
+                self, "Select Directory with Partition Images",
+                str(Path.cwd())
+            )
+            if not dir_path:
+                return
+            
+            # Common partition names to look for
+            partition_names = [
+                'system', 'system_ext', 'vendor', 'product', 'odm', 
+                'vendor_dlkm', 'odm_dlkm', 'system_dlkm'
+            ]
+            
+            found = 0
+            for img_file in Path(dir_path).glob('*.img'):
+                name = img_file.stem.lower()
+                # Check if it's a known partition or just add any .img
+                base_name = name
+                for suffix in ['_a', '_b', '-sign', '.raw', '_raw']:
+                    if base_name.endswith(suffix):
+                        base_name = base_name[:-len(suffix)]
+                
+                size = img_file.stat().st_size
+                if size > 0:  # Skip empty files
+                    size_mb = size / (1024 * 1024)
+                    item = QListWidgetItem(f"{base_name}: {size_mb:.2f} MB - {img_file}")
+                    item.setData(Qt.ItemDataRole.UserRole, {
+                        'name': base_name, 
+                        'path': str(img_file), 
+                        'size': size
+                    })
+                    self.super_partitions_list.addItem(item)
+                    found += 1
+            
+            self._super_update_calc()
+            
+            if found > 0:
+                self._repack_log(f"Found {found} partition image(s) in {dir_path}")
+            else:
+                QMessageBox.information(self, "Scan Complete", 
+                    f"No .img files found in:\n{dir_path}")
+        
+        def _super_update_calc(self):
+            """Update the calculated total size display."""
+            total_size = 0
+            for i in range(self.super_partitions_list.count()):
+                item = self.super_partitions_list.item(i)
+                data = item.data(Qt.ItemDataRole.UserRole)
+                if data:
+                    total_size += data.get('size', 0)
+            
+            total_mb = total_size / (1024 * 1024)
+            self.super_calc_label.setText(f"Total partition size: {total_mb:.2f} MB ({self.super_partitions_list.count()} partitions)")
+        
+        def _repack_super(self, output_path: str):
+            """Create super.img from partition images."""
+            if self.super_partitions_list.count() == 0:
+                QMessageBox.warning(self, "Error", "Please add at least one partition image")
+                return
+            
+            # Get settings
+            group_name = self.super_group_name.text().strip() or "default"
+            sparse_output = self.super_sparse_check.isChecked()
+            readonly = self.super_readonly_check.isChecked()
+            
+            # Get metadata size
+            metadata_text = self.super_metadata_size.currentText()
+            metadata_size = int(metadata_text.split()[0])
+            
+            # Calculate or get sizes
+            if self.super_size_auto.isChecked():
+                super_size = 0  # Auto-calculate
+            else:
+                super_size = self.super_size_spin.value() * 1024 * 1024
+            
+            if self.super_group_size_auto.isChecked():
+                group_max_size = 0  # Auto-calculate
+            else:
+                group_max_size = self.super_group_size_spin.value() * 1024 * 1024
+            
+            self._repack_log(f"\ud83d\udd25 Creating super.img (dynamic partition)...")
+            self._repack_log(f"  Group: {group_name}")
+            self._repack_log(f"  Partitions: {self.super_partitions_list.count()}")
+            self._repack_log(f"  Metadata size: {metadata_size}")
+            self._repack_log(f"  Sparse output: {sparse_output}")
+            self._repack_log(f"  Read-only: {readonly}")
+            
+            def progress_callback(current, total, msg):
+                pct = int(current / total * 100) if total > 0 else 0
+                self.repack_img_progress.setValue(pct)
+                self.repack_img_progress_label.setText(msg)
+            
+            self.repack_img_progress.setRange(0, 100)
+            self.repack_img_progress.setValue(0)
+            
+            try:
+                creator = SuperImageCreator(progress_callback)
+                creator.set_metadata_size(metadata_size)
+                creator.set_sparse(sparse_output)
+                
+                if super_size > 0:
+                    creator.set_super_size(super_size)
+                
+                # Add partitions
+                total_size = 0
+                for i in range(self.super_partitions_list.count()):
+                    item = self.super_partitions_list.item(i)
+                    data = item.data(Qt.ItemDataRole.UserRole)
+                    if data:
+                        creator.add_partition(
+                            data['name'], 
+                            data['path'], 
+                            group_name, 
+                            readonly
+                        )
+                        total_size += data['size']
+                        self._repack_log(f"  + {data['name']}: {data['size'] / (1024*1024):.2f} MB")
+                
+                # Set group max size
+                if group_max_size > 0:
+                    creator.add_group(group_name, group_max_size)
+                else:
+                    # Auto: total size + 10% buffer
+                    creator.add_group(group_name, int(total_size * 1.1))
+                
+                self._repack_log(f"\nBuilding super.img...")
+                
+                # Create the image
+                success = creator.create(output_path)
+                
+                if success:
+                    size = os.path.getsize(output_path)
+                    self._repack_log(f"\n🔥 Super image created successfully!")
+                    self._repack_log(f"  Output: {output_path}")
+                    self._repack_log(f"  Size: {size / (1024*1024):.2f} MB")
+                    self.repack_img_progress.setValue(100)
+                    self.repack_img_progress_label.setText("Complete")
+                    self._show_toast(f"Super.img created: {size / (1024*1024):.0f} MB", 'success')
+                    QMessageBox.information(self, "Success", 
+                        f"Super partition image created!\n\n"
+                        f"Output: {output_path}\n"
+                        f"Size: {size / (1024*1024):.2f} MB\n"
+                        f"Partitions: {self.super_partitions_list.count()}")
+                else:
+                    self._repack_log("💀 Failed to create super image")
+                    self.repack_img_progress_label.setText("Failed")
+                    
+            except Exception as e:
+                self._repack_log(f"💀 Error: {e}")
+                self.repack_img_progress_label.setText("Failed")
+                raise
         
         # ===== Recovery Porter Methods =====
         def _recovery_log(self, msg: str):
@@ -9883,6 +11866,27 @@ def create_gui_app():
                     os.system(f'open "{output_dir}"')
                 else:
                     os.system(f'xdg-open "{output_dir}"')
+
+    class PluginUploadThread(QThread):
+        """Thread for uploading plugins without blocking the UI."""
+        
+        finished = pyqtSignal(dict)  # Emits result dict
+        progress = pyqtSignal(str)   # Emits status message
+        
+        def __init__(self, api, manifest: dict, file_path: str, screenshots: list = None):
+            super().__init__()
+            self.api = api
+            self.manifest = manifest
+            self.file_path = file_path
+            self.screenshots = screenshots or []
+        
+        def run(self):
+            try:
+                self.progress.emit("📤 Uploading plugin file...")
+                result = self.api.submit_plugin(self.manifest, self.file_path, self.screenshots)
+                self.finished.emit(result)
+            except Exception as e:
+                self.finished.emit({'error': str(e)})
 
     class ImageExtractThread(QThread):
         """Thread for extracting Android images without blocking the UI."""
@@ -10302,6 +12306,324 @@ def create_gui_app():
             self.progress.emit(1, 1, "Copy complete")
 
     # =========================================================================
+    # PLUGIN STORE API CLIENT
+    # =========================================================================
+    
+    # Plugin Store URL - set via environment variable or change here
+    PLUGIN_STORE_URL = os.environ.get('PLUGIN_STORE_URL', 'https://plugins.imageanarchy.com')
+    
+    class PluginStoreAPI:
+        """API client for the Image Anarchy Plugin Store."""
+        
+        def __init__(self, base_url: str = None):
+            self.base_url = base_url or PLUGIN_STORE_URL
+            self.token = None
+            self.user = None
+            self._load_auth()
+        
+        def _load_auth(self):
+            """Load saved authentication from config."""
+            try:
+                config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plugin_store_auth.json')
+                if os.path.exists(config_file):
+                    with open(config_file, 'r') as f:
+                        data = json.load(f)
+                        self.token = data.get('token')
+                        self.user = data.get('user')
+            except Exception:
+                pass
+        
+        def _save_auth(self):
+            """Save authentication to config."""
+            try:
+                config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plugin_store_auth.json')
+                with open(config_file, 'w') as f:
+                    json.dump({'token': self.token, 'user': self.user}, f)
+            except Exception:
+                pass
+        
+        def _request(self, method: str, endpoint: str, data: dict = None, files: list = None) -> dict:
+            """Make an API request.
+            
+            Args:
+                method: HTTP method (GET, POST, etc.)
+                endpoint: API endpoint
+                data: Dictionary of form data
+                files: List of tuples: [(field_name, filename, filedata), ...]
+            """
+            import urllib.request
+            import urllib.error
+            import urllib.parse
+            import hashlib
+            import time
+            
+            url = f"{self.base_url}{endpoint}"
+            headers = {
+                'Content-Type': 'application/json',
+                'User-Agent': 'ImageAnarchy/2.0'
+            }
+            
+            # Add request signature for security
+            timestamp = str(int(time.time() * 1000))
+            app_secret = 'ImageAnarchy-Plugin-Store-2026'
+            hourly_key = int(timestamp) // (60 * 60 * 1000)
+            sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+            signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+            headers['X-App-Signature'] = signature
+            headers['X-App-Timestamp'] = timestamp
+            
+            if self.token:
+                headers['Authorization'] = f'Bearer {self.token}'
+            
+            try:
+                if files:
+                    # Multipart form upload
+                    import mimetypes
+                    boundary = '----WebKitFormBoundary' + str(uuid.uuid4()).replace('-', '')[:16]
+                    headers['Content-Type'] = f'multipart/form-data; boundary={boundary}'
+                    
+                    body = b''
+                    for key, value in (data or {}).items():
+                        body += f'--{boundary}\r\n'.encode()
+                        body += f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+                        # JSON serialize lists and dicts
+                        if isinstance(value, (list, dict)):
+                            value = json.dumps(value)
+                        body += f'{value}\r\n'.encode()
+                    
+                    # Support multiple files with same field name
+                    for field_name, filename, filedata in files:
+                        mime_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+                        body += f'--{boundary}\r\n'.encode()
+                        body += f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode()
+                        body += f'Content-Type: {mime_type}\r\n\r\n'.encode()
+                        body += filedata + b'\r\n'
+                    
+                    body += f'--{boundary}--\r\n'.encode()
+                    
+                    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+                elif data:
+                    body = json.dumps(data).encode('utf-8')
+                    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+                else:
+                    if method == 'GET':
+                        headers.pop('Content-Type', None)
+                    req = urllib.request.Request(url, headers=headers, method=method)
+                
+                # Use longer timeout for uploads (files present), shorter for regular API calls
+                request_timeout = 300 if files else 30  # 5 minutes for uploads, 30s otherwise
+                with urllib.request.urlopen(req, timeout=request_timeout) as response:
+                    return json.loads(response.read().decode('utf-8'))
+                    
+            except urllib.error.HTTPError as e:
+                try:
+                    error_body = json.loads(e.read().decode('utf-8'))
+                    return {'error': error_body.get('error', str(e))}
+                except:
+                    return {'error': str(e)}
+            except urllib.error.URLError as e:
+                return {'error': f'Connection failed: {e.reason}'}
+            except Exception as e:
+                return {'error': str(e)}
+        
+        def get_plugins(self, category: str = None, search: str = None) -> list:
+            """Get list of approved plugins from the store."""
+            endpoint = '/api/plugins'
+            if search:
+                endpoint = f'/api/search?q={urllib.parse.quote(search)}'
+            elif category:
+                endpoint = f'/api/plugins?category={urllib.parse.quote(category)}'
+            
+            result = self._request('GET', endpoint)
+            if 'error' in result:
+                return []
+            return result.get('plugins', result) if isinstance(result, dict) else result
+        
+        def get_plugin(self, plugin_id: str) -> dict:
+            """Get plugin details."""
+            return self._request('GET', f'/api/plugins/{plugin_id}')
+        
+        def get_categories(self) -> list:
+            """Get list of categories."""
+            result = self._request('GET', '/api/categories')
+            return result.get('categories', []) if isinstance(result, dict) else []
+        
+        def download_plugin(self, plugin_id: str, save_path: str) -> tuple:
+            """Download a plugin zip file.
+            
+            Returns:
+                tuple: (success: bool, message: str)
+            """
+            import urllib.request
+            import urllib.error
+            
+            url = f"{self.base_url}/api/plugins/{plugin_id}/download"
+            
+            try:
+                req = urllib.request.Request(url)
+                req.add_header('User-Agent', 'ImageAnarchy/2.0')
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    with open(save_path, 'wb') as f:
+                        f.write(response.read())
+                return True, save_path
+            except Exception as e:
+                return False, str(e)
+        
+        def register(self, username: str, email: str, password: str) -> dict:
+            """Register a new developer account."""
+            result = self._request('POST', '/api/auth/register', {
+                'username': username,
+                'email': email,
+                'password': password
+            })
+            
+            if 'token' in result:
+                self.token = result['token']
+                self.user = result.get('user', {'username': username})
+                self._save_auth()
+            
+            return result
+        
+        def login(self, username: str, password: str) -> dict:
+            """Login to developer account."""
+            result = self._request('POST', '/api/auth/login', {
+                'username': username,
+                'password': password
+            })
+            
+            if 'token' in result:
+                self.token = result['token']
+                self.user = result.get('user', {'username': username})
+                self._save_auth()
+            
+            return result
+        
+        def logout(self):
+            """Logout and clear saved auth."""
+            self.token = None
+            self.user = None
+            try:
+                config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plugin_store_auth.json')
+                if os.path.exists(config_file):
+                    os.remove(config_file)
+            except Exception:
+                pass
+        
+        def is_logged_in(self) -> bool:
+            """Check if user is logged in."""
+            return self.token is not None
+        
+        def submit_plugin(self, manifest: dict, zip_path: str, screenshots: list = None) -> dict:
+            """Submit a plugin to the store with optional screenshots."""
+            if not self.token:
+                return {'error': 'Not logged in'}
+            
+            with open(zip_path, 'rb') as f:
+                zip_data = f.read()
+            
+            # Build files list: [(field_name, filename, data), ...]
+            files = [('plugin', os.path.basename(zip_path), zip_data)]
+            
+            # Add screenshots
+            if screenshots:
+                for ss_path in screenshots:
+                    if os.path.exists(ss_path):
+                        with open(ss_path, 'rb') as ss_file:
+                            ss_data = ss_file.read()
+                            files.append(('screenshots', os.path.basename(ss_path), ss_data))
+            
+            result = self._request('POST', '/api/plugins/submit', manifest, files)
+            
+            # Return screenshot count and external deps count in result
+            if 'error' not in result:
+                result['screenshots'] = len(screenshots) if screenshots else 0
+                result['external_deps'] = len(manifest.get('external_dependencies', []))
+            
+            return result
+        
+        # =====================================================================
+        # Feedback, Rating & Bug Report API Methods
+        # =====================================================================
+        
+        def get_feedback(self, plugin_id: str) -> dict:
+            """Get feedback and ratings for a plugin."""
+            return self._request('GET', f'/api/plugins/{plugin_id}/feedback')
+        
+        def submit_rating(self, plugin_id: str, rating: int, comment: str = None) -> dict:
+            """Submit a rating for a plugin (requires login)."""
+            if not self.token:
+                return {'error': 'Not logged in'}
+            data = {'rating': rating}
+            if comment:
+                data['comment'] = comment
+            return self._request('POST', f'/api/plugins/{plugin_id}/rate', data)
+        
+        def submit_feedback(self, plugin_id: str, content: str) -> dict:
+            """Submit feedback for a plugin (requires login)."""
+            if not self.token:
+                return {'error': 'Not logged in'}
+            return self._request('POST', f'/api/plugins/{plugin_id}/feedback', {'content': content})
+        
+        def submit_bug_report(self, plugin_id: str, content: str, email: str = None, 
+                              name: str = None, captcha_answer: str = None) -> dict:
+            """Submit a bug report for a plugin (no login required)."""
+            data = {
+                'content': content,
+                'captchaAnswer': captcha_answer or ''
+            }
+            if email:
+                data['email'] = email
+            if name:
+                data['name'] = name
+            return self._request('POST', f'/api/plugins/{plugin_id}/bug-report', data)
+        
+        def get_bug_reports(self, plugin_id: str) -> dict:
+            """Get bug reports for a plugin (plugin author only)."""
+            if not self.token:
+                return {'error': 'Not logged in'}
+            return self._request('GET', f'/api/plugins/{plugin_id}/bugs')
+        
+        def respond_to_bug(self, bug_id: int, response: str, status: str = 'in-progress') -> dict:
+            """Respond to a bug report (plugin author only)."""
+            if not self.token:
+                return {'error': 'Not logged in'}
+            return self._request('POST', f'/api/bugs/{bug_id}/respond', {
+                'response': response,
+                'status': status
+            })
+        
+        # =====================================================================
+        # Admin API Methods
+        # =====================================================================
+        
+        def get_pending_plugins(self) -> dict:
+            """Get list of pending plugins (admin only)."""
+            return self._request('GET', '/api/admin/pending')
+        
+        def get_all_admin_plugins(self) -> dict:
+            """Get all plugins for admin view."""
+            return self._request('GET', '/api/admin/plugins')
+        
+        def approve_plugin(self, plugin_id: str) -> dict:
+            """Approve a pending plugin (admin only)."""
+            return self._request('POST', f'/api/admin/approve/{plugin_id}')
+        
+        def reject_plugin(self, plugin_id: str, reason: str = "") -> dict:
+            """Reject a pending plugin (admin only)."""
+            return self._request('POST', f'/api/admin/reject/{plugin_id}', {'reason': reason})
+        
+        def delete_plugin(self, plugin_id: str) -> dict:
+            """Delete a plugin (admin only)."""
+            return self._request('DELETE', f'/api/admin/plugins/{plugin_id}')
+        
+        def get_plugin_review_details(self, plugin_id: str) -> dict:
+            """Get detailed plugin info for admin review (admin only)."""
+            return self._request('GET', f'/api/admin/review/{plugin_id}')
+    
+    # Global plugin store API instance
+    plugin_store_api = PluginStoreAPI()
+
+    # =========================================================================
     # PLUGINS MANAGEMENT TAB
     # =========================================================================
     
@@ -10312,19 +12634,45 @@ def create_gui_app():
             super().__init__()
             self.parent_window = parent_window
             self.loaded_widgets: Dict[str, QWidget] = {}
+            self.loaded_plugins: Dict[str, Any] = {}  # Track plugin instances for cleanup
+            self.active_plugin_id: Optional[str] = None  # Currently open plugin
             self.builtin_plugins = {}
             
             self._setup_ui()
             self._load_plugins()
         
         def _log(self, message: str):
-            """Log a message (print to console for now)."""
-            print(f"[Plugins] {message}")
+            """Log a plugin message."""
+            logger.debug(f"[Plugins] {message}")
         
         def _setup_ui(self):
             layout = QVBoxLayout(self)
-            layout.setSpacing(12)
-            layout.setContentsMargins(8, 12, 8, 8)
+            layout.setSpacing(8)
+            layout.setContentsMargins(8, 8, 8, 8)
+            
+            # Main tab widget for Installed / Store views
+            self.view_tabs = QTabWidget()
+            self.view_tabs.setStyleSheet("""
+                QTabWidget::pane { border: 1px solid #444; border-radius: 4px; }
+                QTabBar::tab { padding: 8px 20px; }
+                QTabBar::tab:selected { background: #3a3a3a; }
+            """)
+            
+            # Auto-refresh store when switching to Store tab
+            self._store_loaded = False
+            def on_tab_changed(index):
+                tab_text = self.view_tabs.tabText(index)
+                if "Store" in tab_text and not self._store_loaded:
+                    self._refresh_store()
+                    self._store_loaded = True
+            self.view_tabs.currentChanged.connect(on_tab_changed)
+            
+            # =====================================================================
+            # INSTALLED PLUGINS TAB
+            # =====================================================================
+            installed_widget = QWidget()
+            installed_layout = QVBoxLayout(installed_widget)
+            installed_layout.setContentsMargins(8, 12, 8, 8)
             
             # Header
             header_layout = QHBoxLayout()
@@ -10341,7 +12689,7 @@ def create_gui_app():
             open_folder_btn.clicked.connect(self._open_plugins_folder)
             header_layout.addWidget(open_folder_btn)
             
-            layout.addLayout(header_layout)
+            installed_layout.addLayout(header_layout)
             
             # Splitter for plugin list and details
             splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -10432,13 +12780,389 @@ def create_gui_app():
             self.open_btn.setEnabled(False)
             btn_layout.addWidget(self.open_btn)
             
+            self.uninstall_btn = QPushButton("🗑️ Uninstall")
+            self.uninstall_btn.setStyleSheet("background-color: #c62828; color: white;")
+            self.uninstall_btn.clicked.connect(self._uninstall_plugin)
+            self.uninstall_btn.setEnabled(False)
+            btn_layout.addWidget(self.uninstall_btn)
+            
             self.details_layout.addLayout(btn_layout)
             
             details_layout.addWidget(self.details_group)
             splitter.addWidget(details_widget)
             
             splitter.setSizes([300, 500])
-            layout.addWidget(splitter)
+            installed_layout.addWidget(splitter)
+            
+            # Info label at bottom
+            info_label = QLabel(
+                "💡 Drop plugins into the 'plugins' folder to install them. "
+                "Double-click a plugin to open it."
+            )
+            info_label.setStyleSheet("color: #888; font-style: italic;")
+            installed_layout.addWidget(info_label)
+            
+            # Store reference to main view for installed tab
+            self.main_view = splitter
+            
+            self.view_tabs.addTab(installed_widget, "📦 Installed")
+            
+            # =====================================================================
+            # PLUGIN STORE TAB
+            # =====================================================================
+            store_widget = QWidget()
+            store_layout = QVBoxLayout(store_widget)
+            store_layout.setContentsMargins(8, 12, 8, 8)
+            
+            # Store Header with search and auth
+            store_header = QHBoxLayout()
+            
+            store_title = QLabel("🛒 Plugin Store")
+            store_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #4fc3f7;")
+            store_header.addWidget(store_title)
+            
+            store_header.addStretch()
+            
+            # Search
+            self.store_search = QLineEdit()
+            self.store_search.setPlaceholderText("Search plugins...")
+            self.store_search.setMinimumWidth(220)
+            self.store_search.setMaximumWidth(280)
+            self.store_search.setStyleSheet("""
+                QLineEdit {
+                    background-color: #2a2a3a;
+                    border: 1px solid #3a3a4a;
+                    border-radius: 16px;
+                    padding: 6px 14px;
+                    color: #ffffff;
+                    font-size: 12px;
+                }
+                QLineEdit:focus {
+                    border-color: #4fc3f7;
+                }
+            """)
+            self.store_search.returnPressed.connect(self._search_store)
+            store_header.addWidget(self.store_search)
+            
+            search_btn = QPushButton("🔍")
+            search_btn.setFixedSize(32, 32)
+            search_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3a3a4a;
+                    border-radius: 16px;
+                    border: none;
+                    font-size: 16px;
+                }
+                QPushButton:hover {
+                    background-color: #4fc3f7;
+                }
+            """)
+            search_btn.clicked.connect(self._search_store)
+            store_header.addWidget(search_btn)
+            
+            refresh_store_btn = QPushButton("🔄")
+            refresh_store_btn.setFixedSize(32, 32)
+            refresh_store_btn.setToolTip("Refresh store")
+            refresh_store_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3a3a4a;
+                    border-radius: 16px;
+                    border: none;
+                    font-size: 16px;
+                }
+                QPushButton:hover {
+                    background-color: #4fc3f7;
+                }
+            """)
+            refresh_store_btn.clicked.connect(self._refresh_store)
+            store_header.addWidget(refresh_store_btn)
+            
+            # Auth buttons
+            self.login_btn = QPushButton("🔑 Login")
+            self.login_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3a3a4a;
+                    border-radius: 14px;
+                    padding: 6px 14px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #4fc3f7;
+                    color: #000;
+                }
+            """)
+            self.login_btn.clicked.connect(self._show_login_dialog)
+            store_header.addWidget(self.login_btn)
+            
+            self.user_menu_btn = QPushButton()
+            self.user_menu_btn.setVisible(False)
+            self.user_menu_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #2e7d32;
+                    border-radius: 14px;
+                    padding: 6px 14px;
+                    border: none;
+                    color: #fff;
+                }
+                QPushButton:hover {
+                    background-color: #4CAF50;
+                }
+            """)
+            self.user_menu_btn.clicked.connect(self._show_user_menu)
+            store_header.addWidget(self.user_menu_btn)
+            
+            store_layout.addLayout(store_header)
+            
+            # Category filter
+            cat_layout = QHBoxLayout()
+            cat_label = QLabel("Category:")
+            cat_label.setStyleSheet("color: #888; font-size: 12px;")
+            cat_layout.addWidget(cat_label)
+            
+            self.category_combo = QComboBox()
+            self.category_combo.addItems(["All", "Tools", "Extraction", "Modification", "ADB", "Fastboot", "Utilities", "Other"])
+            self.category_combo.currentTextChanged.connect(self._filter_store_category)
+            self.category_combo.setMinimumWidth(140)
+            self.category_combo.setStyleSheet("""
+                QComboBox {
+                    background-color: #2a2a3a;
+                    border: 1px solid #3a3a4a;
+                    border-radius: 12px;
+                    padding: 5px 12px;
+                    color: #ffffff;
+                }
+                QComboBox:hover {
+                    border-color: #4fc3f7;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                    padding-right: 8px;
+                }
+            """)
+            cat_layout.addWidget(self.category_combo)
+            cat_layout.addStretch()
+            
+            # Developer upload button (visible when logged in)
+            self.upload_btn = QPushButton("📤 Upload Plugin")
+            self.upload_btn.clicked.connect(self._show_upload_dialog)
+            self.upload_btn.setVisible(False)
+            self.upload_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #4CAF50;
+                    color: #fff;
+                    font-weight: bold;
+                    padding: 8px 16px;
+                    border-radius: 14px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #66bb6a;
+                }
+            """)
+            cat_layout.addWidget(self.upload_btn)
+            
+            store_layout.addLayout(cat_layout)
+            
+            # Store plugin grid (using scroll area with grid)
+            self.store_scroll = QScrollArea()
+            self.store_scroll.setWidgetResizable(True)
+            self.store_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            
+            self.store_grid_widget = QWidget()
+            self.store_grid_layout = QGridLayout(self.store_grid_widget)
+            self.store_grid_layout.setSpacing(16)
+            self.store_grid_layout.setContentsMargins(8, 8, 8, 8)
+            self.store_grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            
+            self.store_scroll.setWidget(self.store_grid_widget)
+            store_layout.addWidget(self.store_scroll)
+            
+            # Store status
+            self.store_status = QLabel("Connect to the Plugin Store to browse available plugins.")
+            self.store_status.setStyleSheet("color: #6a6a8a; font-size: 12px; padding: 8px;")
+            self.store_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            store_layout.addWidget(self.store_status)
+            
+            self.view_tabs.addTab(store_widget, "🛒 Store")
+            
+            # =====================================================================
+            # PLUGIN PLAYGROUND TAB (Coming Soon)
+            # =====================================================================
+            playground_widget = QWidget()
+            playground_layout = QVBoxLayout(playground_widget)
+            playground_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Scroll area for content
+            playground_scroll = QScrollArea()
+            playground_scroll.setWidgetResizable(True)
+            playground_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            playground_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            
+            playground_scroll_widget = QWidget()
+            playground_scroll_layout = QVBoxLayout(playground_scroll_widget)
+            playground_scroll_layout.setContentsMargins(0, 20, 0, 20)
+            playground_scroll_layout.setSpacing(10)
+            playground_scroll_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            
+            # Icon
+            playground_icon = QLabel("🧪")
+            playground_icon.setStyleSheet("font-size: 48px;")
+            playground_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            playground_scroll_layout.addWidget(playground_icon)
+            
+            # Title
+            playground_title = QLabel("Plugin Playground")
+            playground_title.setStyleSheet("font-size: 22px; font-weight: bold; color: #4fc3f7;")
+            playground_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            playground_scroll_layout.addWidget(playground_title)
+            
+            # Coming Soon badge
+            coming_badge = QLabel("🚧 COMING SOON 🚧")
+            coming_badge.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(255, 152, 0, 0.2);
+                    color: #ff9800;
+                    font-weight: bold;
+                    font-size: 11px;
+                    padding: 5px 16px;
+                    border-radius: 10px;
+                }
+            """)
+            coming_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            playground_scroll_layout.addWidget(coming_badge)
+            
+            # Description
+            playground_desc = QLabel(
+                "Test your plugins before submitting them to the store!\n\n"
+                "Features coming in a future update:\n"
+                "✨ Load and preview plugins from any folder\n"
+                "✅ Real-time manifest.json validation\n"
+                "🐛 Live error console with full tracebacks\n"
+                "📋 Dependency checker (pip packages, git repos)\n"
+                "🎯 \"Ready to Submit\" checklist\n"
+                "🔄 Hot-reload your changes instantly"
+            )
+            playground_desc.setStyleSheet("color: #bbb; font-size: 12px;")
+            playground_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            playground_desc.setWordWrap(True)
+            playground_desc.setMaximumWidth(450)
+            playground_scroll_layout.addWidget(playground_desc, 0, Qt.AlignmentFlag.AlignCenter)
+            
+            # Tip
+            playground_tip = QLabel(
+                "💡 For now, test plugins by placing them in the plugins/ folder and restarting."
+            )
+            playground_tip.setStyleSheet("""
+                QLabel {
+                    color: #999;
+                    font-size: 11px;
+                    background-color: rgba(79, 195, 247, 0.1);
+                    padding: 10px 16px;
+                    border-radius: 8px;
+                }
+            """)
+            playground_tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            playground_tip.setWordWrap(True)
+            playground_tip.setMaximumWidth(450)
+            playground_scroll_layout.addWidget(playground_tip, 0, Qt.AlignmentFlag.AlignCenter)
+            
+            playground_scroll_layout.addStretch()
+            
+            playground_scroll.setWidget(playground_scroll_widget)
+            playground_layout.addWidget(playground_scroll)
+            
+            self.view_tabs.addTab(playground_widget, "🧪 Playground")
+            
+            # =====================================================================
+            # VISUAL PLUGIN MAKER TAB (Coming Soon)
+            # =====================================================================
+            maker_widget = QWidget()
+            maker_layout = QVBoxLayout(maker_widget)
+            maker_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Scroll area for content
+            maker_scroll = QScrollArea()
+            maker_scroll.setWidgetResizable(True)
+            maker_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            maker_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            
+            maker_scroll_widget = QWidget()
+            maker_scroll_layout = QVBoxLayout(maker_scroll_widget)
+            maker_scroll_layout.setContentsMargins(0, 20, 0, 20)
+            maker_scroll_layout.setSpacing(10)
+            maker_scroll_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            
+            # Icon
+            maker_icon = QLabel("🎨")
+            maker_icon.setStyleSheet("font-size: 48px;")
+            maker_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            maker_scroll_layout.addWidget(maker_icon)
+            
+            # Title
+            maker_title = QLabel("Visual Plugin Maker")
+            maker_title.setStyleSheet("font-size: 22px; font-weight: bold; color: #e91e63;")
+            maker_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            maker_scroll_layout.addWidget(maker_title)
+            
+            # Coming Soon badge
+            maker_badge = QLabel("🚧 COMING SOON 🚧")
+            maker_badge.setStyleSheet("""
+                QLabel {
+                    background-color: rgba(255, 152, 0, 0.2);
+                    color: #ff9800;
+                    font-weight: bold;
+                    font-size: 11px;
+                    padding: 5px 16px;
+                    border-radius: 10px;
+                }
+            """)
+            maker_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            maker_scroll_layout.addWidget(maker_badge)
+            
+            # Description
+            maker_desc = QLabel(
+                "Create plugins without writing code!\n\n"
+                "Drag-and-drop interface for building plugin UIs:\n"
+                "🖱️ Drag & drop buttons, labels, inputs, and more\n"
+                "🎨 Visual style editor with live preview\n"
+                "⚡ Pre-built action blocks (run ADB, extract, pack)\n"
+                "🔗 Connect UI elements to actions visually\n"
+                "📝 Auto-generates clean Python code\n"
+                "📦 One-click export to plugin package\n"
+                "🧠 AI-assisted logic suggestions"
+            )
+            maker_desc.setStyleSheet("color: #bbb; font-size: 12px;")
+            maker_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            maker_desc.setWordWrap(True)
+            maker_desc.setMaximumWidth(450)
+            maker_scroll_layout.addWidget(maker_desc, 0, Qt.AlignmentFlag.AlignCenter)
+            
+            # Tip
+            maker_tip = QLabel(
+                "💡 No coding experience? No problem! The Visual Plugin Maker will let anyone create powerful plugins."
+            )
+            maker_tip.setStyleSheet("""
+                QLabel {
+                    color: #999;
+                    font-size: 11px;
+                    background-color: rgba(233, 30, 99, 0.1);
+                    padding: 10px 16px;
+                    border-radius: 8px;
+                }
+            """)
+            maker_tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            maker_tip.setWordWrap(True)
+            maker_tip.setMaximumWidth(450)
+            maker_scroll_layout.addWidget(maker_tip, 0, Qt.AlignmentFlag.AlignCenter)
+            
+            maker_scroll_layout.addStretch()
+            
+            maker_scroll.setWidget(maker_scroll_widget)
+            maker_layout.addWidget(maker_scroll)
+            
+            self.view_tabs.addTab(maker_widget, "🎨 Creator")
+            
+            layout.addWidget(self.view_tabs)
             
             # Plugin content area (shown when a plugin is opened)
             self.plugin_container = QWidget()
@@ -10466,16 +13190,8 @@ def create_gui_app():
             self.plugin_container.setVisible(False)
             layout.addWidget(self.plugin_container)
             
-            # Store reference to main view
-            self.main_view = splitter
-            
-            # Info label at bottom
-            info_label = QLabel(
-                "💡 Drop plugins into the 'plugins' folder to install them. "
-                "Double-click a plugin to open it."
-            )
-            info_label.setStyleSheet("color: #888; font-style: italic;")
-            layout.addWidget(info_label)
+            # Update auth UI
+            self._update_auth_ui()
         
         def _load_plugins(self):
             """Load and display all available plugins."""
@@ -10487,7 +13203,7 @@ def create_gui_app():
             # Discover external plugins
             external_plugins = plugin_manager.discover_plugins()
             
-            # Add built-in plugins first
+            # Add built-in plugins first (if any)
             for plugin_id, plugin in self.builtin_plugins.items():
                 manifest = plugin.manifest
                 item = QListWidgetItem(f"{manifest.icon} {manifest.name}")
@@ -10548,6 +13264,14 @@ def create_gui_app():
                     self.enable_btn.setText("○ Disabled")
                 self.enable_btn.setEnabled(True)
             
+            # Only developer_guide cannot be uninstalled
+            if data['id'] == 'developer_guide':
+                self.uninstall_btn.setEnabled(False)
+                self.uninstall_btn.setToolTip("Developer Guide cannot be uninstalled")
+            else:
+                self.uninstall_btn.setEnabled(True)
+                self.uninstall_btn.setToolTip("Remove this plugin")
+            
             self.open_btn.setEnabled(manifest.enabled)
             
             # Payment/license info
@@ -10597,6 +13321,169 @@ def create_gui_app():
             # Refresh list
             self._load_plugins()
         
+        def _uninstall_plugin(self):
+            """Uninstall the selected plugin."""
+            current = self.plugin_list.currentItem()
+            if not current:
+                return
+            
+            data = current.data(Qt.ItemDataRole.UserRole)
+            plugin_id = data['id']
+            
+            # Only developer_guide is protected
+            if plugin_id == 'developer_guide':
+                QMessageBox.warning(
+                    self,
+                    "Cannot Uninstall",
+                    "The Plugin Developer's Guide cannot be uninstalled."
+                )
+                return
+            
+            manifest = data['manifest']
+            
+            # Confirm uninstall
+            reply = QMessageBox.question(
+                self,
+                "Confirm Uninstall",
+                f"Are you sure you want to uninstall '{manifest.name}'?\n\n"
+                "This will delete the plugin folder and all its files.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            
+            # Get plugin path and delete
+            plugins_dir = plugin_manager._get_plugins_dir()
+            plugin_path = os.path.join(plugins_dir, plugin_id)
+            
+            if os.path.exists(plugin_path):
+                try:
+                    self._force_remove_directory(plugin_path, plugin_id)
+                    
+                    QMessageBox.information(
+                        self,
+                        "Plugin Uninstalled",
+                        f"'{manifest.name}' has been successfully uninstalled."
+                    )
+                    
+                    # Refresh the plugin list
+                    self._load_plugins()
+                    
+                    # Clear details panel
+                    self.plugin_icon.setText("🔌")
+                    self.plugin_name.setText("Select a plugin")
+                    self.plugin_version.setText("")
+                    self.plugin_author.setText("")
+                    self.plugin_desc.setText("")
+                    self.payment_group.setVisible(False)
+                    self.enable_btn.setEnabled(False)
+                    self.open_btn.setEnabled(False)
+                    self.uninstall_btn.setEnabled(False)
+                    
+                except Exception as e:
+                    QMessageBox.critical(
+                        self,
+                        "Uninstall Failed",
+                        f"Failed to uninstall plugin:\n{str(e)}"
+                    )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Plugin Not Found",
+                    f"Plugin folder not found at:\n{plugin_path}"
+                )
+        
+        def _force_remove_directory(self, path: str, plugin_id: str):
+            """Forcefully remove a directory, handling locked files and read-only attributes."""
+            import shutil
+            import stat
+            import subprocess
+            import time
+            
+            # Kill processes that might be locking files
+            processes_to_kill = ['adb.exe', 'fastboot.exe', 'mtk_client.exe', 'python.exe']
+            plugin_path_lower = path.lower()
+            
+            # Try to kill any processes that might be using files in this plugin
+            try:
+                if sys.platform == 'win32':
+                    # Use tasklist to find processes and check if they're from this plugin folder
+                    result = subprocess.run(
+                        ['tasklist', '/FO', 'CSV', '/V'],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    # Look for adb.exe or fastboot.exe specifically
+                    for proc_name in ['adb.exe', 'fastboot.exe']:
+                        if proc_name in result.stdout.lower():
+                            # Check if this is from our plugin directory by trying to kill gracefully
+                            subprocess.run(
+                                ['taskkill', '/F', '/IM', proc_name],
+                                capture_output=True, timeout=5
+                            )
+                            time.sleep(0.5)  # Give time for process to fully terminate
+            except Exception:
+                pass  # Best effort - continue even if this fails
+            
+            def on_rm_error(func, filepath, exc_info):
+                """Error handler for shutil.rmtree - handles read-only and permission errors."""
+                try:
+                    # Clear the read-only flag
+                    os.chmod(filepath, stat.S_IWRITE | stat.S_IREAD)
+                    # Try again
+                    func(filepath)
+                except Exception as e:
+                    # If still failing, try one more approach on Windows
+                    if sys.platform == 'win32':
+                        try:
+                            # Use attrib to clear all attributes
+                            subprocess.run(
+                                ['attrib', '-R', '-H', '-S', filepath],
+                                capture_output=True, timeout=5
+                            )
+                            func(filepath)
+                        except Exception:
+                            raise e
+                    else:
+                        raise e
+            
+            # First pass: try to make all files writable
+            for root, dirs, files in os.walk(path):
+                for name in files:
+                    filepath = os.path.join(root, name)
+                    try:
+                        os.chmod(filepath, stat.S_IWRITE | stat.S_IREAD)
+                    except Exception:
+                        pass
+                for name in dirs:
+                    dirpath = os.path.join(root, name)
+                    try:
+                        os.chmod(dirpath, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+                    except Exception:
+                        pass
+            
+            # Try rmtree with error handler
+            try:
+                shutil.rmtree(path, onerror=on_rm_error)
+            except Exception as e:
+                # Last resort on Windows: use rd /s /q
+                if sys.platform == 'win32':
+                    try:
+                        # Use Windows rd command which can be more forceful
+                        result = subprocess.run(
+                            ['cmd', '/c', 'rd', '/s', '/q', path],
+                            capture_output=True, text=True, timeout=30
+                        )
+                        if os.path.exists(path):
+                            raise Exception(f"Directory still exists after rd command: {result.stderr}")
+                    except subprocess.TimeoutExpired:
+                        raise Exception("Timeout while removing directory")
+                    except Exception as rd_error:
+                        raise Exception(f"Failed to remove directory: {str(e)}. rd also failed: {str(rd_error)}")
+                else:
+                    raise
+        
         def _open_payment(self):
             """Open payment link or show payment address."""
             if not hasattr(self, '_current_payment_info'):
@@ -10645,53 +13532,138 @@ def create_gui_app():
                 )
                 return
             
-            # Check requirements for external plugins
-            if not data['builtin'] and manifest.requirements:
-                all_installed, missing, installed = plugin_manager.check_requirements(plugin_id)
-                
-                if not all_installed:
-                    # Ask user if they want to install missing packages
-                    msg = (
-                        f"Plugin '{manifest.name}' requires the following packages:\n\n"
-                        f"Missing: {', '.join(missing)}\n\n"
-                        "Would you like to install them now?\n"
-                        "(This requires an internet connection)"
-                    )
+            # Check for post-install steps (drivers, git clones, etc.)
+            if not data['builtin'] and manifest.post_install:
+                # Check if post-install has already been completed
+                plugin_config = plugin_manager.config.get(plugin_id, {})
+                if not plugin_config.get('post_install_done', False):
+                    # Build description of what will happen
+                    steps_desc = []
+                    for step in manifest.post_install:
+                        step_type = step.get('type', '')
+                        step_name = step.get('name', step_type)
+                        if step_type == 'driver':
+                            steps_desc.append(f"• Install driver: {step.get('file', 'Unknown')}")
+                        elif step_type == 'git_clone':
+                            steps_desc.append(f"• Clone repository: {step.get('repo', 'Unknown')}")
+                        elif step_type == 'pip_requirements':
+                            steps_desc.append(f"• Install pip requirements from cloned repo")
+                        elif step_type == 'command':
+                            steps_desc.append(f"• Run setup command")
                     
-                    reply = QMessageBox.question(
-                        self,
-                        "Missing Requirements",
-                        msg,
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                    )
-                    
-                    if reply == QMessageBox.StandardButton.Yes:
-                        # Show progress
-                        self._log(f"Installing requirements: {', '.join(missing)}...")
-                        QApplication.processEvents()
+                    if steps_desc:
+                        msg = (
+                            f"Plugin '{manifest.name}' requires additional setup:\n\n"
+                            + "\n".join(steps_desc) + "\n\n"
+                            "Would you like to run the setup now?\n"
+                            "(This may take a few minutes)"
+                        )
                         
-                        success, message = plugin_manager.install_requirements(missing)
+                        reply = QMessageBox.question(
+                            self,
+                            "Plugin Setup Required",
+                            msg,
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                        )
                         
-                        if success:
-                            self._log(f"✓ {message}")
+                        if reply == QMessageBox.StandardButton.Yes:
+                            # Create progress dialog
+                            from PyQt6.QtWidgets import QProgressDialog
+                            progress = QProgressDialog(
+                                "Running plugin setup...", "Cancel", 0, len(manifest.post_install), self
+                            )
+                            progress.setWindowModality(Qt.WindowModality.WindowModal)
+                            progress.setMinimumDuration(0)
+                            progress.setValue(0)
+                            progress.setWindowTitle("Plugin Setup")
+                            
+                            step_idx = [0]  # Use list for closure
+                            
+                            def progress_callback(step_name: str, status: str):
+                                progress.setLabelText(f"Step: {step_name}\nStatus: {status}")
+                                step_idx[0] += 1
+                                progress.setValue(min(step_idx[0], len(manifest.post_install)))
+                                QApplication.processEvents()
+                            
+                            self._log(f"Running post-install setup for {manifest.name}...")
+                            QApplication.processEvents()
+                            
+                            success, message = plugin_manager.run_post_install(plugin_id, progress_callback)
+                            progress.close()
+                            
+                            if success:
+                                self._log(f"✓ Post-install setup complete")
+                                # Mark as done
+                                if plugin_id not in plugin_manager.config:
+                                    plugin_manager.config[plugin_id] = {}
+                                plugin_manager.config[plugin_id]['post_install_done'] = True
+                                plugin_manager._save_config()
+                                
+                                QMessageBox.information(
+                                    self,
+                                    "Setup Complete",
+                                    f"Plugin '{manifest.name}' setup completed successfully!"
+                                )
+                            else:
+                                self._log(f"✗ Post-install setup failed: {message}")
+                                QMessageBox.warning(
+                                    self,
+                                    "Setup Issues",
+                                    f"Some setup steps had issues:\n\n{message}\n\n"
+                                    "The plugin may still work, but some features might be unavailable.\n"
+                                    "You can try the manual setup in the plugin's Setup tab."
+                                )
+                        else:
+                            # User declined - show info about manual setup
                             QMessageBox.information(
                                 self,
-                                "Installation Complete",
-                                f"Successfully installed:\n{', '.join(missing)}\n\n"
-                                "The plugin is now ready to use."
+                                "Setup Skipped",
+                                "You can run the setup later from the plugin's Setup tab.\n\n"
+                                "Some features may not work until setup is complete."
                             )
-                        else:
-                            self._log(f"✗ {message}")
-                            QMessageBox.critical(
+            
+            # Generic check: if plugin has git_clone or other setup requirements not yet completed
+            if not data['builtin']:
+                plugin_config = plugin_manager.config.get(plugin_id, {})
+                if not plugin_config.get('setup_complete', False):
+                    # Check if plugin has setup requirements
+                    has_git_clone = manifest.git_clone is not None
+                    has_bundled_binaries = bool(manifest.bundled_binaries)
+                    
+                    if has_git_clone or has_bundled_binaries:
+                        # Run setup
+                        from PyQt6.QtWidgets import QProgressDialog
+                        progress_dialog = QProgressDialog(
+                            f"Setting up {manifest.name}...",
+                            "Cancel",
+                            0, 100,
+                            self
+                        )
+                        progress_dialog.setWindowTitle("Plugin Setup")
+                        progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+                        progress_dialog.setMinimumDuration(0)
+                        progress_dialog.setValue(0)
+                        
+                        def setup_progress(step_name: str, status: str, progress: int):
+                            if progress_dialog.wasCanceled():
+                                return
+                            progress_dialog.setLabelText(f"{step_name}\n{status}")
+                            progress_dialog.setValue(progress)
+                            QApplication.processEvents()
+                        
+                        success, message = plugin_manager.setup_plugin_dependencies(plugin_id, setup_progress)
+                        progress_dialog.close()
+                        
+                        if not success:
+                            reply = QMessageBox.warning(
                                 self,
-                                "Installation Failed",
-                                f"Failed to install requirements:\n{message}\n\n"
-                                "You can try installing manually:\n"
-                                f"pip install {' '.join(missing)}"
+                                "Setup Issues",
+                                f"Some setup steps had issues:\n\n{message}\n\n"
+                                "Would you like to continue loading the plugin anyway?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                             )
-                            return
-                    else:
-                        return
+                            if reply != QMessageBox.StandardButton.Yes:
+                                return
             
             # Load plugin if not already loaded
             if plugin_id in self.loaded_widgets:
@@ -10720,9 +13692,9 @@ def create_gui_app():
                         )
                         return
                     self.loaded_widgets[plugin_id] = widget
+                    self.loaded_plugins[plugin_id] = plugin  # Track plugin for cleanup
                 except Exception as e:
-                    import traceback
-                    traceback.print_exc()
+                    logger.exception(f"Failed to create plugin widget: {e}")
                     QMessageBox.critical(
                         self,
                         "Error",
@@ -10730,8 +13702,11 @@ def create_gui_app():
                     )
                     return
             
+            # Track active plugin for cleanup
+            self.active_plugin_id = plugin_id
+            
             # Show plugin view
-            self.main_view.setVisible(False)
+            self.view_tabs.setVisible(False)
             
             # Clear old widget from layout (but don't destroy it)
             while self.plugin_widget_layout.count():
@@ -10747,8 +13722,18 @@ def create_gui_app():
         
         def _close_plugin(self):
             """Close the current plugin and return to list."""
+            # Call cleanup on the active plugin if it has one
+            if self.active_plugin_id and self.active_plugin_id in self.loaded_plugins:
+                plugin = self.loaded_plugins[self.active_plugin_id]
+                if hasattr(plugin, 'cleanup') and callable(plugin.cleanup):
+                    try:
+                        plugin.cleanup()
+                    except Exception as e:
+                        logger.warning(f"[Plugins] Cleanup error for {self.active_plugin_id}: {e}")
+            
+            self.active_plugin_id = None
             self.plugin_container.setVisible(False)
-            self.main_view.setVisible(True)
+            self.view_tabs.setVisible(True)
         
         def _open_plugins_folder(self):
             """Open the plugins folder in file explorer."""
@@ -10761,8 +13746,2774 @@ def create_gui_app():
                 subprocess.run(['open', plugins_dir])
             else:
                 subprocess.run(['xdg-open', plugins_dir])
+        
+        # =====================================================================
+        # PLUGIN STORE METHODS
+        # =====================================================================
+        
+        def _update_auth_ui(self):
+            """Update the auth UI based on login status."""
+            if plugin_store_api.is_logged_in():
+                self.login_btn.setVisible(False)
+                self.user_menu_btn.setVisible(True)
+                self.user_menu_btn.setText(f"👤 {plugin_store_api.user.get('username', 'User')}")
+                self.upload_btn.setVisible(True)
+            else:
+                self.login_btn.setVisible(True)
+                self.user_menu_btn.setVisible(False)
+                self.upload_btn.setVisible(False)
+        
+        def _refresh_store(self):
+            """Refresh the plugin store listing."""
+            self.store_status.setText("Loading plugins from store...")
+            QApplication.processEvents()
+            
+            # Clear existing grid
+            while self.store_grid_layout.count():
+                item = self.store_grid_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            
+            # Fetch plugins
+            plugins = plugin_store_api.get_plugins()
+            
+            if not plugins:
+                self.store_status.setText(
+                    "No plugins found or unable to connect to store.\n"
+                    f"Server: {plugin_store_api.base_url}"
+                )
+                return
+            
+            self.store_status.setText(f"Found {len(plugins)} plugins")
+            self._store_plugins = plugins
+            self._display_store_plugins(plugins)
+        
+        def _display_store_plugins(self, plugins: list):
+            """Display plugins in the store grid."""
+            # Clear existing
+            while self.store_grid_layout.count():
+                item = self.store_grid_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            
+            row, col = 0, 0
+            max_cols = 3
+            
+            for plugin in plugins:
+                card = self._create_store_plugin_card(plugin)
+                self.store_grid_layout.addWidget(card, row, col)
+                col += 1
+                if col >= max_cols:
+                    col = 0
+                    row += 1
+        
+        def _create_store_plugin_card(self, plugin: dict) -> QWidget:
+            """Create a modern card widget for a store plugin."""
+            card = QFrame()
+            card.setFrameShape(QFrame.Shape.StyledPanel)
+            card.setStyleSheet("""
+                QFrame {
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #2d2d3a, stop:1 #1e1e28);
+                    border: 1px solid #3a3a4a;
+                    border-radius: 12px;
+                    padding: 0px;
+                }
+                QFrame:hover {
+                    border: 2px solid #4fc3f7;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 #353545, stop:1 #252530);
+                }
+            """)
+            card.setFixedSize(280, 220)
+            
+            layout = QVBoxLayout(card)
+            layout.setSpacing(8)
+            layout.setContentsMargins(14, 14, 14, 12)
+            
+            # Header with icon and name
+            header = QHBoxLayout()
+            header.setSpacing(12)
+            
+            # Icon with background
+            icon_container = QFrame()
+            icon_container.setFixedSize(50, 50)
+            icon_container.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(79, 195, 247, 0.15);
+                    border-radius: 10px;
+                    border: none;
+                }
+            """)
+            icon_layout = QVBoxLayout(icon_container)
+            icon_layout.setContentsMargins(0, 0, 0, 0)
+            icon_label = QLabel(plugin.get('icon', '🔌'))
+            icon_label.setStyleSheet("font-size: 28px; background: transparent; border: none;")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_layout.addWidget(icon_label)
+            header.addWidget(icon_container)
+            
+            # Name and author column
+            name_col = QVBoxLayout()
+            name_col.setSpacing(2)
+            
+            name_label = QLabel(plugin.get('name', 'Unknown'))
+            name_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #ffffff; background: transparent; border: none;")
+            name_label.setWordWrap(True)
+            name_col.addWidget(name_label)
+            
+            info_label = QLabel(f"by {plugin.get('author_name', 'Unknown')} • v{plugin.get('version', '1.0')}")
+            info_label.setStyleSheet("color: #8888aa; font-size: 11px; background: transparent; border: none;")
+            name_col.addWidget(info_label)
+            
+            header.addLayout(name_col, 1)
+            layout.addLayout(header)
+            
+            # Description - now with more space
+            desc = plugin.get('description', 'No description available')
+            if len(desc) > 120:
+                desc = desc[:117] + '...'
+            desc_label = QLabel(desc)
+            desc_label.setWordWrap(True)
+            desc_label.setStyleSheet("color: #aaaacc; font-size: 12px; line-height: 1.4; background: transparent; border: none;")
+            desc_label.setMinimumHeight(50)
+            desc_label.setMaximumHeight(60)
+            layout.addWidget(desc_label)
+            
+            layout.addStretch()
+            
+            # Footer with license badge, downloads, and button
+            footer = QHBoxLayout()
+            footer.setSpacing(8)
+            
+            # License/Price badge with pill style
+            license_type = plugin.get('license_type', 'free')
+            price_badge = QLabel()
+            if license_type == 'free':
+                price_badge.setText("FREE")
+                price_badge.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(76, 175, 80, 0.2);
+                        color: #4CAF50;
+                        font-weight: bold;
+                        font-size: 10px;
+                        padding: 4px 10px;
+                        border-radius: 10px;
+                        border: none;
+                    }
+                """)
+            elif license_type == 'donation':
+                price_badge.setText("☕ TIP")
+                price_badge.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(255, 152, 0, 0.2);
+                        color: #ff9800;
+                        font-weight: bold;
+                        font-size: 10px;
+                        padding: 4px 10px;
+                        border-radius: 10px;
+                        border: none;
+                    }
+                """)
+            else:
+                price = plugin.get('price', 0)
+                price_badge.setText(f"${price:.2f}")
+                price_badge.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(244, 67, 54, 0.2);
+                        color: #f44336;
+                        font-weight: bold;
+                        font-size: 10px;
+                        padding: 4px 10px;
+                        border-radius: 10px;
+                        border: none;
+                    }
+                """)
+            footer.addWidget(price_badge)
+            
+            # Downloads count with icon
+            downloads = plugin.get('downloads', 0)
+            dl_label = QLabel(f"⬇ {downloads}")
+            dl_label.setStyleSheet("color: #666688; font-size: 11px; background: transparent; border: none;")
+            footer.addWidget(dl_label)
+            
+            footer.addStretch()
+            
+            # Details button - modern style
+            details_btn = QPushButton("Details")
+            details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            details_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #4fc3f7;
+                    color: #000000;
+                    font-weight: bold;
+                    font-size: 11px;
+                    padding: 6px 16px;
+                    border-radius: 12px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #81d4fa;
+                }
+                QPushButton:pressed {
+                    background-color: #29b6f6;
+                }
+            """)
+            details_btn.clicked.connect(lambda checked, p=plugin: self._show_plugin_details(p))
+            footer.addWidget(details_btn)
+            
+            layout.addLayout(footer)
+            
+            return card
+        
+        def _show_plugin_details(self, plugin: dict):
+            """Show detailed view of a plugin with HTML description."""
+            from PyQt6.QtWidgets import QTextBrowser
+            
+            plugin_id = plugin.get('id')
+            plugin_name = plugin.get('name', 'Unknown')
+            
+            # Fetch full plugin details from API (includes long_description)
+            self.store_status.setText(f"Loading details for {plugin_name}...")
+            QApplication.processEvents()
+            
+            full_plugin = plugin_store_api.get_plugin(plugin_id)
+            if 'error' in full_plugin:
+                QMessageBox.warning(self, "Error", f"Failed to load plugin details:\n{full_plugin['error']}")
+                self.store_status.setText("Failed to load details")
+                return
+            
+            self.store_status.setText("")
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"{full_plugin.get('icon', '🔌')} {plugin_name}")
+            dialog.setMinimumSize(650, 550)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header
+            header = QHBoxLayout()
+            
+            icon_label = QLabel(full_plugin.get('icon', '🔌'))
+            icon_label.setStyleSheet("font-size: 48px;")
+            header.addWidget(icon_label)
+            
+            header_info = QVBoxLayout()
+            
+            name_label = QLabel(f"<b style='font-size: 18px;'>{plugin_name}</b>")
+            name_label.setTextFormat(Qt.TextFormat.RichText)
+            header_info.addWidget(name_label)
+            
+            author_label = QLabel(f"by <b>{full_plugin.get('author_name', 'Unknown')}</b> • v{full_plugin.get('version', '1.0')}")
+            author_label.setStyleSheet("color: #888;")
+            header_info.addWidget(author_label)
+            
+            stats_label = QLabel(f"⬇️ {full_plugin.get('downloads', 0)} downloads • ⭐ {full_plugin.get('rating', 0):.1f} ({full_plugin.get('rating_count', 0)} reviews)")
+            stats_label.setStyleSheet("color: #666; font-size: 11px;")
+            header_info.addWidget(stats_label)
+            
+            header.addLayout(header_info, 1)
+            
+            # Price badge
+            license_type = full_plugin.get('license_type', 'free')
+            if license_type == 'free':
+                price_badge = QLabel("FREE")
+                price_badge.setStyleSheet("background: #4CAF50; color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;")
+            elif license_type == 'donation':
+                price_badge = QLabel("DONATION")
+                price_badge.setStyleSheet("background: #ff9800; color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;")
+            else:
+                price = full_plugin.get('price', 0)
+                price_badge = QLabel(f"${price:.2f}")
+                price_badge.setStyleSheet("background: #f44336; color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;")
+            header.addWidget(price_badge)
+            
+            layout.addLayout(header)
+            
+            # Category and tags
+            tags_layout = QHBoxLayout()
+            
+            cat_label = QLabel(f"📁 {full_plugin.get('category', 'other')}")
+            cat_label.setStyleSheet("background: #333; padding: 4px 8px; border-radius: 4px; font-size: 11px;")
+            tags_layout.addWidget(cat_label)
+            
+            tags = full_plugin.get('tags', [])
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags)
+                except:
+                    tags = []
+            
+            for tag in tags[:5]:
+                tag_label = QLabel(f"🏷️ {tag}")
+                tag_label.setStyleSheet("background: #2a4a6a; padding: 4px 8px; border-radius: 4px; font-size: 11px;")
+                tags_layout.addWidget(tag_label)
+            
+            tags_layout.addStretch()
+            layout.addLayout(tags_layout)
+            
+            # Screenshots button (if screenshots available)
+            screenshots = full_plugin.get('screenshots', [])
+            if isinstance(screenshots, str):
+                try:
+                    screenshots = json.loads(screenshots)
+                except:
+                    screenshots = []
+            
+            if screenshots:
+                screenshots_btn = QPushButton(f"🖼️ View Screenshots ({len(screenshots)})")
+                screenshots_btn.setStyleSheet("background: #2196F3; padding: 8px 16px;")
+                screenshots_btn.clicked.connect(lambda: self._show_screenshots_dialog(plugin_name, plugin_id, screenshots))
+                layout.addWidget(screenshots_btn)
+            
+            # Description area with HTML support
+            desc_group = QGroupBox("Description")
+            desc_layout = QVBoxLayout(desc_group)
+            
+            desc_browser = QTextBrowser()
+            desc_browser.setOpenExternalLinks(True)
+            desc_browser.setStyleSheet("""
+                QTextBrowser {
+                    background-color: #1a1a1a;
+                    border: 1px solid #333;
+                    border-radius: 4px;
+                    padding: 10px;
+                }
+            """)
+            
+            # Build HTML content
+            long_desc = full_plugin.get('long_description', '')
+            short_desc = full_plugin.get('description', '')
+            
+            html_content = f"""
+            <style>
+                body {{ font-family: 'Segoe UI', sans-serif; color: #e0e0e0; line-height: 1.6; }}
+                h1, h2, h3 {{ color: #4fc3f7; }}
+                a {{ color: #4fc3f7; }}
+                code {{ background: #333; padding: 2px 6px; border-radius: 3px; }}
+                pre {{ background: #1a1a2e; padding: 10px; border-radius: 6px; overflow-x: auto; }}
+                ul, ol {{ margin-left: 20px; }}
+                .highlight {{ background: #4fc3f720; padding: 10px; border-left: 3px solid #4fc3f7; margin: 10px 0; }}
+            </style>
+            <p>{short_desc}</p>
+            <hr style="border-color: #333;">
+            {long_desc if long_desc else '<p style="color: #666;"><i>No detailed description provided.</i></p>'}
+            """
+            
+            desc_browser.setHtml(html_content)
+            desc_layout.addWidget(desc_browser)
+            layout.addWidget(desc_group)
+            
+            # Requirements info
+            min_version = full_plugin.get('min_app_version', '1.0')
+            req_label = QLabel(f"📋 Requires Image Anarchy v{min_version} or later")
+            req_label.setStyleSheet("color: #888; font-size: 11px;")
+            layout.addWidget(req_label)
+            
+            # Feedback, Rating, Bug Report Section
+            feedback_tabs = QTabWidget()
+            feedback_tabs.setMaximumHeight(200)
+            
+            # Tab 1: Reviews/Ratings
+            reviews_tab = QWidget()
+            reviews_layout = QVBoxLayout(reviews_tab)
+            reviews_layout.setContentsMargins(5, 5, 5, 5)
+            
+            reviews_list = QTextEdit()
+            reviews_list.setReadOnly(True)
+            reviews_list.setMaximumHeight(120)
+            
+            # Populate reviews
+            reviews = full_plugin.get('reviews', [])
+            if reviews:
+                reviews_html = ""
+                for r in reviews[:10]:
+                    stars = "⭐" * r.get('rating', 0) + "☆" * (5 - r.get('rating', 0))
+                    reviews_html += f"<p><b>{r.get('username', 'User')}</b> {stars}<br>"
+                    reviews_html += f"<span style='color:#aaa;'>{r.get('comment', '')}</span></p><hr>"
+                reviews_list.setHtml(reviews_html)
+            else:
+                reviews_list.setHtml("<p style='color:#888;'>No reviews yet. Be the first to rate this plugin!</p>")
+            reviews_layout.addWidget(reviews_list)
+            
+            # Rate button
+            rate_btn = QPushButton("⭐ Rate This Plugin")
+            rate_btn.clicked.connect(lambda: self._show_rate_dialog(plugin_id, plugin_name))
+            reviews_layout.addWidget(rate_btn)
+            
+            feedback_tabs.addTab(reviews_tab, "⭐ Reviews")
+            
+            # Tab 2: Feedback
+            feedback_tab = QWidget()
+            feedback_layout = QVBoxLayout(feedback_tab)
+            feedback_layout.setContentsMargins(5, 5, 5, 5)
+            
+            feedback_label = QLabel("Share your thoughts with the developer:")
+            feedback_label.setStyleSheet("color: #888;")
+            feedback_layout.addWidget(feedback_label)
+            
+            feedback_btn = QPushButton("💬 Leave Feedback")
+            feedback_btn.clicked.connect(lambda: self._show_feedback_dialog(plugin_id, plugin_name))
+            feedback_layout.addWidget(feedback_btn)
+            feedback_layout.addStretch()
+            
+            feedback_tabs.addTab(feedback_tab, "💬 Feedback")
+            
+            # Tab 3: Bug Report
+            bug_tab = QWidget()
+            bug_layout = QVBoxLayout(bug_tab)
+            bug_layout.setContentsMargins(5, 5, 5, 5)
+            
+            bug_label = QLabel("Found a bug? Report it here (no login required):")
+            bug_label.setStyleSheet("color: #888;")
+            bug_layout.addWidget(bug_label)
+            
+            bug_btn = QPushButton("🐛 Report Bug")
+            bug_btn.clicked.connect(lambda: self._show_bug_report_dialog(plugin_id, plugin_name))
+            bug_layout.addWidget(bug_btn)
+            bug_layout.addStretch()
+            
+            feedback_tabs.addTab(bug_tab, "🐛 Report Bug")
+            
+            layout.addWidget(feedback_tabs)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            
+            if full_plugin.get('homepage'):
+                homepage_btn = QPushButton("🌐 Homepage")
+                homepage_btn.clicked.connect(lambda: webbrowser.open(full_plugin.get('homepage')))
+                btn_layout.addWidget(homepage_btn)
+            
+            if full_plugin.get('repository'):
+                repo_btn = QPushButton("📦 Repository")
+                repo_btn.clicked.connect(lambda: webbrowser.open(full_plugin.get('repository')))
+                btn_layout.addWidget(repo_btn)
+            
+            btn_layout.addStretch()
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(close_btn)
+            
+            install_btn = QPushButton("⬇️ Install Plugin")
+            install_btn.setStyleSheet("background-color: #4CAF50; padding: 10px 24px; font-size: 14px;")
+            install_btn.clicked.connect(lambda: self._install_from_details(dialog, full_plugin))
+            btn_layout.addWidget(install_btn)
+            
+            layout.addLayout(btn_layout)
+            
+            dialog.exec()
+        
+        def _install_from_details(self, dialog, plugin: dict):
+            """Install plugin from the details dialog."""
+            dialog.accept()
+            self._download_store_plugin(plugin)
+        
+        def _show_screenshots_dialog(self, plugin_name: str, plugin_id: str, screenshots: list):
+            """Show dialog with all plugin screenshots."""
+            from PyQt6.QtGui import QPixmap
+            from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+            from PyQt6.QtCore import QUrl
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"🖼️ Screenshots - {plugin_name}")
+            dialog.setMinimumSize(800, 600)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header
+            header = QLabel(f"<b>Screenshots for {plugin_name}</b> ({len(screenshots)} image(s))")
+            header.setStyleSheet("font-size: 14px; padding: 10px;")
+            layout.addWidget(header)
+            
+            # Scroll area for screenshots
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            
+            scroll_content = QWidget()
+            scroll_layout = QVBoxLayout(scroll_content)
+            scroll_layout.setSpacing(20)
+            
+            # Status label for loading
+            self._screenshot_status = QLabel("Loading screenshots...")
+            self._screenshot_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            scroll_layout.addWidget(self._screenshot_status)
+            
+            # Store references for loading
+            self._screenshot_labels = []
+            self._screenshot_manager = QNetworkAccessManager()
+            
+            # Base URL for screenshots
+            base_url = plugin_store_api.base_url
+            
+            # Load each screenshot
+            for i, ss_filename in enumerate(screenshots):
+                # Container for each screenshot
+                ss_container = QWidget()
+                ss_container_layout = QVBoxLayout(ss_container)
+                ss_container_layout.setContentsMargins(0, 0, 0, 0)
+                
+                # Screenshot label (placeholder)
+                ss_label = QLabel(f"⏳ Loading screenshot {i+1}...")
+                ss_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                ss_label.setMinimumHeight(300)
+                ss_label.setStyleSheet("background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 10px;")
+                ss_container_layout.addWidget(ss_label)
+                
+                # Caption
+                caption = QLabel(f"Screenshot {i+1} of {len(screenshots)}")
+                caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                caption.setStyleSheet("color: #888; font-size: 11px;")
+                ss_container_layout.addWidget(caption)
+                
+                scroll_layout.addWidget(ss_container)
+                self._screenshot_labels.append(ss_label)
+                
+                # Load image asynchronously
+                ss_url = f"{base_url}/screenshots/{ss_filename}"
+                self._load_screenshot_async(ss_label, ss_url, i)
+            
+            scroll_layout.addStretch()
+            scroll.setWidget(scroll_content)
+            layout.addWidget(scroll)
+            
+            # Update status
+            self._screenshot_status.setText(f"Loaded {len(screenshots)} screenshot(s)")
+            
+            # Close button
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+            
+            dialog.exec()
+        
+        def _load_screenshot_async(self, label, url: str, index: int):
+            """Load a screenshot image asynchronously."""
+            import urllib.request
+            from PyQt6.QtGui import QPixmap
+            from PyQt6.QtCore import QByteArray
+            
+            def load_image():
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'ImageAnarchy/1.1'})
+                    with urllib.request.urlopen(req, timeout=15) as response:
+                        data = response.read()
+                        
+                        pixmap = QPixmap()
+                        pixmap.loadFromData(QByteArray(data))
+                        
+                        if not pixmap.isNull():
+                            # Scale to fit nicely (max 750px wide)
+                            if pixmap.width() > 750:
+                                pixmap = pixmap.scaledToWidth(750, Qt.TransformationMode.SmoothTransformation)
+                            label.setPixmap(pixmap)
+                            label.setMinimumHeight(pixmap.height())
+                        else:
+                            label.setText(f"❌ Failed to load image {index+1}")
+                except Exception as e:
+                    label.setText(f"❌ Error loading screenshot {index+1}:\n{str(e)[:50]}")
+            
+            # Run in thread to avoid blocking UI
+            import threading
+            thread = threading.Thread(target=load_image, daemon=True)
+            thread.start()
 
-    return QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab
+        def _show_rate_dialog(self, plugin_id: str, plugin_name: str):
+            """Show dialog to rate a plugin."""
+            if not plugin_store_api.is_logged_in():
+                QMessageBox.information(
+                    self,
+                    "Login Required",
+                    "You need to be logged in to rate plugins.\n\n"
+                    "Click 'Login' in the Plugin Store to create an account or sign in."
+                )
+                return
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Rate {plugin_name}")
+            dialog.setFixedWidth(400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Star rating selector
+            rating_label = QLabel("Select your rating:")
+            layout.addWidget(rating_label)
+            
+            stars_layout = QHBoxLayout()
+            star_buttons = []
+            selected_rating = [0]  # Using list to allow modification in nested function
+            
+            def set_rating(rating):
+                selected_rating[0] = rating
+                for i, btn in enumerate(star_buttons):
+                    if i < rating:
+                        btn.setText("⭐")
+                        btn.setStyleSheet("font-size: 28px; border: none; background: transparent;")
+                    else:
+                        btn.setText("☆")
+                        btn.setStyleSheet("font-size: 28px; border: none; background: transparent; color: #666;")
+            
+            for i in range(5):
+                star_btn = QPushButton("☆")
+                star_btn.setStyleSheet("font-size: 28px; border: none; background: transparent; color: #666;")
+                star_btn.setFixedSize(40, 40)
+                star_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                star_btn.clicked.connect(lambda checked, r=i+1: set_rating(r))
+                star_buttons.append(star_btn)
+                stars_layout.addWidget(star_btn)
+            
+            stars_layout.addStretch()
+            layout.addLayout(stars_layout)
+            
+            # Comment
+            comment_label = QLabel("Add a comment (optional):")
+            layout.addWidget(comment_label)
+            
+            comment_edit = QTextEdit()
+            comment_edit.setMaximumHeight(80)
+            comment_edit.setPlaceholderText("Share your experience with this plugin...")
+            layout.addWidget(comment_edit)
+            
+            # Status
+            status_label = QLabel("")
+            status_label.setStyleSheet("color: #f44336;")
+            layout.addWidget(status_label)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(cancel_btn)
+            
+            def submit_rating():
+                if selected_rating[0] == 0:
+                    status_label.setText("Please select a rating")
+                    return
+                
+                comment = comment_edit.toPlainText().strip()
+                result = plugin_store_api.submit_rating(plugin_id, selected_rating[0], comment)
+                
+                if 'error' in result:
+                    status_label.setText(result['error'])
+                else:
+                    dialog.accept()
+                    QMessageBox.information(self, "Success", "Thank you for your rating!")
+            
+            submit_btn = QPushButton("⭐ Submit Rating")
+            submit_btn.setStyleSheet("background-color: #4CAF50;")
+            submit_btn.clicked.connect(submit_rating)
+            btn_layout.addWidget(submit_btn)
+            
+            layout.addLayout(btn_layout)
+            dialog.exec()
+        
+        def _show_feedback_dialog(self, plugin_id: str, plugin_name: str):
+            """Show dialog to leave feedback on a plugin."""
+            if not plugin_store_api.is_logged_in():
+                QMessageBox.information(
+                    self,
+                    "Login Required",
+                    "You need to be logged in to leave feedback.\n\n"
+                    "Click 'Login' in the Plugin Store to create an account or sign in."
+                )
+                return
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Feedback for {plugin_name}")
+            dialog.setFixedWidth(450)
+            
+            layout = QVBoxLayout(dialog)
+            
+            info_label = QLabel("Share your thoughts with the developer:")
+            layout.addWidget(info_label)
+            
+            feedback_edit = QTextEdit()
+            feedback_edit.setMinimumHeight(120)
+            feedback_edit.setPlaceholderText(
+                "Share your experience, suggestions, or feature requests...\n\n"
+                "Your feedback helps developers improve their plugins!"
+            )
+            layout.addWidget(feedback_edit)
+            
+            char_count = QLabel("0/2000 characters")
+            char_count.setStyleSheet("color: #888; font-size: 10px;")
+            feedback_edit.textChanged.connect(
+                lambda: char_count.setText(f"{len(feedback_edit.toPlainText())}/2000 characters")
+            )
+            layout.addWidget(char_count)
+            
+            # Status
+            status_label = QLabel("")
+            status_label.setStyleSheet("color: #f44336;")
+            layout.addWidget(status_label)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(cancel_btn)
+            
+            def submit_feedback():
+                content = feedback_edit.toPlainText().strip()
+                if len(content) < 10:
+                    status_label.setText("Feedback must be at least 10 characters")
+                    return
+                if len(content) > 2000:
+                    status_label.setText("Feedback must be under 2000 characters")
+                    return
+                
+                result = plugin_store_api.submit_feedback(plugin_id, content)
+                
+                if 'error' in result:
+                    status_label.setText(result['error'])
+                else:
+                    dialog.accept()
+                    QMessageBox.information(self, "Success", "Thank you for your feedback!")
+            
+            submit_btn = QPushButton("💬 Submit Feedback")
+            submit_btn.setStyleSheet("background-color: #4CAF50;")
+            submit_btn.clicked.connect(submit_feedback)
+            btn_layout.addWidget(submit_btn)
+            
+            layout.addLayout(btn_layout)
+            dialog.exec()
+        
+        def _show_bug_report_dialog(self, plugin_id: str, plugin_name: str):
+            """Show dialog to report a bug (no login required)."""
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Report Bug in {plugin_name}")
+            dialog.setFixedWidth(500)
+            
+            layout = QVBoxLayout(dialog)
+            
+            info_label = QLabel(
+                "🐛 <b>Report a Bug</b><br>"
+                "<span style='color:#888;'>No login required. The developer will review your report.</span>"
+            )
+            info_label.setTextFormat(Qt.TextFormat.RichText)
+            layout.addWidget(info_label)
+            
+            # Name (optional)
+            name_layout = QHBoxLayout()
+            name_label = QLabel("Your name (optional):")
+            name_layout.addWidget(name_label)
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("Anonymous")
+            name_layout.addWidget(name_edit)
+            layout.addLayout(name_layout)
+            
+            # Email (optional)
+            email_layout = QHBoxLayout()
+            email_label = QLabel("Email (optional):")
+            email_layout.addWidget(email_label)
+            email_edit = QLineEdit()
+            email_edit.setPlaceholderText("For follow-up if needed")
+            email_layout.addWidget(email_edit)
+            layout.addLayout(email_layout)
+            
+            # Bug description
+            desc_label = QLabel("Describe the bug:")
+            layout.addWidget(desc_label)
+            
+            bug_edit = QTextEdit()
+            bug_edit.setMinimumHeight(150)
+            bug_edit.setPlaceholderText(
+                "Please describe:\n"
+                "1. What you expected to happen\n"
+                "2. What actually happened\n"
+                "3. Steps to reproduce the bug\n\n"
+                "Include any error messages if applicable."
+            )
+            layout.addWidget(bug_edit)
+            
+            char_count = QLabel("0/5000 characters (min 20)")
+            char_count.setStyleSheet("color: #888; font-size: 10px;")
+            bug_edit.textChanged.connect(
+                lambda: char_count.setText(f"{len(bug_edit.toPlainText())}/5000 characters (min 20)")
+            )
+            layout.addWidget(char_count)
+            
+            # Simple captcha
+            captcha_layout = QHBoxLayout()
+            
+            # Generate simple math captcha
+            import random
+            a = random.randint(1, 10)
+            b = random.randint(1, 10)
+            captcha_answer = a + b
+            
+            captcha_label = QLabel(f"🤖 Captcha: What is {a} + {b}?")
+            captcha_layout.addWidget(captcha_label)
+            
+            captcha_edit = QLineEdit()
+            captcha_edit.setFixedWidth(60)
+            captcha_edit.setPlaceholderText("?")
+            captcha_layout.addWidget(captcha_edit)
+            captcha_layout.addStretch()
+            layout.addLayout(captcha_layout)
+            
+            # Status
+            status_label = QLabel("")
+            status_label.setWordWrap(True)
+            status_label.setStyleSheet("color: #f44336;")
+            layout.addWidget(status_label)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(cancel_btn)
+            
+            def submit_bug_report():
+                content = bug_edit.toPlainText().strip()
+                if len(content) < 20:
+                    status_label.setText("Bug report must be at least 20 characters")
+                    return
+                if len(content) > 5000:
+                    status_label.setText("Bug report must be under 5000 characters")
+                    return
+                
+                # Verify captcha
+                try:
+                    user_answer = int(captcha_edit.text().strip())
+                    if user_answer != captcha_answer:
+                        status_label.setText("Incorrect captcha answer. Please try again.")
+                        return
+                except ValueError:
+                    status_label.setText("Please enter a valid number for the captcha")
+                    return
+                
+                email = email_edit.text().strip()
+                if email and '@' not in email:
+                    status_label.setText("Please enter a valid email or leave it blank")
+                    return
+                
+                name = name_edit.text().strip() or "Anonymous"
+                
+                result = plugin_store_api.submit_bug_report(plugin_id, content, email, name, str(user_answer))
+                
+                if 'error' in result:
+                    status_label.setText(result['error'])
+                else:
+                    dialog.accept()
+                    QMessageBox.information(
+                        self, 
+                        "Bug Report Submitted",
+                        "Thank you for reporting this bug!\n\n"
+                        "The developer will review your report and may follow up if you provided an email."
+                    )
+            
+            submit_btn = QPushButton("🐛 Submit Bug Report")
+            submit_btn.setStyleSheet("background-color: #ff9800;")
+            submit_btn.clicked.connect(submit_bug_report)
+            btn_layout.addWidget(submit_btn)
+            
+            layout.addLayout(btn_layout)
+            dialog.exec()
+        
+        def _search_store(self):
+            """Search the plugin store."""
+            query = self.store_search.text().strip()
+            if not query:
+                self._refresh_store()
+                return
+            
+            self.store_status.setText(f"Searching for '{query}'...")
+            QApplication.processEvents()
+            
+            plugins = plugin_store_api.get_plugins(search=query)
+            
+            if not plugins:
+                self.store_status.setText(f"No plugins found for '{query}'")
+                self._display_store_plugins([])
+                return
+            
+            self.store_status.setText(f"Found {len(plugins)} plugins matching '{query}'")
+            self._display_store_plugins(plugins)
+        
+        def _filter_store_category(self, category: str):
+            """Filter store by category."""
+            if category == "All":
+                self._refresh_store()
+                return
+            
+            if hasattr(self, '_store_plugins'):
+                filtered = [p for p in self._store_plugins if p.get('category', '').lower() == category.lower()]
+                self._display_store_plugins(filtered)
+                self.store_status.setText(f"Showing {len(filtered)} plugins in '{category}'")
+        
+        def _download_store_plugin(self, plugin: dict):
+            """Download and install a plugin from the store."""
+            plugin_id = plugin.get('id')
+            plugin_name = plugin.get('name', plugin_id)
+            
+            reply = QMessageBox.question(
+                self,
+                "Install Plugin",
+                f"Download and install '{plugin_name}'?\n\n"
+                f"Author: {plugin.get('author_name', 'Unknown')}\n"
+                f"Version: {plugin.get('version', '1.0')}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            
+            # Download to temp file
+            import tempfile
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, f"{plugin_id}.zip")
+            
+            self.store_status.setText(f"Downloading {plugin_name}...")
+            QApplication.processEvents()
+            
+            success, result = plugin_store_api.download_plugin(plugin_id, zip_path)
+            
+            if not success:
+                QMessageBox.critical(self, "Download Failed", f"Failed to download plugin:\n{result}")
+                self.store_status.setText("Download failed")
+                return
+            
+            # Extract to plugins folder
+            try:
+                import zipfile
+                plugins_dir = plugin_manager._get_plugins_dir()
+                
+                # Create plugin subdirectory using plugin ID
+                plugin_install_dir = os.path.join(plugins_dir, plugin_id)
+                os.makedirs(plugin_install_dir, exist_ok=True)
+                
+                self.store_status.setText(f"Extracting {plugin_name}...")
+                QApplication.processEvents()
+                
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    # Check if the zip has a root folder or files at root
+                    namelist = zf.namelist()
+                    
+                    # Check if all files are in a subdirectory already
+                    has_root_folder = False
+                    if namelist:
+                        first_part = namelist[0].split('/')[0]
+                        has_root_folder = all(n.startswith(first_part + '/') or n == first_part for n in namelist)
+                    
+                    if has_root_folder:
+                        # Extract and move contents from the root folder
+                        zf.extractall(plugins_dir)
+                        # The extracted folder might have a different name, rename if needed
+                        extracted_folder = os.path.join(plugins_dir, first_part)
+                        if extracted_folder != plugin_install_dir and os.path.exists(extracted_folder):
+                            # Remove target if exists, then rename
+                            if os.path.exists(plugin_install_dir):
+                                import shutil
+                                shutil.rmtree(plugin_install_dir)
+                            os.rename(extracted_folder, plugin_install_dir)
+                    else:
+                        # Files are at root level, extract to plugin subdirectory
+                        zf.extractall(plugin_install_dir)
+                
+                # Clean up temp file
+                os.remove(zip_path)
+                os.rmdir(temp_dir)
+                
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "Extraction Failed",
+                    f"Failed to extract plugin:\n{str(e)}"
+                )
+                self.store_status.setText("Installation failed")
+                return
+            
+            # Run plugin setup (pip install, git clone, binary downloads, etc.)
+            self.store_status.setText(f"Setting up {plugin_name}...")
+            QApplication.processEvents()
+            
+            # Show progress dialog for setup
+            from PyQt6.QtWidgets import QProgressDialog
+            progress_dialog = QProgressDialog(
+                f"Setting up {plugin_name}...",
+                "Cancel",
+                0, 100,
+                self
+            )
+            progress_dialog.setWindowTitle("Plugin Setup")
+            progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.setValue(0)
+            
+            setup_errors = []
+            
+            def setup_progress(step_name: str, status: str, progress: int):
+                if progress_dialog.wasCanceled():
+                    return
+                progress_dialog.setLabelText(f"{step_name}\n{status}")
+                progress_dialog.setValue(progress)
+                QApplication.processEvents()
+            
+            try:
+                success, message = plugin_manager.setup_plugin_dependencies(plugin_id, setup_progress)
+                progress_dialog.close()
+                
+                if not success:
+                    setup_errors.append(message)
+            except Exception as e:
+                progress_dialog.close()
+                setup_errors.append(str(e))
+            
+            # Show result
+            if setup_errors:
+                QMessageBox.warning(
+                    self,
+                    "Plugin Installed with Warnings",
+                    f"'{plugin_name}' was installed but some setup steps had issues:\n\n"
+                    f"{chr(10).join(setup_errors)}\n\n"
+                    "The plugin may still work, or you can try setup again from the plugin."
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Plugin Installed",
+                    f"'{plugin_name}' has been installed and configured successfully!\n\n"
+                    "Go to the Installed tab to use it."
+                )
+            
+            self.store_status.setText(f"Installed {plugin_name}")
+            
+            # Refresh installed plugins
+            self._load_plugins()
+        
+        def _show_login_dialog(self):
+            """Show login/register dialog."""
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Plugin Store Login")
+            dialog.setMinimumWidth(350)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Tab for Login / Register
+            tabs = QTabWidget()
+            
+            # Login tab
+            login_widget = QWidget()
+            login_layout = QFormLayout(login_widget)
+            
+            login_user = QLineEdit()
+            login_user.setPlaceholderText("Username")
+            login_layout.addRow("Username:", login_user)
+            
+            login_pass = QLineEdit()
+            login_pass.setPlaceholderText("Password")
+            login_pass.setEchoMode(QLineEdit.EchoMode.Password)
+            login_layout.addRow("Password:", login_pass)
+            
+            login_btn = QPushButton("Login")
+            login_layout.addRow(login_btn)
+            
+            login_status = QLabel("")
+            login_status.setStyleSheet("color: #f44336;")
+            login_layout.addRow(login_status)
+            
+            def do_login():
+                username = login_user.text().strip()
+                password = login_pass.text()
+                
+                if not username or not password:
+                    login_status.setText("Please enter username and password")
+                    return
+                
+                login_status.setText("Logging in...")
+                login_status.setStyleSheet("color: #888;")
+                QApplication.processEvents()
+                
+                result = plugin_store_api.login(username, password)
+                
+                if 'error' in result:
+                    login_status.setText(result['error'])
+                    login_status.setStyleSheet("color: #f44336;")
+                else:
+                    dialog.accept()
+                    self._update_auth_ui()
+                    QMessageBox.information(self, "Login Successful", f"Welcome, {username}!")
+            
+            login_btn.clicked.connect(do_login)
+            login_pass.returnPressed.connect(do_login)
+            
+            tabs.addTab(login_widget, "Login")
+            
+            # Register tab
+            reg_widget = QWidget()
+            reg_layout = QFormLayout(reg_widget)
+            
+            reg_user = QLineEdit()
+            reg_user.setPlaceholderText("Choose a username")
+            reg_layout.addRow("Username:", reg_user)
+            
+            reg_email = QLineEdit()
+            reg_email.setPlaceholderText("your@email.com")
+            reg_layout.addRow("Email:", reg_email)
+            
+            reg_pass = QLineEdit()
+            reg_pass.setPlaceholderText("Min 6 characters")
+            reg_pass.setEchoMode(QLineEdit.EchoMode.Password)
+            reg_layout.addRow("Password:", reg_pass)
+            
+            reg_pass2 = QLineEdit()
+            reg_pass2.setPlaceholderText("Confirm password")
+            reg_pass2.setEchoMode(QLineEdit.EchoMode.Password)
+            reg_layout.addRow("Confirm:", reg_pass2)
+            
+            reg_btn = QPushButton("Create Account")
+            reg_layout.addRow(reg_btn)
+            
+            reg_status = QLabel("")
+            reg_status.setStyleSheet("color: #f44336;")
+            reg_status.setWordWrap(True)
+            reg_layout.addRow(reg_status)
+            
+            def do_register():
+                username = reg_user.text().strip()
+                email = reg_email.text().strip()
+                password = reg_pass.text()
+                password2 = reg_pass2.text()
+                
+                if not username or not email or not password:
+                    reg_status.setText("Please fill in all fields")
+                    return
+                
+                if password != password2:
+                    reg_status.setText("Passwords don't match")
+                    return
+                
+                if len(password) < 6:
+                    reg_status.setText("Password must be at least 6 characters")
+                    return
+                
+                reg_status.setText("Creating account...")
+                reg_status.setStyleSheet("color: #888;")
+                QApplication.processEvents()
+                
+                result = plugin_store_api.register(username, email, password)
+                
+                if 'error' in result:
+                    reg_status.setText(result['error'])
+                    reg_status.setStyleSheet("color: #f44336;")
+                else:
+                    dialog.accept()
+                    self._update_auth_ui()
+                    QMessageBox.information(
+                        self,
+                        "Account Created",
+                        f"Welcome, {username}!\n\n"
+                        "You can now upload plugins to the store."
+                    )
+            
+            reg_btn.clicked.connect(do_register)
+            
+            tabs.addTab(reg_widget, "Register")
+            
+            layout.addWidget(tabs)
+            
+            # Note about why register
+            note = QLabel(
+                "💡 Registration is only required for plugin developers who want to upload plugins.\n"
+                "Browsing and downloading plugins is free for everyone!"
+            )
+            note.setStyleSheet("color: #888; font-style: italic; font-size: 11px;")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            
+            dialog.exec()
+        
+        def _show_user_menu(self):
+            """Show user menu with logout option."""
+            menu = QMenu(self)
+            
+            user = plugin_store_api.user or {}
+            username = user.get('username', 'User')
+            is_admin = user.get('is_admin', False)
+            
+            # User info
+            if is_admin:
+                user_action = menu.addAction(f"👤 {username} (Admin)")
+            else:
+                user_action = menu.addAction(f"👤 Logged in as {username}")
+            user_action.setEnabled(False)
+            
+            menu.addSeparator()
+            
+            # Admin panel (only for admins)
+            if is_admin:
+                admin_action = menu.addAction("⚙️ Admin Panel")
+                admin_action.triggered.connect(self._show_admin_panel)
+                menu.addSeparator()
+            
+            # Upload plugin
+            upload_action = menu.addAction("📤 Upload Plugin")
+            upload_action.triggered.connect(self._show_upload_dialog)
+            
+            menu.addSeparator()
+            
+            # Logout
+            logout_action = menu.addAction("🚪 Logout")
+            logout_action.triggered.connect(self._logout)
+            
+            # Show menu at button
+            menu.exec(self.user_menu_btn.mapToGlobal(self.user_menu_btn.rect().bottomLeft()))
+        
+        def _logout(self):
+            """Logout from plugin store."""
+            plugin_store_api.logout()
+            self._update_auth_ui()
+            QMessageBox.information(self, "Logged Out", "You have been logged out.")
+        
+        def _show_admin_panel(self):
+            """Show admin panel for managing pending plugins."""
+            dialog = QDialog(self)
+            dialog.setWindowTitle("⚙️ Plugin Store Admin Panel")
+            dialog.setMinimumWidth(800)
+            dialog.setMinimumHeight(600)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Header
+            header = QLabel("⚙️ <b>Admin Panel</b> - Review and manage plugin submissions")
+            header.setTextFormat(Qt.TextFormat.RichText)
+            header.setStyleSheet("font-size: 16px; padding: 10px; background: #ff9800; color: #1a1a1a; border-radius: 6px;")
+            layout.addWidget(header)
+            
+            # Tabs
+            tabs = QTabWidget()
+            
+            # Pending plugins tab
+            pending_widget = QWidget()
+            pending_layout = QVBoxLayout(pending_widget)
+            
+            pending_label = QLabel("📋 Pending plugins awaiting review:")
+            pending_label.setStyleSheet("font-weight: bold;")
+            pending_layout.addWidget(pending_label)
+            
+            self._admin_pending_list = QListWidget()
+            self._admin_pending_list.setStyleSheet("""
+                QListWidget::item { padding: 10px; border-bottom: 1px solid #333; }
+                QListWidget::item:selected { background: #2d4a2d; }
+            """)
+            pending_layout.addWidget(self._admin_pending_list)
+            
+            # Action buttons
+            btn_layout = QHBoxLayout()
+            
+            refresh_btn = QPushButton("🔄 Refresh")
+            refresh_btn.clicked.connect(lambda: self._load_pending_plugins(dialog))
+            btn_layout.addWidget(refresh_btn)
+            
+            review_btn = QPushButton("🔍 Review Details")
+            review_btn.setStyleSheet("background: #2196F3; padding: 8px 16px;")
+            review_btn.clicked.connect(lambda: self._review_selected_plugin(dialog))
+            btn_layout.addWidget(review_btn)
+            
+            btn_layout.addStretch()
+            
+            approve_btn = QPushButton("✅ Approve Selected")
+            approve_btn.setStyleSheet("background: #4CAF50; padding: 8px 16px;")
+            approve_btn.clicked.connect(lambda: self._approve_selected_plugin(dialog))
+            btn_layout.addWidget(approve_btn)
+            
+            reject_btn = QPushButton("❌ Reject Selected")
+            reject_btn.setStyleSheet("background: #f44336; padding: 8px 16px;")
+            reject_btn.clicked.connect(lambda: self._reject_selected_plugin(dialog))
+            btn_layout.addWidget(reject_btn)
+            
+            pending_layout.addLayout(btn_layout)
+            tabs.addTab(pending_widget, "📋 Pending")
+            
+            # All plugins tab
+            all_widget = QWidget()
+            all_layout = QVBoxLayout(all_widget)
+            
+            all_label = QLabel("📦 All plugins in the store:")
+            all_label.setStyleSheet("font-weight: bold;")
+            all_layout.addWidget(all_label)
+            
+            self._admin_all_list = QListWidget()
+            self._admin_all_list.setStyleSheet("""
+                QListWidget::item { padding: 8px; border-bottom: 1px solid #333; }
+            """)
+            all_layout.addWidget(self._admin_all_list)
+            
+            all_btn_layout = QHBoxLayout()
+            refresh_all_btn = QPushButton("🔄 Refresh")
+            refresh_all_btn.clicked.connect(lambda: self._load_all_admin_plugins(dialog))
+            all_btn_layout.addWidget(refresh_all_btn)
+            
+            review_all_btn = QPushButton("🔍 Review Details")
+            review_all_btn.setStyleSheet("background: #2196F3; padding: 8px 16px;")
+            review_all_btn.clicked.connect(lambda: self._review_all_selected_plugin(dialog))
+            all_btn_layout.addWidget(review_all_btn)
+            
+            all_btn_layout.addStretch()
+            
+            delete_btn = QPushButton("🗑️ Delete Selected")
+            delete_btn.setStyleSheet("background: #f44336; padding: 8px 16px;")
+            delete_btn.clicked.connect(lambda: self._delete_selected_plugin(dialog))
+            all_btn_layout.addWidget(delete_btn)
+            
+            all_layout.addLayout(all_btn_layout)
+            tabs.addTab(all_widget, "📦 All Plugins")
+            
+            # Connect tab change to load data
+            tabs.currentChanged.connect(lambda idx: self._load_all_admin_plugins(dialog) if idx == 1 else None)
+            
+            layout.addWidget(tabs)
+            
+            # Status
+            self._admin_status = QLabel("")
+            self._admin_status.setWordWrap(True)
+            layout.addWidget(self._admin_status)
+            
+            # Close button
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+            
+            # Load pending plugins
+            self._load_pending_plugins(dialog)
+            
+            dialog.exec()
+        
+        def _load_pending_plugins(self, dialog):
+            """Load pending plugins from server."""
+            self._admin_pending_list.clear()
+            self._admin_status.setText("Loading pending plugins...")
+            self._admin_status.setStyleSheet("color: #888;")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.get_pending_plugins()
+            
+            if 'error' in result:
+                self._admin_status.setText(f"Error: {result['error']}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+                return
+            
+            plugins = result.get('plugins', [])
+            
+            if not plugins:
+                self._admin_status.setText("🎉 No pending plugins to review!")
+                self._admin_status.setStyleSheet("color: #4CAF50;")
+                return
+            
+            for p in plugins:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                
+                status_icon = "⏳"
+                text = f"{p.get('icon', '📦')} {p.get('name', 'Unknown')} v{p.get('version', '?')}\n"
+                text += f"   by {p.get('author_name', 'Unknown')} | {p.get('category', 'other')}\n"
+                text += f"   {p.get('description', '')[:100]}..."
+                item.setText(text)
+                
+                self._admin_pending_list.addItem(item)
+            
+            self._admin_status.setText(f"Found {len(plugins)} pending plugin(s)")
+            self._admin_status.setStyleSheet("color: #4fc3f7;")
+        
+        def _load_all_admin_plugins(self, dialog):
+            """Load all plugins from server."""
+            self._admin_all_list.clear()
+            self._admin_status.setText("Loading all plugins...")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.get_all_admin_plugins()
+            
+            if 'error' in result:
+                self._admin_status.setText(f"Error: {result['error']}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+                return
+            
+            plugins = result.get('plugins', [])
+            
+            for p in plugins:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, p)
+                
+                status = p.get('status', 'unknown')
+                status_icon = "✅" if status == 'approved' else "⏳" if status == 'pending' else "❌"
+                
+                text = f"{status_icon} {p.get('icon', '📦')} {p.get('name', 'Unknown')} v{p.get('version', '?')} [{status}]\n"
+                text += f"   by {p.get('author_name', 'Unknown')} | ⬇️ {p.get('downloads', 0)} downloads"
+                item.setText(text)
+                
+                self._admin_all_list.addItem(item)
+            
+            self._admin_status.setText(f"Found {len(plugins)} plugin(s)")
+            self._admin_status.setStyleSheet("color: #4fc3f7;")
+        
+        def _approve_selected_plugin(self, dialog):
+            """Approve the selected pending plugin."""
+            item = self._admin_pending_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a plugin to approve.")
+                return
+            
+            plugin = item.data(Qt.ItemDataRole.UserRole)
+            plugin_id = plugin.get('id')
+            plugin_name = plugin.get('name', 'Unknown')
+            
+            reply = QMessageBox.question(
+                dialog,
+                "Approve Plugin",
+                f"Approve '{plugin_name}'?\n\nIt will become publicly visible in the store.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            
+            self._admin_status.setText(f"Approving {plugin_name}...")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.approve_plugin(plugin_id)
+            
+            if 'error' in result:
+                self._admin_status.setText(f"Error: {result['error']}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+            else:
+                self._admin_status.setText(f"✅ {plugin_name} approved!")
+                self._admin_status.setStyleSheet("color: #4CAF50;")
+                self._load_pending_plugins(dialog)
+                self._refresh_store()  # Refresh main store view
+        
+        def _reject_selected_plugin(self, dialog):
+            """Reject the selected pending plugin."""
+            item = self._admin_pending_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a plugin to reject.")
+                return
+            
+            plugin = item.data(Qt.ItemDataRole.UserRole)
+            plugin_id = plugin.get('id')
+            plugin_name = plugin.get('name', 'Unknown')
+            
+            reason, ok = QInputDialog.getText(
+                dialog,
+                "Rejection Reason",
+                f"Reason for rejecting '{plugin_name}':\n(This will be sent to the developer)"
+            )
+            
+            if not ok:
+                return
+            
+            self._admin_status.setText(f"Rejecting {plugin_name}...")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.reject_plugin(plugin_id, reason)
+            
+            if 'error' in result:
+                self._admin_status.setText(f"Error: {result['error']}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+            else:
+                self._admin_status.setText(f"❌ {plugin_name} rejected")
+                self._admin_status.setStyleSheet("color: #ff9800;")
+                self._load_pending_plugins(dialog)
+        
+        def _delete_selected_plugin(self, dialog):
+            """Delete the selected plugin."""
+            item = self._admin_all_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a plugin to delete.")
+                return
+            
+            plugin = item.data(Qt.ItemDataRole.UserRole)
+            plugin_id = plugin.get('id')
+            plugin_name = plugin.get('name', 'Unknown')
+            
+            reply = QMessageBox.warning(
+                dialog,
+                "Delete Plugin",
+                f"⚠️ DELETE '{plugin_name}'?\n\nThis cannot be undone!",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            
+            self._admin_status.setText(f"Deleting {plugin_name}...")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.delete_plugin(plugin_id)
+            
+            if 'error' in result:
+                self._admin_status.setText(f"Error: {result['error']}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+            else:
+                self._admin_status.setText(f"🗑️ {plugin_name} deleted")
+                self._admin_status.setStyleSheet("color: #ff9800;")
+                self._load_all_admin_plugins(dialog)
+                self._refresh_store()
+
+        def _review_selected_plugin(self, dialog):
+            """Review detailed info for a pending plugin."""
+            item = self._admin_pending_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a plugin to review.")
+                return
+            plugin = item.data(Qt.ItemDataRole.UserRole)
+            self._show_plugin_review_dialog(dialog, plugin.get('id'), plugin.get('name', 'Unknown'))
+        
+        def _review_all_selected_plugin(self, dialog):
+            """Review detailed info for a plugin from all plugins list."""
+            item = self._admin_all_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a plugin to review.")
+                return
+            plugin = item.data(Qt.ItemDataRole.UserRole)
+            self._show_plugin_review_dialog(dialog, plugin.get('id'), plugin.get('name', 'Unknown'))
+        
+        def _show_plugin_review_dialog(self, parent, plugin_id, plugin_name):
+            """Show detailed review dialog for a plugin."""
+            review_dialog = QDialog(parent)
+            review_dialog.setWindowTitle(f"🔍 Review: {plugin_name}")
+            review_dialog.setMinimumWidth(900)
+            review_dialog.setMinimumHeight(700)
+            
+            layout = QVBoxLayout(review_dialog)
+            
+            # Loading
+            status_label = QLabel("⏳ Loading plugin details...")
+            status_label.setStyleSheet("font-size: 14px; padding: 10px;")
+            layout.addWidget(status_label)
+            
+            QApplication.processEvents()
+            
+            # Fetch details
+            result = plugin_store_api.get_plugin_review_details(plugin_id)
+            
+            if 'error' in result:
+                status_label.setText(f"❌ Error: {result['error']}")
+                status_label.setStyleSheet("color: #f44336;")
+                return
+            
+            # Remove loading label
+            layout.removeWidget(status_label)
+            status_label.deleteLater()
+            
+            plugin = result.get('plugin', {})
+            scan_results = result.get('scanResults', [])
+            binaries = result.get('binaries', [])
+            all_files = result.get('allFiles', [])
+            external_deps = result.get('externalDependencies', [])
+            summary = result.get('summary', {})
+            
+            # Create scrollable content
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll_content = QWidget()
+            scroll_layout = QVBoxLayout(scroll_content)
+            
+            # ---- Plugin Info Section ----
+            info_group = QGroupBox("📦 Plugin Information")
+            info_layout = QFormLayout(info_group)
+            
+            info_layout.addRow("ID:", QLabel(f"<code>{plugin.get('id', '?')}</code>"))
+            info_layout.addRow("Name:", QLabel(f"<b>{plugin.get('name', '?')}</b>"))
+            info_layout.addRow("Version:", QLabel(plugin.get('version', '?')))
+            info_layout.addRow("Author:", QLabel(f"{plugin.get('author_name', '?')} ({plugin.get('author_email', '?')})"))
+            info_layout.addRow("Category:", QLabel(plugin.get('category', '?')))
+            info_layout.addRow("License:", QLabel(plugin.get('license_type', '?')))
+            info_layout.addRow("Status:", QLabel(f"<b>{plugin.get('status', '?').upper()}</b>"))
+            info_layout.addRow("File Size:", QLabel(f"{plugin.get('file_size', 0) / 1024:.1f} KB"))
+            info_layout.addRow("Submitted:", QLabel(plugin.get('created_at', '?')))
+            
+            scroll_layout.addWidget(info_group)
+            
+            # ---- Description Section ----
+            desc_group = QGroupBox("📝 Description")
+            desc_layout = QVBoxLayout(desc_group)
+            
+            short_desc = QLabel(plugin.get('description', 'No description'))
+            short_desc.setWordWrap(True)
+            short_desc.setStyleSheet("font-weight: bold;")
+            desc_layout.addWidget(short_desc)
+            
+            long_desc = plugin.get('long_description', '')
+            if long_desc:
+                long_desc_edit = QTextEdit()
+                long_desc_edit.setReadOnly(True)
+                long_desc_edit.setHtml(long_desc)
+                long_desc_edit.setMaximumHeight(200)
+                desc_layout.addWidget(long_desc_edit)
+            
+            scroll_layout.addWidget(desc_group)
+            
+            # ---- Dependencies & Git Clone Section ----
+            deps_info_group = QGroupBox("📦 Plugin Dependencies")
+            deps_info_layout = QVBoxLayout(deps_info_group)
+            
+            # Pip requirements
+            requirements = plugin.get('requirements', [])
+            if requirements:
+                req_label = QLabel(f"<b>📋 Pip Requirements ({len(requirements)}):</b>")
+                deps_info_layout.addWidget(req_label)
+                req_list = QLabel("<code>" + ", ".join(requirements) + "</code>")
+                req_list.setWordWrap(True)
+                req_list.setStyleSheet("padding: 5px; background: rgba(33, 150, 243, 0.1); border-radius: 4px;")
+                deps_info_layout.addWidget(req_list)
+            else:
+                deps_info_layout.addWidget(QLabel("📋 No pip requirements"))
+            
+            # Git clone
+            git_clone = plugin.get('git_clone', {})
+            if git_clone:
+                git_label = QLabel("<b>📦 Git Repository Clone:</b>")
+                git_label.setStyleSheet("margin-top: 10px;")
+                deps_info_layout.addWidget(git_label)
+                
+                git_info_text = f"<b>Repo:</b> <code>{git_clone.get('repo', '?')}</code><br>"
+                git_info_text += f"<b>Target Directory:</b> <code>{git_clone.get('target', 'repo root')}</code>"
+                if git_clone.get('requirements_file'):
+                    git_info_text += f"<br><b>Requirements File:</b> <code>{git_clone.get('requirements_file')}</code>"
+                
+                git_info_label = QLabel(git_info_text)
+                git_info_label.setWordWrap(True)
+                git_info_label.setStyleSheet("padding: 8px; background: rgba(76, 175, 80, 0.1); border-radius: 4px;")
+                deps_info_layout.addWidget(git_info_label)
+                
+                # Warning about git clone
+                git_warning = QLabel("⚠️ <span style='color:#ff9800;'>Plugin will clone this repository when installed. Verify the source!</span>")
+                git_warning.setTextFormat(Qt.TextFormat.RichText)
+                git_warning.setStyleSheet("margin-top: 5px;")
+                deps_info_layout.addWidget(git_warning)
+            else:
+                no_git_label = QLabel("📦 No git clone required")
+                no_git_label.setStyleSheet("margin-top: 10px;")
+                deps_info_layout.addWidget(no_git_label)
+            
+            # Bundled binaries from manifest
+            bundled_bins = plugin.get('bundled_binaries', [])
+            if bundled_bins:
+                bundled_label = QLabel(f"<b>📁 Bundled Binaries ({len(bundled_bins)}):</b>")
+                bundled_label.setStyleSheet("margin-top: 10px;")
+                deps_info_layout.addWidget(bundled_label)
+                for bb in bundled_bins:
+                    bb_label = QLabel(f"• <code>{bb}</code>")
+                    bb_label.setStyleSheet("padding-left: 10px;")
+                    deps_info_layout.addWidget(bb_label)
+            
+            # Setup commands from manifest
+            setup_commands = plugin.get('setup_commands', [])
+            if setup_commands:
+                cmd_label = QLabel(f"<b>⚡ Setup Commands ({len(setup_commands)}):</b>")
+                cmd_label.setStyleSheet("margin-top: 10px;")
+                deps_info_layout.addWidget(cmd_label)
+                for cmd in setup_commands:
+                    cmd_display = QLabel(f"• <code>{cmd}</code>")
+                    cmd_display.setStyleSheet("padding-left: 10px;")
+                    deps_info_layout.addWidget(cmd_display)
+                
+                # Warning about setup commands
+                cmd_warning = QLabel("⚠️ <span style='color:#ff9800;'>Review these commands carefully! They will run during plugin setup.</span>")
+                cmd_warning.setTextFormat(Qt.TextFormat.RichText)
+                cmd_warning.setStyleSheet("margin-top: 5px;")
+                deps_info_layout.addWidget(cmd_warning)
+            
+            scroll_layout.addWidget(deps_info_group)
+            
+            # ---- Security Scan Section ----
+            scan_group = QGroupBox(f"🔒 Security Scan Results ({len(scan_results)} scan(s))")
+            scan_layout = QVBoxLayout(scan_group)
+            
+            if scan_results:
+                for scan in scan_results:
+                    scan_text = f"<b>File:</b> {scan.get('file_name', '?')}<br>"
+                    scan_text += f"<b>Safe:</b> {'✅ Yes' if scan.get('is_safe') else '❌ NO - THREATS DETECTED'}<br>"
+                    scan_text += f"<b>Context:</b> {scan.get('scan_context', '?')}<br>"
+                    scan_text += f"<b>ClamAV:</b> {scan.get('clamav_result') or '✅ Clean'}<br>"
+                    scan_text += f"<b>VirusTotal:</b> {scan.get('virustotal_detections', 0)}/{scan.get('virustotal_total', 0)} detections"
+                    if scan.get('virustotal_scan_id'):
+                        scan_text += f" (ID: {scan.get('virustotal_scan_id')[:16]}...)"
+                    
+                    threats = scan.get('threats', [])
+                    if threats:
+                        scan_text += f"<br><b style='color: #f44336;'>Threats:</b> {', '.join(threats)}"
+                    
+                    scan_label = QLabel(scan_text)
+                    scan_label.setWordWrap(True)
+                    scan_label.setStyleSheet("padding: 8px; background: rgba(0,0,0,0.2); border-radius: 4px; margin-bottom: 5px;")
+                    scan_layout.addWidget(scan_label)
+            else:
+                scan_layout.addWidget(QLabel("No scan results available"))
+            
+            scroll_layout.addWidget(scan_group)
+            
+            # ---- Binaries Section ----
+            bin_group = QGroupBox(f"⚙️ Binaries/Executables ({len(binaries)})")
+            bin_layout = QVBoxLayout(bin_group)
+            
+            if binaries:
+                for b in binaries:
+                    size_kb = b.get('size', 0) / 1024
+                    bin_label = QLabel(f"📁 <code>{b.get('path', '?')}</code> ({size_kb:.1f} KB)")
+                    bin_label.setStyleSheet("padding: 3px;")
+                    bin_layout.addWidget(bin_label)
+            else:
+                bin_layout.addWidget(QLabel("✅ No binaries found in package"))
+            
+            scroll_layout.addWidget(bin_group)
+            
+            # ---- All Files Section ----
+            files_group = QGroupBox(f"📂 All Files ({len(all_files)})")
+            files_layout = QVBoxLayout(files_group)
+            
+            files_list = QListWidget()
+            files_list.setMaximumHeight(150)
+            for f in all_files[:50]:  # Limit to 50
+                size_kb = f.get('size', 0) / 1024
+                files_list.addItem(f"{f.get('path', '?')} ({size_kb:.1f} KB)")
+            if len(all_files) > 50:
+                files_list.addItem(f"... and {len(all_files) - 50} more files")
+            files_layout.addWidget(files_list)
+            
+            scroll_layout.addWidget(files_group)
+            
+            # ---- External Dependencies Section ----
+            if external_deps:
+                deps_group = QGroupBox(f"🌐 External Dependencies ({len(external_deps)})")
+                deps_layout = QVBoxLayout(deps_group)
+                
+                deps_status = plugin.get('deps_status', 'unknown')
+                deps_label = QLabel(f"<b>Status:</b> {deps_status.upper()}")
+                deps_layout.addWidget(deps_label)
+                
+                for dep in external_deps:
+                    dep_text = f"<b>{dep.get('name', '?')}</b><br>"
+                    dep_text += f"URL: <code>{dep.get('url', '?')[:80]}...</code><br>"
+                    dep_text += f"Target: {dep.get('targetPath', './')}"
+                    dep_label = QLabel(dep_text)
+                    dep_label.setWordWrap(True)
+                    dep_label.setStyleSheet("padding: 5px; background: rgba(255,152,0,0.1); border-radius: 4px; margin: 2px 0;")
+                    deps_layout.addWidget(dep_label)
+                
+                scroll_layout.addWidget(deps_group)
+            
+            # ---- Summary Section ----
+            summary_group = QGroupBox("📊 Summary")
+            summary_layout = QFormLayout(summary_group)
+            summary_layout.addRow("Total Files:", QLabel(str(summary.get('totalFiles', 0))))
+            summary_layout.addRow("Binaries:", QLabel(str(summary.get('totalBinaries', 0))))
+            summary_layout.addRow("Scans Performed:", QLabel(str(summary.get('totalScans', 0))))
+            summary_layout.addRow("Has Threats:", QLabel("❌ YES" if summary.get('hasThreats') else "✅ No"))
+            summary_layout.addRow("Pending Deps:", QLabel("⏳ Yes" if summary.get('hasPendingDeps') else "✅ No"))
+            summary_layout.addRow("Git Clone:", QLabel("📦 Yes" if summary.get('hasGitClone') else "No"))
+            summary_layout.addRow("Pip Requirements:", QLabel("📋 Yes" if summary.get('hasRequirements') else "No"))
+            scroll_layout.addWidget(summary_group)
+            
+            scroll_layout.addStretch()
+            scroll.setWidget(scroll_content)
+            layout.addWidget(scroll)
+            
+            # Close button
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(review_dialog.accept)
+            layout.addWidget(close_btn)
+            
+            review_dialog.exec()
+
+        def _show_upload_dialog(self):
+            """Show dialog to upload a plugin."""
+            if not plugin_store_api.is_logged_in():
+                QMessageBox.warning(
+                    self,
+                    "Login Required",
+                    "You must be logged in to upload plugins.\n"
+                    "Click 'Login' to create an account or sign in."
+                )
+                return
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Upload Plugin to Store")
+            dialog.setMinimumWidth(600)
+            dialog.setMinimumHeight(800)
+            
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            
+            scroll_widget = QWidget()
+            layout = QVBoxLayout(scroll_widget)
+            
+            # Instructions
+            intro = QLabel(
+                "📤 <b>Upload Your Plugin to the Image Anarchy Store</b><br><br>"
+                "Package your plugin as a ZIP file containing:<br>"
+                "• <code>manifest.json</code> - Plugin metadata and configuration<br>"
+                "• Your main Python file with a <code>Plugin</code> class<br><br>"
+                "Your plugin will be reviewed before appearing in the store."
+            )
+            intro.setTextFormat(Qt.TextFormat.RichText)
+            intro.setWordWrap(True)
+            layout.addWidget(intro)
+            
+            # Manifest requirements info box
+            manifest_info = QFrame()
+            manifest_info.setStyleSheet("""
+                QFrame {
+                    background-color: #2a4a6a;
+                    border: 1px solid #4fc3f7;
+                    border-radius: 6px;
+                    padding: 10px;
+                }
+            """)
+            manifest_info_layout = QVBoxLayout(manifest_info)
+            manifest_label = QLabel(
+                "<b>📋 manifest.json Requirements</b><br><br>"
+                "<b>Required fields:</b> id, name, version, description, author<br><br>"
+                "<b>📦 Python Dependencies:</b> Add pip packages your plugin needs:<br>"
+                "<code style='background:#1a1a1a;padding:4px;'>"
+                '&nbsp;&nbsp;"requirements": ["package1", "package2>=1.0"]'
+                "</code><br><br>"
+                "<b>Example manifest.json:</b><br>"
+                "<code style='background:#1a1a1a;padding:4px;font-size:10px;'>"
+                '{<br>'
+                '&nbsp;&nbsp;"id": "my_plugin",<br>'
+                '&nbsp;&nbsp;"name": "My Plugin",<br>'
+                '&nbsp;&nbsp;"version": "1.0.0",<br>'
+                '&nbsp;&nbsp;"author": "Your Name",<br>'
+                '&nbsp;&nbsp;"description": "Short description",<br>'
+                '&nbsp;&nbsp;"icon": "🔧",<br>'
+                '&nbsp;&nbsp;"category": "tools",<br>'
+                '&nbsp;&nbsp;"requirements": ["requests", "pillow>=9.0"],<br>'
+                '&nbsp;&nbsp;"license_type": "free"<br>'
+                '}'
+                "</code>"
+            )
+            manifest_label.setTextFormat(Qt.TextFormat.RichText)
+            manifest_label.setWordWrap(True)
+            manifest_label.setStyleSheet("color: #e0e0e0; font-size: 11px;")
+            manifest_info_layout.addWidget(manifest_label)
+            layout.addWidget(manifest_info)
+            
+            layout.addSpacing(10)
+            
+            # Plugin file selector
+            file_group = QGroupBox("Plugin File")
+            file_group_layout = QVBoxLayout(file_group)
+            
+            file_layout = QHBoxLayout()
+            self._upload_file_path = QLineEdit()
+            self._upload_file_path.setReadOnly(True)
+            self._upload_file_path.setPlaceholderText("Select your plugin.zip file...")
+            file_layout.addWidget(self._upload_file_path)
+            
+            browse_btn = QPushButton("Browse...")
+            browse_btn.clicked.connect(lambda: self._browse_upload_file(dialog))
+            file_layout.addWidget(browse_btn)
+            file_group_layout.addLayout(file_layout)
+            
+            layout.addWidget(file_group)
+            
+            # Screenshots
+            screenshots_group = QGroupBox("Screenshots (Optional, up to 5)")
+            screenshots_layout = QVBoxLayout(screenshots_group)
+            
+            self._screenshot_list = QListWidget()
+            self._screenshot_list.setMaximumHeight(80)
+            screenshots_layout.addWidget(self._screenshot_list)
+            
+            ss_btn_layout = QHBoxLayout()
+            add_ss_btn = QPushButton("➕ Add Screenshot")
+            add_ss_btn.clicked.connect(lambda: self._add_screenshot(dialog))
+            ss_btn_layout.addWidget(add_ss_btn)
+            
+            remove_ss_btn = QPushButton("➖ Remove")
+            remove_ss_btn.clicked.connect(self._remove_screenshot)
+            ss_btn_layout.addWidget(remove_ss_btn)
+            ss_btn_layout.addStretch()
+            screenshots_layout.addLayout(ss_btn_layout)
+            
+            ss_note = QLabel("Screenshots help users understand your plugin. Max 5MB each, JPG/PNG/GIF/WebP.")
+            ss_note.setStyleSheet("color: #888; font-size: 11px;")
+            screenshots_layout.addWidget(ss_note)
+            
+            layout.addWidget(screenshots_group)
+            
+            # Manifest override fields (optional)
+            override_group = QGroupBox("Plugin Details (auto-filled from manifest.json)")
+            override_layout = QFormLayout(override_group)
+            
+            self._upload_name = QLineEdit()
+            self._upload_name.setPlaceholderText("Auto-filled from manifest")
+            override_layout.addRow("Name:", self._upload_name)
+            
+            self._upload_version = QLineEdit()
+            self._upload_version.setPlaceholderText("1.0.0")
+            override_layout.addRow("Version:", self._upload_version)
+            
+            self._upload_desc = QTextEdit()
+            self._upload_desc.setMaximumHeight(60)
+            self._upload_desc.setPlaceholderText("Brief description (plain text)...")
+            override_layout.addRow("Short Desc:", self._upload_desc)
+            
+            # Long description with HTML support
+            long_desc_label = QLabel("Long Description (HTML supported):")
+            override_layout.addRow(long_desc_label)
+            
+            self._upload_long_desc = QTextEdit()
+            self._upload_long_desc.setMaximumHeight(100)
+            self._upload_long_desc.setPlaceholderText(
+                "Detailed description of your plugin. You can use HTML tags like:\n"
+                "<b>bold</b>, <i>italic</i>, <ul><li>lists</li></ul>, <a href=''>links</a>, etc."
+            )
+            override_layout.addRow("", self._upload_long_desc)
+            
+            self._upload_category = QComboBox()
+            self._upload_category.addItems(["tools", "extraction", "modification", "adb", "fastboot", "utilities", "other"])
+            override_layout.addRow("Category:", self._upload_category)
+            
+            # Icon selector
+            icon_layout = QHBoxLayout()
+            
+            # Available icons organized by category
+            plugin_icons = [
+                # Tools & Utilities
+                "🔧", "⚙️", "🛠️", "🔩", "⚡", "🔌",
+                # Package & Plugin
+                "🧩", "📦", "📥", "📤", "💾", "🗃️",
+                # Android & Mobile
+                "📱", "🤖", "💻", "🖥️", "📟", "🔋",
+                # Files & Data
+                "📁", "📂", "🗂️", "📄", "📝", "🔍",
+                # Security & Development
+                "🔒", "🔓", "🔑", "🛡️", "🐛", "💡",
+                # Action & Status
+                "🚀", "✨", "🔥", "💫", "⭐", "🎯",
+                # Communication
+                "📡", "🌐", "🔗", "📶", "🔔", "💬",
+                # Creative
+                "🎨", "🎬", "🖼️", "📸", "🎵", "🎮"
+            ]
+            
+            self._upload_icon = QLineEdit()
+            self._upload_icon.setMaximumWidth(50)
+            self._upload_icon.setPlaceholderText("🔧")
+            self._upload_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._upload_icon.setStyleSheet("font-size: 20px;")
+            icon_layout.addWidget(self._upload_icon)
+            
+            # Icon picker button
+            icon_picker_btn = QPushButton("Choose Icon...")
+            icon_picker_btn.setMaximumWidth(100)
+            
+            def show_icon_picker():
+                icon_dialog = QDialog(dialog)
+                icon_dialog.setWindowTitle("Select Plugin Icon")
+                icon_dialog.setMinimumSize(520, 480)
+                icon_dlg_layout = QVBoxLayout(icon_dialog)
+                
+                icon_label = QLabel("Select an icon for your plugin:")
+                icon_label.setStyleSheet("font-weight: bold; font-size: 14px; margin-bottom: 10px;")
+                icon_dlg_layout.addWidget(icon_label)
+                
+                # Create grid of icons
+                icon_scroll = QScrollArea()
+                icon_scroll.setWidgetResizable(True)
+                icon_scroll.setFrameShape(QFrame.Shape.NoFrame)
+                
+                icon_grid_widget = QWidget()
+                icon_grid = QGridLayout(icon_grid_widget)
+                icon_grid.setSpacing(8)
+                
+                cols = 6
+                for i, icon in enumerate(plugin_icons):
+                    btn = QPushButton(icon)
+                    btn.setFixedSize(70, 70)
+                    btn.setStyleSheet("""
+                        QPushButton {
+                            font-size: 36px;
+                            border: 2px solid #444;
+                            border-radius: 8px;
+                            background-color: #2a2a2a;
+                        }
+                        QPushButton:hover {
+                            background-color: #3a3a3a;
+                            border-color: #4fc3f7;
+                        }
+                        QPushButton:pressed {
+                            background-color: #4fc3f7;
+                        }
+                    """)
+                    btn.clicked.connect(lambda checked, ic=icon: (
+                        self._upload_icon.setText(ic),
+                        icon_dialog.accept()
+                    ))
+                    icon_grid.addWidget(btn, i // cols, i % cols)
+                
+                icon_scroll.setWidget(icon_grid_widget)
+                icon_dlg_layout.addWidget(icon_scroll)
+                
+                # Custom icon input
+                custom_layout = QHBoxLayout()
+                custom_label = QLabel("Or enter custom emoji:")
+                custom_label.setStyleSheet("font-size: 13px;")
+                custom_layout.addWidget(custom_label)
+                custom_input = QLineEdit()
+                custom_input.setMaximumWidth(80)
+                custom_input.setPlaceholderText("🔧")
+                custom_input.setStyleSheet("font-size: 28px; padding: 4px;")
+                custom_layout.addWidget(custom_input)
+                custom_btn = QPushButton("Use")
+                custom_btn.setStyleSheet("padding: 8px 16px;")
+                custom_btn.clicked.connect(lambda: (
+                    self._upload_icon.setText(custom_input.text()) if custom_input.text() else None,
+                    icon_dialog.accept() if custom_input.text() else None
+                ))
+                custom_layout.addWidget(custom_btn)
+                custom_layout.addStretch()
+                icon_dlg_layout.addLayout(custom_layout)
+                
+                # Close button
+                close_btn = QPushButton("Cancel")
+                close_btn.setStyleSheet("padding: 8px 20px;")
+                close_btn.clicked.connect(icon_dialog.reject)
+                icon_dlg_layout.addWidget(close_btn)
+                
+                icon_dialog.exec()
+            
+            icon_picker_btn.clicked.connect(show_icon_picker)
+            icon_layout.addWidget(icon_picker_btn)
+            
+            icon_hint = QLabel("(Emoji displayed in plugin store)")
+            icon_hint.setStyleSheet("color: #888; font-size: 11px;")
+            icon_layout.addWidget(icon_hint)
+            icon_layout.addStretch()
+            
+            override_layout.addRow("Icon:", icon_layout)
+            
+            # License with coming soon labels
+            license_layout = QHBoxLayout()
+            self._upload_license = QComboBox()
+            self._upload_license.addItems(["free", "donation"])
+            license_layout.addWidget(self._upload_license)
+            
+            paid_label = QLabel("💰 Paid (coming soon)")
+            paid_label.setStyleSheet("color: #888; font-style: italic;")
+            license_layout.addWidget(paid_label)
+            license_layout.addStretch()
+            override_layout.addRow("License:", license_layout)
+            
+            # Price with coming soon
+            price_layout = QHBoxLayout()
+            self._upload_price = QDoubleSpinBox()
+            self._upload_price.setRange(0, 1000)
+            self._upload_price.setPrefix("$ ")
+            self._upload_price.setEnabled(False)
+            price_layout.addWidget(self._upload_price)
+            
+            price_soon = QLabel("(coming soon)")
+            price_soon.setStyleSheet("color: #888; font-style: italic;")
+            price_layout.addWidget(price_soon)
+            price_layout.addStretch()
+            override_layout.addRow("Price:", price_layout)
+            
+            layout.addWidget(override_group)
+            
+            # External Dependencies Section (Binaries)
+            deps_group = QGroupBox("🔧 External Dependencies (Optional)")
+            deps_layout = QVBoxLayout(deps_group)
+            
+            deps_info = QLabel(
+                "<b>If your plugin needs external binaries (like ADB, Fastboot, etc.):</b><br>"
+                "Add direct download URLs below. The server will download and package them with your plugin.<br>"
+                "<span style='color:#ff9800;'>⚠️ Only direct download URLs are accepted (not pages with download buttons)</span>"
+            )
+            deps_info.setTextFormat(Qt.TextFormat.RichText)
+            deps_info.setWordWrap(True)
+            deps_info.setStyleSheet("font-size: 11px; margin-bottom: 10px;")
+            deps_layout.addWidget(deps_info)
+            
+            # Dependencies list
+            self._ext_deps_list = QListWidget()
+            self._ext_deps_list.setMaximumHeight(120)
+            self._ext_deps_list.setStyleSheet("QListWidget::item { padding: 4px; }")
+            deps_layout.addWidget(self._ext_deps_list)
+            
+            # Add dependency form
+            add_dep_layout = QHBoxLayout()
+            
+            self._dep_name = QLineEdit()
+            self._dep_name.setPlaceholderText("Name (e.g., adb.exe)")
+            self._dep_name.setMaximumWidth(150)
+            add_dep_layout.addWidget(self._dep_name)
+            
+            self._dep_url = QLineEdit()
+            self._dep_url.setPlaceholderText("Direct download URL (https://...)")
+            add_dep_layout.addWidget(self._dep_url)
+            
+            self._dep_path = QLineEdit()
+            self._dep_path.setPlaceholderText("Target path (e.g., platform-tools/)")
+            self._dep_path.setMaximumWidth(150)
+            add_dep_layout.addWidget(self._dep_path)
+            
+            add_dep_btn = QPushButton("➕ Add")
+            add_dep_btn.clicked.connect(self._add_external_dep)
+            add_dep_layout.addWidget(add_dep_btn)
+            
+            deps_layout.addLayout(add_dep_layout)
+            
+            # Remove and Validate buttons
+            dep_btn_layout = QHBoxLayout()
+            
+            remove_dep_btn = QPushButton("➖ Remove Selected")
+            remove_dep_btn.clicked.connect(self._remove_external_dep)
+            dep_btn_layout.addWidget(remove_dep_btn)
+            
+            validate_deps_btn = QPushButton("🔍 Validate URLs")
+            validate_deps_btn.setToolTip("Check if all URLs are valid and downloadable")
+            validate_deps_btn.clicked.connect(self._validate_external_deps)
+            dep_btn_layout.addWidget(validate_deps_btn)
+            
+            dep_btn_layout.addStretch()
+            deps_layout.addLayout(dep_btn_layout)
+            
+            # Validation status
+            self._deps_status = QLabel("")
+            self._deps_status.setWordWrap(True)
+            self._deps_status.setStyleSheet("font-size: 11px;")
+            deps_layout.addWidget(self._deps_status)
+            
+            # Example
+            deps_example = QLabel(
+                "<b>Examples:</b><br>"
+                "• Name: <code>adb.exe</code> | URL: <code>https://dl.google.com/.../adb.exe</code> | Path: <code>platform-tools/</code><br>"
+                "• Name: <code>mtkclient.zip</code> | URL: <code>https://github.com/.../archive/refs/heads/main.zip</code> | Path: <code>./</code>"
+            )
+            deps_example.setTextFormat(Qt.TextFormat.RichText)
+            deps_example.setWordWrap(True)
+            deps_example.setStyleSheet("color: #888; font-size: 10px; background: #1a1a1a; padding: 8px; border-radius: 4px;")
+            deps_layout.addWidget(deps_example)
+            
+            layout.addWidget(deps_group)
+            
+            # Initialize external deps list
+            self._external_deps = []
+            
+            # Git Clone Section (for cloning repos at install time)
+            git_group = QGroupBox("📦 Git Repository Clone (Optional)")
+            git_layout = QVBoxLayout(git_group)
+            
+            git_info = QLabel(
+                "<b>Clone a Git repository when your plugin is installed:</b><br>"
+                "The repository will be cloned to a subfolder in your plugin directory.<br>"
+                "<span style='color:#4fc3f7;'>💡 Ideal for tools like mtkclient that need their own repo structure.</span><br>"
+                "<span style='color:#ff9800;'>⚠️ List ALL pip packages in manifest.json <code>requirements</code> field - not here!</span>"
+            )
+            git_info.setTextFormat(Qt.TextFormat.RichText)
+            git_info.setWordWrap(True)
+            git_info.setStyleSheet("font-size: 11px; margin-bottom: 10px;")
+            git_layout.addWidget(git_info)
+            
+            git_form = QFormLayout()
+            
+            self._git_repo_url = QLineEdit()
+            self._git_repo_url.setPlaceholderText("https://github.com/user/repo.git")
+            git_form.addRow("Repository URL:", self._git_repo_url)
+            
+            self._git_target_dir = QLineEdit()
+            self._git_target_dir.setPlaceholderText("e.g., mtkclient (subfolder in plugin dir)")
+            git_form.addRow("Target Directory:", self._git_target_dir)
+            
+            git_layout.addLayout(git_form)
+            
+            git_example = QLabel(
+                "<b>Example manifest.json with git_clone:</b><br>"
+                "<code style='font-size:10px;'>{<br>"
+                "&nbsp;&nbsp;\"requirements\": [\"pyusb\", \"pycryptodome\"],<br>"
+                "&nbsp;&nbsp;\"git_clone\": {<br>"
+                "&nbsp;&nbsp;&nbsp;&nbsp;\"repo\": \"https://github.com/bkerler/mtkclient.git\",<br>"
+                "&nbsp;&nbsp;&nbsp;&nbsp;\"target\": \"mtkclient\"<br>"
+                "&nbsp;&nbsp;}<br>"
+                "}</code>"
+            )
+            git_example.setTextFormat(Qt.TextFormat.RichText)
+            git_example.setWordWrap(True)
+            git_example.setStyleSheet("color: #888; font-size: 10px; background: #1a1a1a; padding: 8px; border-radius: 4px;")
+            git_layout.addWidget(git_example)
+            
+            layout.addWidget(git_group)
+            
+            # Setup Commands Section (commands to run after git clone and pip install)
+            setup_cmd_group = QGroupBox("⚡ Setup Commands (Optional)")
+            setup_cmd_layout = QVBoxLayout(setup_cmd_group)
+            
+            setup_cmd_info = QLabel(
+                "<b>Commands to run after git clone and pip install:</b><br>"
+                "These bash-compatible commands run in the plugin directory after dependencies are installed.<br>"
+                "<span style='color:#4fc3f7;'>💡 Useful for 'pip install .' to install cloned repos as packages.</span><br>"
+                "<span style='color:#ff9800;'>⚠️ All commands are reviewed before your plugin is approved.</span>"
+            )
+            setup_cmd_info.setTextFormat(Qt.TextFormat.RichText)
+            setup_cmd_info.setWordWrap(True)
+            setup_cmd_info.setStyleSheet("font-size: 11px; margin-bottom: 10px;")
+            setup_cmd_layout.addWidget(setup_cmd_info)
+            
+            self._setup_commands = QTextEdit()
+            self._setup_commands.setMaximumHeight(80)
+            self._setup_commands.setPlaceholderText(
+                "Enter one command per line, e.g.:\n"
+                "pip install .\n"
+                "python setup.py build"
+            )
+            setup_cmd_layout.addWidget(self._setup_commands)
+            
+            setup_cmd_example = QLabel(
+                "<b>Example manifest.json with setup_commands:</b><br>"
+                "<code style='font-size:10px;'>{<br>"
+                "&nbsp;&nbsp;\"git_clone\": {\"repo\": \"https://github.com/bkerler/mtkclient.git\", \"target\": \"mtkclient\"},<br>"
+                "&nbsp;&nbsp;\"setup_commands\": [\"pip install .\"]<br>"
+                "}</code>"
+            )
+            setup_cmd_example.setTextFormat(Qt.TextFormat.RichText)
+            setup_cmd_example.setWordWrap(True)
+            setup_cmd_example.setStyleSheet("color: #888; font-size: 10px; background: #1a1a1a; padding: 8px; border-radius: 4px;")
+            setup_cmd_layout.addWidget(setup_cmd_example)
+            
+            layout.addWidget(setup_cmd_group)
+            
+            # Legal Agreement Section
+            legal_group = QGroupBox("📜 Developer Agreement & License")
+            legal_layout = QVBoxLayout(legal_group)
+            
+            legal_text = QTextEdit()
+            legal_text.setReadOnly(True)
+            legal_text.setMaximumHeight(180)
+            legal_text.setStyleSheet("background-color: #1a1a1a; color: #ccc; font-size: 10px;")
+            legal_text.setHtml("""
+<p><b>IMAGE ANARCHY PLUGIN DEVELOPER AGREEMENT</b></p>
+<p><i>Last Updated: January 2026</i></p>
+
+<p>By submitting a plugin to the Image Anarchy Plugin Store ("Store"), you ("Developer") agree to the following terms and conditions:</p>
+
+<p><b>1. GRANT OF LICENSE</b><br>
+For all plugins submitted with a "free" or "donation" license type, Developer hereby grants to Image Anarchy ("IA"), its successors, and assigns, an irrevocable, perpetual, worldwide, royalty-free, non-exclusive license to use, reproduce, modify, distribute, publicly display, publicly perform, sublicense, and create derivative works from the submitted plugin. Upon submission, such plugins become the property of Image Anarchy.</p>
+
+<p><b>2. DISCLAIMER OF LIABILITY</b><br>
+THE PLUGIN STORE AND ALL PLUGINS ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IMAGE ANARCHY DISCLAIMS ALL LIABILITY FOR ANY DAMAGES, INCLUDING BUT NOT LIMITED TO DIRECT, INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, ARISING OUT OF OR RELATED TO THE USE OR INABILITY TO USE ANY PLUGIN, REGARDLESS OF WHETHER SUCH DAMAGES WERE FORESEEABLE OR WHETHER IMAGE ANARCHY WAS ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.</p>
+
+<p><b>3. INDEMNIFICATION</b><br>
+Developer agrees to indemnify, defend, and hold harmless Image Anarchy, its officers, directors, employees, agents, and affiliates from and against any and all claims, damages, obligations, losses, liabilities, costs, and expenses arising from: (a) Developer's plugin; (b) Developer's violation of any third-party rights; (c) Developer's violation of any applicable law or regulation.</p>
+
+<p><b>4. CONTENT RESPONSIBILITY</b><br>
+Developer is solely responsible for ensuring that submitted plugins do not infringe upon any intellectual property rights, contain malicious code, or violate any applicable laws. Image Anarchy reserves the right to remove any plugin at its sole discretion without notice.</p>
+
+<p><b>5. TAKEDOWN REQUESTS</b><br>
+Developers may submit takedown requests to: <b>requests@imageanarchy.com</b><br>
+Developer agrees to allow Image Anarchy a minimum of forty-eight (48) hours to process and act upon any takedown request. Paid plugins (when available) will include a self-service removal option.</p>
+
+<p><b>6. LIMITATION OF LIABILITY</b><br>
+IN NO EVENT SHALL IMAGE ANARCHY'S TOTAL LIABILITY TO DEVELOPER EXCEED ZERO DOLLARS ($0.00 USD). IMAGE ANARCHY SHALL NOT BE LIABLE FOR ANY LOST PROFITS, LOST DATA, OR ANY FORM OF CONSEQUENTIAL DAMAGES.</p>
+
+<p><b>7. GOVERNING LAW</b><br>
+This Agreement shall be governed by the laws applicable to software distribution platforms, without regard to conflict of law principles.</p>
+
+<p><b>8. ENTIRE AGREEMENT</b><br>
+This Agreement constitutes the entire agreement between Developer and Image Anarchy regarding plugin submissions and supersedes all prior agreements and understandings.</p>
+
+<p style="color:#ff9800;"><b>BY SIGNING BELOW, YOU ACKNOWLEDGE THAT YOU HAVE READ, UNDERSTOOD, AND AGREE TO BE BOUND BY ALL TERMS OF THIS AGREEMENT.</b></p>
+            """)
+            legal_layout.addWidget(legal_text)
+            
+            # Signature canvas
+            sig_label = QLabel("✍️ Sign below with your mouse or finger to agree:")
+            sig_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            legal_layout.addWidget(sig_label)
+            
+            # Signature widget (custom drawing canvas)
+            from PyQt6.QtGui import QPainterPath, QPainter, QPen, QColor
+            
+            class SignatureCanvas(QWidget):
+                def __init__(self, parent=None):
+                    super().__init__(parent)
+                    self.setMinimumSize(400, 80)
+                    self.setMaximumHeight(80)
+                    self.setStyleSheet("background-color: #f5f5f5; border: 2px solid #444; border-radius: 4px;")
+                    self.path = QPainterPath()
+                    self.last_point = None
+                    self.has_signature = False
+                
+                def clear(self):
+                    self.path = QPainterPath()
+                    self.last_point = None
+                    self.has_signature = False
+                    self.update()
+                
+                def paintEvent(self, event):
+                    painter = QPainter(self)
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    painter.fillRect(self.rect(), QColor("#f5f5f5"))
+                    
+                    if not self.has_signature:
+                        painter.setPen(QColor("#aaa"))
+                        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Sign here...")
+                    
+                    painter.setPen(QPen(QColor("#1a1a1a"), 2))
+                    painter.drawPath(self.path)
+                
+                def mousePressEvent(self, event):
+                    if event.button() == Qt.MouseButton.LeftButton:
+                        self.last_point = event.position()
+                        self.path.moveTo(self.last_point)
+                        self.has_signature = True
+                
+                def mouseMoveEvent(self, event):
+                    if event.buttons() & Qt.MouseButton.LeftButton and self.last_point:
+                        new_point = event.position()
+                        self.path.lineTo(new_point)
+                        self.last_point = new_point
+                        self.update()
+                
+                def mouseReleaseEvent(self, event):
+                    self.last_point = None
+            
+            self._signature_canvas = SignatureCanvas()
+            legal_layout.addWidget(self._signature_canvas)
+            
+            # Clear signature button
+            clear_sig_btn = QPushButton("🗑️ Clear Signature")
+            clear_sig_btn.setMaximumWidth(150)
+            clear_sig_btn.clicked.connect(self._signature_canvas.clear)
+            legal_layout.addWidget(clear_sig_btn)
+            
+            layout.addWidget(legal_group)
+            
+            # Security notice
+            security_notice = QLabel(
+                "🔒 <b>Security Notice:</b> All plugins are scanned for malware before acceptance. "
+                "Plugins containing executables (.exe, .dll) may take 1-2 minutes to upload while scanning completes."
+            )
+            security_notice.setWordWrap(True)
+            security_notice.setStyleSheet("color: #888; font-size: 11px; padding: 8px; background-color: rgba(33, 150, 243, 0.1); border-radius: 4px;")
+            layout.addWidget(security_notice)
+            
+            # Status
+            self._upload_status = QLabel("")
+            self._upload_status.setWordWrap(True)
+            layout.addWidget(self._upload_status)
+            
+            layout.addStretch()
+            
+            scroll.setWidget(scroll_widget)
+            
+            dialog_layout = QVBoxLayout(dialog)
+            dialog_layout.addWidget(scroll)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(cancel_btn)
+            
+            upload_btn = QPushButton("📤 Upload Plugin")
+            upload_btn.setObjectName("upload_btn")  # Set object name for finding later
+            upload_btn.setStyleSheet("background-color: #4CAF50; padding: 8px 20px;")
+            upload_btn.clicked.connect(lambda: self._do_upload(dialog))
+            btn_layout.addWidget(upload_btn)
+            
+            dialog_layout.addLayout(btn_layout)
+            
+            # Initialize screenshot list
+            self._screenshot_paths = []
+            
+            dialog.exec()
+        
+        def _add_external_dep(self):
+            """Add an external dependency to the list."""
+            name = self._dep_name.text().strip()
+            url = self._dep_url.text().strip()
+            target_path = self._dep_path.text().strip() or "./"
+            
+            if not name:
+                self._deps_status.setText("⚠️ Please enter a dependency name")
+                self._deps_status.setStyleSheet("color: #f44336;")
+                return
+            
+            if not url:
+                self._deps_status.setText("⚠️ Please enter a download URL")
+                self._deps_status.setStyleSheet("color: #f44336;")
+                return
+            
+            if not url.startswith(("http://", "https://")):
+                self._deps_status.setText("⚠️ URL must start with http:// or https://")
+                self._deps_status.setStyleSheet("color: #f44336;")
+                return
+            
+            # Add to list
+            dep = {"name": name, "url": url, "path": target_path, "validated": False}
+            self._external_deps.append(dep)
+            
+            item_text = f"📦 {name} → {target_path} | {url[:60]}..."
+            self._ext_deps_list.addItem(item_text)
+            
+            # Clear inputs
+            self._dep_name.clear()
+            self._dep_url.clear()
+            self._dep_path.clear()
+            
+            self._deps_status.setText(f"✓ Added {name}")
+            self._deps_status.setStyleSheet("color: #4CAF50;")
+        
+        def _remove_external_dep(self):
+            """Remove selected external dependency."""
+            current = self._ext_deps_list.currentRow()
+            if current >= 0:
+                self._ext_deps_list.takeItem(current)
+                removed = self._external_deps.pop(current)
+                self._deps_status.setText(f"Removed {removed['name']}")
+                self._deps_status.setStyleSheet("color: #888;")
+        
+        def _validate_external_deps(self):
+            """Validate all external dependency URLs."""
+            if not self._external_deps:
+                self._deps_status.setText("No dependencies to validate")
+                self._deps_status.setStyleSheet("color: #888;")
+                return
+            
+            self._deps_status.setText("🔄 Validating URLs...")
+            self._deps_status.setStyleSheet("color: #4fc3f7;")
+            QApplication.processEvents()
+            
+            import urllib.request
+            import urllib.error
+            
+            valid_count = 0
+            errors = []
+            
+            for i, dep in enumerate(self._external_deps):
+                try:
+                    # HEAD request to check if URL is valid and downloadable
+                    req = urllib.request.Request(dep['url'], method='HEAD')
+                    req.add_header('User-Agent', 'ImageAnarchy/1.1')
+                    
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        status = response.getcode()
+                        content_type = response.headers.get('Content-Type', '')
+                        content_length = response.headers.get('Content-Length', 'unknown')
+                        
+                        if status == 200:
+                            dep['validated'] = True
+                            dep['size'] = content_length
+                            valid_count += 1
+                            
+                            # Update list item with checkmark
+                            item = self._ext_deps_list.item(i)
+                            if item:
+                                size_str = f" ({int(content_length) // 1024 // 1024}MB)" if content_length != 'unknown' else ""
+                                item.setText(f"✅ {dep['name']} → {dep['path']}{size_str}")
+                        else:
+                            dep['validated'] = False
+                            errors.append(f"{dep['name']}: HTTP {status}")
+                            
+                            item = self._ext_deps_list.item(i)
+                            if item:
+                                item.setText(f"❌ {dep['name']} - HTTP {status}")
+                                
+                except urllib.error.HTTPError as e:
+                    dep['validated'] = False
+                    errors.append(f"{dep['name']}: HTTP {e.code}")
+                    item = self._ext_deps_list.item(i)
+                    if item:
+                        item.setText(f"❌ {dep['name']} - HTTP {e.code}")
+                        
+                except urllib.error.URLError as e:
+                    dep['validated'] = False
+                    errors.append(f"{dep['name']}: {str(e.reason)}")
+                    item = self._ext_deps_list.item(i)
+                    if item:
+                        item.setText(f"❌ {dep['name']} - Connection failed")
+                        
+                except Exception as e:
+                    dep['validated'] = False
+                    errors.append(f"{dep['name']}: {str(e)}")
+                    item = self._ext_deps_list.item(i)
+                    if item:
+                        item.setText(f"❌ {dep['name']} - Error")
+                
+                QApplication.processEvents()
+            
+            if valid_count == len(self._external_deps):
+                self._deps_status.setText(f"✅ All {valid_count} URLs validated successfully!")
+                self._deps_status.setStyleSheet("color: #4CAF50;")
+            else:
+                self._deps_status.setText(f"⚠️ {valid_count}/{len(self._external_deps)} valid. Errors: {'; '.join(errors)}")
+                self._deps_status.setStyleSheet("color: #f44336;")
+        
+        def _add_screenshot(self, dialog):
+            """Add a screenshot to the upload with image validation."""
+            if len(self._screenshot_paths) >= 5:
+                QMessageBox.warning(dialog, "Limit Reached", "Maximum 5 screenshots allowed.")
+                return
+            
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog,
+                "Select Screenshot",
+                "",
+                "All Files (*.*)"
+            )
+            
+            if file_path:
+                # Validate that it's actually an image using magic bytes
+                def is_valid_image(filepath):
+                    """Check if file is a valid image using magic bytes, not extension."""
+                    try:
+                        with open(filepath, 'rb') as f:
+                            header = f.read(32)
+                        
+                        # JPEG magic bytes
+                        if header[:3] == b'\xff\xd8\xff':
+                            return True, "JPEG"
+                        # PNG magic bytes
+                        if header[:8] == b'\x89PNG\r\n\x1a\n':
+                            return True, "PNG"
+                        # GIF magic bytes
+                        if header[:6] in (b'GIF87a', b'GIF89a'):
+                            return True, "GIF"
+                        # WebP magic bytes (RIFF....WEBP)
+                        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+                            return True, "WebP"
+                        # BMP magic bytes
+                        if header[:2] == b'BM':
+                            return True, "BMP"
+                        
+                        return False, None
+                    except Exception:
+                        return False, None
+                
+                is_image, img_type = is_valid_image(file_path)
+                
+                if not is_image:
+                    QMessageBox.warning(
+                        dialog, 
+                        "Invalid Image",
+                        "The selected file is not a valid image.\n\n"
+                        "Supported formats: JPEG, PNG, GIF, WebP, BMP\n\n"
+                        "Note: Files are validated by their content, not extension."
+                    )
+                    return
+                
+                # Check file size (max 5MB)
+                file_size = os.path.getsize(file_path)
+                if file_size > 5 * 1024 * 1024:
+                    QMessageBox.warning(
+                        dialog,
+                        "File Too Large",
+                        f"Screenshot is too large ({file_size / 1024 / 1024:.1f}MB).\n\n"
+                        "Maximum size: 5MB"
+                    )
+                    return
+                
+                self._screenshot_paths.append(file_path)
+                self._screenshot_list.addItem(f"{os.path.basename(file_path)} ({img_type})")
+        
+        def _remove_screenshot(self):
+            """Remove selected screenshot."""
+            current = self._screenshot_list.currentRow()
+            if current >= 0:
+                self._screenshot_list.takeItem(current)
+                self._screenshot_paths.pop(current)
+        
+        def _browse_upload_file(self, dialog):
+            """Browse for plugin zip file."""
+            file_path, _ = QFileDialog.getOpenFileName(
+                dialog,
+                "Select Plugin ZIP",
+                "",
+                "ZIP Files (*.zip)"
+            )
+            
+            if file_path:
+                self._upload_file_path.setText(file_path)
+                
+                # Try to read manifest from zip
+                try:
+                    import zipfile
+                    with zipfile.ZipFile(file_path, 'r') as zf:
+                        # Find manifest.json
+                        for name in zf.namelist():
+                            if name.endswith('manifest.json'):
+                                with zf.open(name) as mf:
+                                    manifest = json.load(mf)
+                                    self._upload_name.setText(manifest.get('name', ''))
+                                    self._upload_version.setText(manifest.get('version', '1.0'))
+                                    self._upload_desc.setPlainText(manifest.get('description', ''))
+                                    
+                                    # Long description
+                                    if manifest.get('long_description'):
+                                        self._upload_long_desc.setPlainText(manifest.get('long_description', ''))
+                                    
+                                    # Set category
+                                    cat = manifest.get('category', 'tools')
+                                    idx = self._upload_category.findText(cat, Qt.MatchFlag.MatchFixedString)
+                                    if idx >= 0:
+                                        self._upload_category.setCurrentIndex(idx)
+                                    
+                                    # Set icon
+                                    icon = manifest.get('icon', '🔧')
+                                    self._upload_icon.setText(icon)
+                                    
+                                    # Set license
+                                    lic = manifest.get('license_type', 'free')
+                                    idx = self._upload_license.findText(lic, Qt.MatchFlag.MatchFixedString)
+                                    if idx >= 0:
+                                        self._upload_license.setCurrentIndex(idx)
+                                    
+                                    self._upload_price.setValue(manifest.get('price', 0))
+                                    
+                                    # Set git_clone if present
+                                    git_clone = manifest.get('git_clone', {})
+                                    if git_clone:
+                                        self._git_repo_url.setText(git_clone.get('repo', ''))
+                                        self._git_target_dir.setText(git_clone.get('target', ''))
+                                    
+                                    # Set setup_commands if present
+                                    setup_commands = manifest.get('setup_commands', [])
+                                    if setup_commands and isinstance(setup_commands, list):
+                                        self._setup_commands.setPlainText('\n'.join(setup_commands))
+                                    
+                                    # Show requirements info in status
+                                    reqs = manifest.get('requirements', [])
+                                    status_parts = ["✓ Manifest loaded from ZIP"]
+                                    if reqs:
+                                        status_parts.append(f"📦 {len(reqs)} pip packages")
+                                    if git_clone:
+                                        status_parts.append(f"📥 Git clone: {git_clone.get('target', 'repo')}")
+                                    if setup_commands:
+                                        status_parts.append(f"⚡ {len(setup_commands)} setup command(s)")
+                                    
+                                    self._upload_status.setText(" | ".join(status_parts))
+                                    self._upload_status.setStyleSheet("color: #4CAF50;")
+                                break
+                except Exception as e:
+                    self._upload_status.setText(f"Could not read manifest: {str(e)}")
+                    self._upload_status.setStyleSheet("color: #ff9800;")
+        
+        def _do_upload(self, dialog):
+            """Perform the plugin upload."""
+            # Check signature first
+            if not hasattr(self, '_signature_canvas') or not self._signature_canvas.has_signature:
+                self._upload_status.setText("⚠️ Please sign the Developer Agreement to continue")
+                self._upload_status.setStyleSheet("color: #f44336;")
+                return
+            
+            file_path = self._upload_file_path.text()
+            
+            if not file_path or not os.path.exists(file_path):
+                self._upload_status.setText("Please select a plugin ZIP file")
+                self._upload_status.setStyleSheet("color: #f44336;")
+                return
+            
+            name = self._upload_name.text().strip()
+            if not name:
+                self._upload_status.setText("Please enter a plugin name")
+                self._upload_status.setStyleSheet("color: #f44336;")
+                return
+            
+            # Check if external deps are validated (if any exist)
+            external_deps = getattr(self, '_external_deps', [])
+            if external_deps:
+                unvalidated = [d for d in external_deps if not d.get('validated', False)]
+                if unvalidated:
+                    self._upload_status.setText("⚠️ Please validate all external dependency URLs first")
+                    self._upload_status.setStyleSheet("color: #f44336;")
+                    return
+            
+            # Build manifest data
+            manifest = {
+                'name': name,
+                'version': self._upload_version.text().strip() or '1.0.0',
+                'description': self._upload_desc.toPlainText().strip(),
+                'long_description': self._upload_long_desc.toPlainText().strip(),
+                'category': self._upload_category.currentText(),
+                'icon': self._upload_icon.text().strip() or '🔧',
+                'license_type': self._upload_license.currentText(),
+                'price': 0,  # Paid plugins coming soon
+                'external_dependencies': external_deps  # Include validated dependencies
+            }
+            
+            # Add git_clone if specified
+            git_repo = self._git_repo_url.text().strip()
+            if git_repo:
+                git_clone_data = {
+                    'repo': git_repo,
+                    'target': self._git_target_dir.text().strip() or None
+                }
+                manifest['git_clone'] = git_clone_data
+            
+            # Show detailed upload progress message
+            self._upload_status.setText("📤 Uploading plugin...\n🔒 Security scanning in progress (may take 1-2 minutes for plugins with binaries)")
+            self._upload_status.setStyleSheet("color: #2196F3;")
+            
+            # Disable upload button during process
+            upload_btn = dialog.findChild(QPushButton, "upload_btn")
+            if upload_btn:
+                upload_btn.setEnabled(False)
+                upload_btn.setText("⏳ Scanning...")
+            
+            # Get screenshot paths
+            screenshots = getattr(self, '_screenshot_paths', [])
+            
+            # Run upload in background thread to prevent UI freeze
+            self._upload_thread = PluginUploadThread(plugin_store_api, manifest, file_path, screenshots)
+            self._upload_dialog = dialog  # Store reference for callback
+            self._upload_name_text = name  # Store for success message
+            
+            def on_upload_progress(msg):
+                self._upload_status.setText(msg + "\n🔒 Security scanning in progress...")
+            
+            def on_upload_finished(result):
+                # Re-enable upload button
+                if upload_btn:
+                    upload_btn.setEnabled(True)
+                    upload_btn.setText("📤 Upload Plugin")
+                
+                if 'error' in result:
+                    # Check for re-login needed
+                    if result.get('code') == 'USER_NOT_FOUND':
+                        self._upload_status.setText("❌ Session expired. Please log out and log in again.")
+                    else:
+                        self._upload_status.setText(f"❌ Upload failed: {result['error']}")
+                    self._upload_status.setStyleSheet("color: #f44336;")
+                else:
+                    self._upload_dialog.accept()
+                    ss_count = result.get('screenshots', 0)
+                    deps_count = result.get('external_deps', 0)
+                    
+                    deps_msg = f"\nExternal Dependencies: {deps_count} (will be downloaded during review)\n" if deps_count else ""
+                    
+                    QMessageBox.information(
+                        self,
+                        "Plugin Submitted",
+                        f"Your plugin '{self._upload_name_text}' has been submitted!\n\n"
+                        f"Screenshots: {ss_count}{deps_msg}\n"
+                        "It will be reviewed by an admin before appearing in the store.\n"
+                        "External dependencies will be downloaded and validated during review.\n\n"
+                        "You'll receive an email when it's approved.\n\n"
+                        "📜 By signing, you agreed to the Developer Agreement.\n"
+                        "Free plugins become property of Image Anarchy.\n"
+                        "Takedown requests: requests@imageanarchy.com (48hr response)"
+                    )
+            
+            self._upload_thread.progress.connect(on_upload_progress)
+            self._upload_thread.finished.connect(on_upload_finished)
+            self._upload_thread.start()
+
+    return QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab, PreReadyChecklistDialog
 
 
 # =============================================================================
@@ -11064,7 +16815,7 @@ Examples:
     else:
         # GUI mode
         try:
-            QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab = create_gui_app()
+            QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab, PreReadyChecklistDialog = create_gui_app()
         except ImportError:
             print("PyQt6 is required for GUI mode. Install with: pip install PyQt6")
             print("Or use CLI mode: python image_anarchy.py --cli payload.bin")
@@ -11086,6 +16837,10 @@ Examples:
         palette.setColor(QPalette.ColorRole.Highlight, QColor(38, 79, 120))
         palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
         app.setPalette(palette)
+        
+        # Show Pre-Ready Checklist splash screen
+        splash = PreReadyChecklistDialog()
+        splash.exec()
         
         window = ImageAnarchyGUI()
         
