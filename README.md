@@ -48,11 +48,11 @@
 - **Driver Pack** - Common USB drivers bundled for Windows
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/plugin_store.png?raw=true" alt="Plugin Store" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/plugin_store.png?raw=true" alt="Plugin Store" width="700">
 </p>
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/upload.png?raw=true" alt="Plugin Upload" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/upload.png?raw=true" alt="Plugin Upload" width="700">
 </p>
 
 ---
@@ -124,13 +124,13 @@ Complete Android Debug Bridge management with 7 specialized tabs:
 | **🔄 Reboot** | System, recovery, bootloader, fastboot, EDL modes |
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb/adbpull.png?raw=true" alt="ADB Partition Pull" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adbpull.png?raw=true" alt="ADB Partition Pull" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb/apps.png?raw=true" alt="ADB Apps" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/apps.png?raw=true" alt="ADB Apps" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb/shell.png?raw=true" alt="ADB Shell" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/shell.png?raw=true" alt="ADB Shell" width="700">
 </p>
 
 ### Fastboot Toolkit  
@@ -148,19 +148,19 @@ Complete bootloader operations with 8 specialized tabs:
 | **🔄 Reboot** | Bootloader, recovery, system, EDL modes |
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot1.png?raw=true" alt="Fastboot Info" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot1.png?raw=true" alt="Fastboot Info" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot2.png?raw=true" alt="Fastboot Flash" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot2.png?raw=true" alt="Fastboot Flash" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot3.png?raw=true" alt="Fastboot Boot" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot3.png?raw=true" alt="Fastboot Boot" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot4.png?raw=true" alt="Fastboot OEM" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot4.png?raw=true" alt="Fastboot OEM" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot5.png?raw=true" alt="Fastboot Slot" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot5.png?raw=true" alt="Fastboot Slot" width="700">
 </p>
 
 ### MTK Toolkit
@@ -175,19 +175,19 @@ MediaTek device support with advanced operations:
 | **📊 Device Info** | Hardware ID, chip info, EMMC/UFS details |
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk1.png?raw=true" alt="MTK Connect" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk1.png?raw=true" alt="MTK Connect" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk2.png?raw=true" alt="MTK Read" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk2.png?raw=true" alt="MTK Read" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk3.png?raw=true" alt="MTK Write" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk3.png?raw=true" alt="MTK Write" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk4.png?raw=true" alt="MTK Erase" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk4.png?raw=true" alt="MTK Erase" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk5.png?raw=true" alt="MTK Tools" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk5.png?raw=true" alt="MTK Tools" width="700">
 </p>
 
 ### Plugin Developer Guide
@@ -524,3 +524,4 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
