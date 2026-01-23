@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-1.1-blue" alt="Version">
+  <img src="https://img.shields.io/badge/Version-2.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
@@ -28,25 +28,31 @@
 
 ---
 
-## 🆕 What's New in v1.1
+## 🆕 What's New in v2.0
 
-### 🔌 Plugin System
-- **Extensible Architecture** - Add new features without modifying core code
-- **Monetization Support** - Plugins can be free, paid, or donation-based
-- **Auto-Dependency Install** - Plugins can specify pip requirements that auto-install
-- **Hot-Reload Ready** - Discover new plugins without restarting
+### 🛒 Online Plugin Store
+- **Browse & Download** - Discover plugins directly from the app
+- **One-Click Install** - Download, extract, and activate plugins instantly
+- **Plugin Ratings & Reviews** - See what the community thinks
+- **Version Management** - Check for updates to installed plugins
+- **Featured Plugins** - Curated selection of the best tools
+
+### 🔌 Premium Plugins Available
+- **ADB Toolkit** - Complete Android Debug Bridge management (7 tools)
+- **Fastboot Toolkit** - Comprehensive bootloader operations (8 tools + vbmeta patching)
+- **MTK Toolkit** - MediaTek device support with BROM exploit
 
 ### 📦 Bundled Platform Tools
 - **ADB & Fastboot Included** - No need to install Android SDK separately
 - **Zero Configuration** - Works out of the box
-
-### 🛠️ New Plugins Included
-- **ADB Toolkit** - Comprehensive device management (7 tools)
-- **Fastboot Toolkit** - Complete bootloader operations (8 tools)
-- **Plugin Developer Guide** - Tutorial for creating your own plugins
+- **Driver Pack** - Common USB drivers bundled for Windows
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/plugin.png?raw=true" alt="Plugin System" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/plugin_store.png?raw=true" alt="Plugin Store" width="700">
+</p>
+
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/upload.png?raw=true" alt="Plugin Upload" width="700">
 </p>
 
 ---
@@ -102,7 +108,7 @@
 
 ---
 
-## 🔌 Included Plugins
+## 🔌 Available Plugins (from Store)
 
 ### ADB Toolkit
 Complete Android Debug Bridge management with 7 specialized tabs:
@@ -118,7 +124,13 @@ Complete Android Debug Bridge management with 7 specialized tabs:
 | **🔄 Reboot** | System, recovery, bootloader, fastboot, EDL modes |
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb.png?raw=true" alt="ADB Toolkit" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb/adbpull.png?raw=true" alt="ADB Partition Pull" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb/apps.png?raw=true" alt="ADB Apps" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/adb/shell.png?raw=true" alt="ADB Shell" width="700">
 </p>
 
 ### Fastboot Toolkit  
@@ -136,7 +148,46 @@ Complete bootloader operations with 8 specialized tabs:
 | **🔄 Reboot** | Bootloader, recovery, system, EDL modes |
 
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot.png?raw=true" alt="Fastboot Toolkit" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot1.png?raw=true" alt="Fastboot Info" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot2.png?raw=true" alt="Fastboot Flash" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot3.png?raw=true" alt="Fastboot Boot" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot4.png?raw=true" alt="Fastboot OEM" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot/fastboot5.png?raw=true" alt="Fastboot Slot" width="700">
+</p>
+
+### MTK Toolkit
+MediaTek device support with advanced operations:
+
+| Feature | Description |
+|---------|-------------|
+| **🔌 BROM Mode** | Connect to devices in BROM/Preloader mode |
+| **📥 Read Partitions** | Dump partitions via BROM exploit |
+| **⚡ Write Partitions** | Flash images to MediaTek devices |
+| **🔐 Bypass Auth** | DA authentication bypass for secured devices |
+| **📊 Device Info** | Hardware ID, chip info, EMMC/UFS details |
+
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk1.png?raw=true" alt="MTK Connect" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk2.png?raw=true" alt="MTK Read" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk3.png?raw=true" alt="MTK Write" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk4.png?raw=true" alt="MTK Erase" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk/mtk5.png?raw=true" alt="MTK Tools" width="700">
 </p>
 
 ### Plugin Developer Guide
