@@ -371,7 +371,7 @@ plugins/
     └── plugin.py        # Plugin code
 ```
 
-### manifest.json
+### manifest.json - Complete Reference
 ```json
 {
     "id": "my-plugin",
@@ -379,17 +379,111 @@ plugins/
     "version": "1.0.0",
     "description": "What my plugin does",
     "author": "Your Name",
-    "min_app_version": "1.1",
+    "icon": "🔧",
+    "min_app_version": "2.0",
     "license_type": "free",
-    "requirements": ["requests", "pillow"]
+    "website": "https://example.com",
+    "support_url": "https://example.com/support",
+    "enabled": true,
+    
+    "requirements": [
+        "requests",
+        "pillow"
+    ],
+    
+    "git_clone": {
+        "repo": "https://github.com/user/repo.git",
+        "target": "repo_folder_name"
+    },
+    
+    "setup_commands": [
+        "pip install ."
+    ],
+    
+    "bundled_binaries": [
+        "https://example.com/tool.exe",
+        {
+            "url": "https://example.com/file.zip",
+            "target_path": "tools/file.zip",
+            "sha256": "abc123..."
+        }
+    ],
+    
+    "post_install": [
+        {"type": "driver", "file": "driver.msi"},
+        {"type": "command", "cmd": ["setup.exe", "/silent"]}
+    ]
 }
 ```
+
+### Manifest Fields Reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique plugin identifier (folder name) |
+| `name` | string | Display name shown in UI |
+| `version` | string | Plugin version (semver recommended) |
+| `description` | string | Short description |
+| `author` | string | Developer name |
+| `icon` | string | Emoji icon for UI |
+| `license_type` | string | `free`, `donation`, or `paid` |
+| `min_app_version` | string | Minimum Image Anarchy version required |
+| `enabled` | bool | Whether plugin is active |
+| `website` | string | Plugin homepage URL |
+| `support_url` | string | Support/docs URL |
+| `requirements` | array | Pip packages to install |
+| `git_clone` | object | Repository to clone (see below) |
+| `setup_commands` | array | Commands to run after clone |
+| `bundled_binaries` | array | Files/URLs to download |
+| `post_install` | array | Final setup steps (drivers, etc.) |
+
+### Dependency Installation Flow
+
+When a plugin is installed, dependencies are set up in this order:
+
+1. **Git Clone** (`git_clone`) - Clone repository to plugin directory
+2. **Download Binaries** (`bundled_binaries`) - Download any required files
+3. **Pip Packages** (`requirements`) - Install Python dependencies
+4. **Setup Commands** (`setup_commands`) - Run in cloned repo directory
+5. **Post Install** (`post_install`) - Final steps like driver installation
+
+### git_clone Object
+```json
+{
+    "repo": "https://github.com/user/repo.git",
+    "target": "local_folder_name"
+}
+```
+- `repo`: Git repository URL
+- `target`: Folder name within plugin directory to clone into
+
+### setup_commands Array
+```json
+["pip install .", "python setup.py build"]
+```
+- Commands run **inside the git_clone target directory**
+- Use `pip install .` to install a cloned Python package
+- Supports any shell command
+
+### bundled_binaries Array
+```json
+[
+    "https://example.com/simple.exe",
+    {
+        "url": "https://example.com/tool.zip",
+        "target_path": "tools/tool.zip",
+        "sha256": "checksum_for_verification"
+    }
+]
+```
+- Simple string: URL downloaded to plugin root
+- Object: Allows custom path and optional SHA256 verification
 
 ### License Types
 | Type | Description |
 |------|-------------|
 | `free` | Completely free to use |
-| `donation` | Free with donation option |
+| `donation` | Free with optional donation |
 | `paid` | Requires purchase |
 
 ### plugin.py Template
@@ -407,6 +501,41 @@ class Plugin(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Hello from my plugin!"))
 ```
+
+### Example: Plugin with Git Clone
+
+For plugins that wrap existing Python libraries:
+
+```json
+{
+    "id": "mtk_toolkit",
+    "name": "MTK Toolkit",
+    "version": "1.0",
+    "description": "MediaTek device toolkit",
+    "author": "Image Anarchy",
+    "icon": "📱",
+    "license_type": "free",
+    
+    "requirements": [
+        "pyusb", "pycryptodome", "colorama", "pyserial"
+    ],
+    
+    "git_clone": {
+        "repo": "https://github.com/bkerler/mtkclient.git",
+        "target": "mtkclient"
+    },
+    
+    "setup_commands": [
+        "pip install ."
+    ]
+}
+```
+
+**Flow:**
+1. Clone mtkclient repo → `plugins/mtk_toolkit/mtkclient/`
+2. Install pip requirements
+3. Run `pip install .` inside the cloned repo
+4. Plugin ready to use!
 
 See the **Plugin Developer Guide** in the Plugins tab for a complete tutorial!
 
@@ -435,6 +564,20 @@ The entire application is contained in a single Python file with embedded protob
 ---
 
 ## 📜 Changelog
+
+### v2.0 - Plugin Store & Advanced Dependencies
+- ✨ **New:** Online Plugin Store with browse, install, ratings & reviews
+- ✨ **New:** One-click plugin installation with automatic dependency setup
+- ✨ **New:** Git clone support for plugins (`git_clone` manifest field)
+- ✨ **New:** Setup commands for complex installations (`setup_commands` field)
+- ✨ **New:** Bundled binary downloads (`bundled_binaries` field)
+- ✨ **New:** Post-install actions for drivers & commands (`post_install` field)
+- ✨ **New:** MTK Toolkit plugin with BROM exploit support
+- ✨ **New:** System tray with minimize-to-tray functionality
+- ✨ **New:** 4-phase plugin setup progress with clear "Step X/N" display
+- 🔧 **Improved:** Plugin dependencies work in frozen exe (PyInstaller)
+- 🔧 **Improved:** Better plugin manifest validation
+- 🔧 **Improved:** Proper application quit from system tray
 
 ### v1.1 - Plugin System Release
 - ✨ **New:** Extensible plugin system with folder-based discovery
@@ -524,4 +667,5 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
