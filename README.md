@@ -79,6 +79,7 @@
 | **ELF/Bootloader** | Analyze XBL, TZ, firmware |
 
 ### 🔨 Image Repacking
+- **Super Partitions** Re-pack Super Partitions
 - **Boot/Recovery images** (v0, v1, v2, v3, v4) - custom kernel/ramdisk
 - **Vendor boot images** (v3, v4)
 - **Sparse images** from raw (for faster flashing)
@@ -105,6 +106,7 @@
 - **Non-blocking** threaded operations
 - Real-time progress and logging
 - CLI mode for scripting/automation
+- SystemTray for fast access or close
 
 ---
 
@@ -667,5 +669,6 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
