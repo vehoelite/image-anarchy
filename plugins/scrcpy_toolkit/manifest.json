@@ -1,0 +1,28 @@
+{
+    "id": "scrcpy_toolkit",
+    "name": "Scrcpy Toolkit",
+    "version": "2.0.0",
+    "description": "Mirror your Android device screen using scrcpy executable. Features screen mirroring, screenshot capture, and screen recording. Requires ADB Toolkit plugin.",
+    "author": "Image Anarchy Team",
+    "icon": "📺",
+    "license_type": "free",
+    "website": "https://github.com/vehoelite/image-anarchy",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "2.0",
+    "requirements": [],
+    "bundled_binaries": [
+        "https://imageanarchy.com/scrcpy.exe",
+        "https://imageanarchy.com/scrcpy-server",
+        "https://imageanarchy.com/adb.exe",
+        "https://imageanarchy.com/AdbWinApi.dll",
+        "https://imageanarchy.com/AdbWinUsbApi.dll",
+        "https://imageanarchy.com/avcodec-61.dll",
+        "https://imageanarchy.com/avformat-61.dll",
+        "https://imageanarchy.com/avutil-59.dll",
+        "https://imageanarchy.com/libusb-1.0.dll",
+        "https://imageanarchy.com/SDL2.dll",
+        "https://imageanarchy.com/swresample-5.dll"
+    ],
+    "dependencies": [],
+    "enabled": true
+}
