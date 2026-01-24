@@ -12,7 +12,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/Version-2.1-red" alt="Version">
+  <img src="https://img.shields.io/badge/HOT-Update-orange" alt="HOT">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
@@ -28,7 +29,33 @@
 
 ---
 
-## 🆕 What's New in v2.0
+## 🔥 What's New in v2.1 - HOT UPDATE
+
+### 🗂️ EROFS Support (Android 13+)
+- **Full EROFS Extraction** - Extract files from Enhanced Read-Only File System images
+- **EROFS Repacking** - Create EROFS images from directories with LZ4/LZMA compression
+- **Superblock Analysis** - View block size, inode count, UUID, compression algorithms
+- **Modern Android Support** - Works with system/vendor/product partitions from Android 13+
+- **Compression Options** - LZ4 (fast), LZ4HC (balanced), LZMA (best compression)
+
+### 📺 NEW: Scrcpy Toolkit Plugin
+- **Live Screen Mirroring** - Mirror your Android screen in real-time
+- **Screenshot Capture** - Take high-quality screenshots with one click
+- **Screen Recording** - Record device screen with audio support
+- **WiFi Mirroring** - Connect wirelessly after initial USB setup
+- **Multiple Quality Options** - Adjust bitrate, resolution, and framerate
+- **Always-On-Top Window** - Keep mirror visible while working
+- **Zero Dependencies** - Uses bundled scrcpy executable
+
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy1.png?raw=true" alt="Scrcpy Mirror" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy2.png?raw=true" alt="Scrcpy Screenshot" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy3.png?raw=true" alt="Scrcpy Recording" width="700">
+</p>
 
 ### 🛒 Online Plugin Store
 - **Browse & Download** - Discover plugins directly from the app
@@ -38,9 +65,10 @@
 - **Featured Plugins** - Curated selection of the best tools
 
 ### 🔌 Premium Plugins Available
-- **ADB Toolkit** - Complete Android Debug Bridge management (7 tools)
+- **ADB Toolkit** - Complete Android Debug Bridge management (7 tools + Run as Root)
 - **Fastboot Toolkit** - Comprehensive bootloader operations (8 tools + vbmeta patching)
 - **MTK Toolkit** - MediaTek device support with BROM exploit
+- **Scrcpy Toolkit** - Screen mirroring, screenshots, and recording
 
 ### 📦 Bundled Platform Tools
 - **ADB & Fastboot Included** - No need to install Android SDK separately
@@ -75,14 +103,15 @@
 | **vbmeta** | Parse, patch (disable verity/verification), re-sign |
 | **ABL (Android Bootloader)** | Deep analysis, unlock checks, LG LAF mode |
 | **ext4** | Extract filesystem contents |
+| **EROFS** | Extract Android 13+ read-only filesystem (LZ4/LZMA) |
 | **FAT** | Extract filesystem contents |
 | **ELF/Bootloader** | Analyze XBL, TZ, firmware |
 
 ### 🔨 Image Repacking
-- **Super Partitions** Re-pack Super Partitions
 - **Boot/Recovery images** (v0, v1, v2, v3, v4) - custom kernel/ramdisk
 - **Vendor boot images** (v3, v4)
 - **Sparse images** from raw (for faster flashing)
+- **EROFS images** from directory (LZ4/LZ4HC/LZMA compression)
 - **vbmeta images** with AVB disabled
 - **Ramdisk** from directory (cpio + compression)
 
@@ -106,7 +135,6 @@
 - **Non-blocking** threaded operations
 - Real-time progress and logging
 - CLI mode for scripting/automation
-- SystemTray for fast access or close
 
 ---
 
@@ -190,6 +218,28 @@ MediaTek device support with advanced operations:
 </p>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk5.png?raw=true" alt="MTK Tools" width="700">
+</p>
+
+### Scrcpy Toolkit
+Real-time screen mirroring and capture for Android devices:
+
+| Feature | Description |
+|---------|-------------|
+| **📺 Screen Mirror** | Live mirroring with customizable quality settings |
+| **📸 Screenshot** | Capture device screen as PNG with timestamp |
+| **🎬 Screen Record** | Record screen with adjustable bitrate and duration |
+| **📶 WiFi Mode** | Connect wirelessly for untethered mirroring |
+| **⚙️ Quality Control** | Adjust resolution, bitrate, and framerate |
+| **📌 Always-On-Top** | Keep mirror window visible (default: enabled) |
+
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy1.png?raw=true" alt="Scrcpy Mirror Tab" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy2.png?raw=true" alt="Scrcpy Screenshot Tab" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy3.png?raw=true" alt="Scrcpy Recording Tab" width="700">
 </p>
 
 ### Plugin Developer Guide
@@ -567,6 +617,19 @@ The entire application is contained in a single Python file with embedded protob
 
 ## 📜 Changelog
 
+### v2.1 - HOT UPDATE: EROFS & Scrcpy
+- 🔥 **New:** Full EROFS filesystem extraction (Android 13+ system/vendor/product images)
+- 🔥 **New:** EROFS image creation from directories with LZ4/LZ4HC/LZMA compression
+- 🔥 **New:** EROFS superblock analysis (UUID, block size, features, compression)
+- ✨ **New:** Scrcpy Toolkit plugin for screen mirroring
+- ✨ **New:** Screenshot capture with one-click save
+- ✨ **New:** Screen recording with audio support
+- ✨ **New:** WiFi mirroring mode for wireless connection
+- ✨ **New:** "Run as Root" checkbox in ADB Shell tab
+- 🔧 **Improved:** Shell prompt shows # for root mode, $ for normal
+- 🔧 **Improved:** Scrcpy defaults to always-on-top and half-size window
+- 🔧 **Improved:** Better error handling for EROFS compressed blocks
+
 ### v2.0 - Plugin Store & Advanced Dependencies
 - ✨ **New:** Online Plugin Store with browse, install, ratings & reviews
 - ✨ **New:** One-click plugin installation with automatic dependency setup
@@ -669,6 +732,4 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
-
-
 
