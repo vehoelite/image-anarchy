@@ -1,0 +1,11 @@
+{
+  "name": "Plugin Developer Guide",
+  "version": "2.0",
+  "description": "Complete guide to creating plugins - requirements, git_clone, binaries & monetization!",
+  "author": "Image Anarchy",
+  "icon": "📖",
+  "license_type": "free",
+  "website": "https://github.com/vehoelite/image-anarchy",
+  "min_version": "2.0",
+  "category": "utilities"
+}
