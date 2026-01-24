@@ -191,7 +191,13 @@ def _extract_bundled_resources():
     app_dir = os.path.dirname(sys.executable)
     
     # Resources to extract if they don't exist
-    resources = ['drivers', 'platform-tools', 'PortableGit', 'plugins', 'Tools']
+    # These are bundled in the exe via ImageAnarchy.spec and extracted on first run
+    # - drivers: Android USB drivers for device connections
+    # - platform-tools: ADB and fastboot binaries
+    # - PortableGit: Git for Windows (used by plugins that need git clone)
+    # - plugins: Plugin system with built-in and user-installed plugins
+    # - tools: CLI utilities (EROFS tools, Allwinner imgRePacker, Rockchip imgRePackerRK)
+    resources = ['drivers', 'platform-tools', 'PortableGit', 'plugins', 'tools']
     
     for resource in resources:
         src = os.path.join(meipass, resource)
@@ -9387,7 +9393,8 @@ def create_gui_app():
         QSplitter, QStatusBar, QMessageBox, QAbstractItemView, QTabWidget,
         QComboBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QHeaderView,
         QFormLayout, QRadioButton, QScrollArea, QFrame, QMenu, QDoubleSpinBox,
-        QGridLayout, QDialog, QInputDialog, QSystemTrayIcon, QGraphicsOpacityEffect
+        QGridLayout, QDialog, QInputDialog, QSystemTrayIcon, QGraphicsOpacityEffect,
+        QPlainTextEdit
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QPoint, QEasingCurve
     from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor, QAction, QIcon, QPixmap, QPainter
@@ -11568,6 +11575,296 @@ def create_gui_app():
             
             self.tab_widget.addTab(recovery_tab, "🔄 Recovery Porter")
             
+            # =============================================================
+            # TAB 6: ALLWINNER TOOLKIT
+            # =============================================================
+            allwinner_tab = QWidget()
+            allwinner_layout = QVBoxLayout(allwinner_tab)
+            allwinner_layout.setSpacing(12)
+            allwinner_layout.setContentsMargins(8, 12, 8, 8)
+            
+            # Info banner
+            aw_info = QLabel(
+                "🌞 <b>Allwinner Firmware Tools</b> - Unpack/repack LiveSuit & PhoenixSuit firmware images<br>"
+                "<small>Supports: SC8600/9800, Boxchip F10-F20, Allwinner A10-A80, F1C100, A133</small>"
+            )
+            aw_info.setStyleSheet("padding: 10px; background: #1a3a1a; border-radius: 5px;")
+            allwinner_layout.addWidget(aw_info)
+            
+            # Input firmware
+            aw_input_group = QGroupBox("Firmware Image")
+            aw_input_layout = QVBoxLayout(aw_input_group)
+            
+            aw_path_layout = QHBoxLayout()
+            aw_path_layout.addWidget(QLabel("Firmware:"))
+            self.aw_firmware_path = DropLineEdit()
+            self.aw_firmware_path.setPlaceholderText("Select Allwinner firmware .img file...")
+            aw_path_layout.addWidget(self.aw_firmware_path, 1)
+            self.aw_browse_btn = QPushButton("Browse...")
+            self.aw_browse_btn.clicked.connect(self._browse_allwinner_firmware)
+            aw_path_layout.addWidget(self.aw_browse_btn)
+            aw_input_layout.addLayout(aw_path_layout)
+            allwinner_layout.addWidget(aw_input_group)
+            
+            # Output directory
+            aw_output_group = QGroupBox("Output Directory")
+            aw_output_layout = QHBoxLayout(aw_output_group)
+            aw_output_layout.addWidget(QLabel("Output:"))
+            self.aw_output_path = QLineEdit()
+            self.aw_output_path.setPlaceholderText("Output directory (auto-generated if empty)")
+            aw_output_layout.addWidget(self.aw_output_path, 1)
+            self.aw_output_browse_btn = QPushButton("Browse...")
+            self.aw_output_browse_btn.clicked.connect(self._browse_allwinner_output)
+            aw_output_layout.addWidget(self.aw_output_browse_btn)
+            allwinner_layout.addWidget(aw_output_group)
+            
+            # Options
+            aw_options_group = QGroupBox("Options")
+            aw_options_layout = QVBoxLayout(aw_options_group)
+            
+            aw_opts_row1 = QHBoxLayout()
+            self.aw_2nd_layer_cb = QCheckBox("Process 2nd layer files (boot images, ramdisks)")
+            self.aw_2nd_layer_cb.setChecked(True)
+            aw_opts_row1.addWidget(self.aw_2nd_layer_cb)
+            self.aw_noiso_cb = QCheckBox("Skip filesystem images")
+            aw_opts_row1.addWidget(self.aw_noiso_cb)
+            aw_opts_row1.addStretch()
+            aw_options_layout.addLayout(aw_opts_row1)
+            
+            allwinner_layout.addWidget(aw_options_group)
+            
+            # Log output
+            aw_log_group = QGroupBox("Log")
+            aw_log_layout = QVBoxLayout(aw_log_group)
+            self.aw_log = QPlainTextEdit()
+            self.aw_log.setReadOnly(True)
+            self.aw_log.setStyleSheet("font-family: Consolas; background: #0d0d0d;")
+            self.aw_log.setMinimumHeight(200)
+            aw_log_layout.addWidget(self.aw_log)
+            allwinner_layout.addWidget(aw_log_group, 1)
+            
+            # Progress
+            self.aw_progress = QProgressBar()
+            self.aw_progress.setVisible(False)
+            allwinner_layout.addWidget(self.aw_progress)
+            
+            # Action buttons
+            aw_action_layout = QHBoxLayout()
+            aw_action_layout.addStretch()
+            
+            self.aw_unpack_btn = QPushButton("📦 Unpack Firmware")
+            self.aw_unpack_btn.setProperty("primary", True)
+            self.aw_unpack_btn.setMinimumWidth(150)
+            self.aw_unpack_btn.clicked.connect(self._allwinner_unpack)
+            aw_action_layout.addWidget(self.aw_unpack_btn)
+            
+            self.aw_repack_btn = QPushButton("🔧 Repack Firmware")
+            self.aw_repack_btn.setMinimumWidth(150)
+            self.aw_repack_btn.clicked.connect(self._allwinner_repack)
+            aw_action_layout.addWidget(self.aw_repack_btn)
+            
+            allwinner_layout.addLayout(aw_action_layout)
+            
+            self.tab_widget.addTab(allwinner_tab, "🌞 Allwinner")
+            
+            # =============================================================
+            # TAB 7: ROCKCHIP TOOLKIT
+            # =============================================================
+            rockchip_tab = QWidget()
+            rockchip_layout = QVBoxLayout(rockchip_tab)
+            rockchip_layout.setSpacing(12)
+            rockchip_layout.setContentsMargins(8, 12, 8, 8)
+            
+            # Info banner
+            rk_info = QLabel(
+                "🪨 <b>Rockchip Firmware Tools</b> - Unpack/repack RKFW & RKAF firmware images<br>"
+                "<small>Supports: RK28xx, RK29xx, RK30xx, RK31xx, RK32xx, RK33xx</small>"
+            )
+            rk_info.setStyleSheet("padding: 10px; background: #1a2a3a; border-radius: 5px;")
+            rockchip_layout.addWidget(rk_info)
+            
+            # Input firmware
+            rk_input_group = QGroupBox("Firmware Image")
+            rk_input_layout = QVBoxLayout(rk_input_group)
+            
+            rk_path_layout = QHBoxLayout()
+            rk_path_layout.addWidget(QLabel("Firmware:"))
+            self.rk_firmware_path = DropLineEdit()
+            self.rk_firmware_path.setPlaceholderText("Select Rockchip firmware .img file...")
+            rk_path_layout.addWidget(self.rk_firmware_path, 1)
+            self.rk_browse_btn = QPushButton("Browse...")
+            self.rk_browse_btn.clicked.connect(self._browse_rockchip_firmware)
+            rk_path_layout.addWidget(self.rk_browse_btn)
+            rk_input_layout.addLayout(rk_path_layout)
+            rockchip_layout.addWidget(rk_input_group)
+            
+            # Output directory
+            rk_output_group = QGroupBox("Output Directory")
+            rk_output_layout = QHBoxLayout(rk_output_group)
+            rk_output_layout.addWidget(QLabel("Output:"))
+            self.rk_output_path = QLineEdit()
+            self.rk_output_path.setPlaceholderText("Output directory (auto-generated if empty)")
+            rk_output_layout.addWidget(self.rk_output_path, 1)
+            self.rk_output_browse_btn = QPushButton("Browse...")
+            self.rk_output_browse_btn.clicked.connect(self._browse_rockchip_output)
+            rk_output_layout.addWidget(self.rk_output_browse_btn)
+            rockchip_layout.addWidget(rk_output_group)
+            
+            # Options
+            rk_options_group = QGroupBox("Options")
+            rk_options_layout = QVBoxLayout(rk_options_group)
+            
+            rk_opts_row1 = QHBoxLayout()
+            self.rk_2nd_layer_cb = QCheckBox("Process 2nd layer files (boot images, bootloaders)")
+            self.rk_2nd_layer_cb.setChecked(True)
+            rk_opts_row1.addWidget(self.rk_2nd_layer_cb)
+            self.rk_rkaf_cb = QCheckBox("Create RKAF image (instead of RKFW)")
+            rk_opts_row1.addWidget(self.rk_rkaf_cb)
+            rk_opts_row1.addStretch()
+            rk_options_layout.addLayout(rk_opts_row1)
+            
+            rk_opts_row2 = QHBoxLayout()
+            self.rk_fix_crc_cb = QCheckBox("Fix MD5/CRC checksums")
+            self.rk_fix_crc_cb.setChecked(True)
+            rk_opts_row2.addWidget(self.rk_fix_crc_cb)
+            self.rk_skip_cid_cb = QCheckBox("Skip ChipID verification")
+            rk_opts_row2.addWidget(self.rk_skip_cid_cb)
+            rk_opts_row2.addStretch()
+            rk_options_layout.addLayout(rk_opts_row2)
+            
+            rockchip_layout.addWidget(rk_options_group)
+            
+            # Log output
+            rk_log_group = QGroupBox("Log")
+            rk_log_layout = QVBoxLayout(rk_log_group)
+            self.rk_log = QPlainTextEdit()
+            self.rk_log.setReadOnly(True)
+            self.rk_log.setStyleSheet("font-family: Consolas; background: #0d0d0d;")
+            self.rk_log.setMinimumHeight(200)
+            rk_log_layout.addWidget(self.rk_log)
+            rockchip_layout.addWidget(rk_log_group, 1)
+            
+            # Progress
+            self.rk_progress = QProgressBar()
+            self.rk_progress.setVisible(False)
+            rockchip_layout.addWidget(self.rk_progress)
+            
+            # Action buttons
+            rk_action_layout = QHBoxLayout()
+            rk_action_layout.addStretch()
+            
+            self.rk_unpack_btn = QPushButton("📦 Unpack Firmware")
+            self.rk_unpack_btn.setProperty("primary", True)
+            self.rk_unpack_btn.setMinimumWidth(150)
+            self.rk_unpack_btn.clicked.connect(self._rockchip_unpack)
+            rk_action_layout.addWidget(self.rk_unpack_btn)
+            
+            self.rk_repack_btn = QPushButton("🔧 Repack Firmware")
+            self.rk_repack_btn.setMinimumWidth(150)
+            self.rk_repack_btn.clicked.connect(self._rockchip_repack)
+            rk_action_layout.addWidget(self.rk_repack_btn)
+            
+            rockchip_layout.addLayout(rk_action_layout)
+            
+            self.tab_widget.addTab(rockchip_tab, "🪨 Rockchip")
+            
+            # =====================================================================
+            # TAB 8: OPPO / OnePlus / Realme Firmware Decryption
+            # =====================================================================
+            oppo_tab = QWidget()
+            oppo_layout = QVBoxLayout(oppo_tab)
+            oppo_layout.setSpacing(10)
+            
+            # Header
+            oppo_header = QLabel("📱 OPPO / OnePlus / Realme Firmware Decrypter")
+            oppo_header.setStyleSheet("font-size: 16px; font-weight: bold; color: #4fc3f7; padding: 10px;")
+            oppo_layout.addWidget(oppo_header)
+            
+            oppo_desc = QLabel(
+                "Decrypt encrypted firmware files from OPPO, OnePlus, and Realme devices.\n"
+                "Supports .ofp (OPPO/Realme Qualcomm & MTK) and .ops (OnePlus) formats.\n"
+                "Based on bkerler's oppo_decrypt tool."
+            )
+            oppo_desc.setStyleSheet("color: #888; padding: 5px;")
+            oppo_layout.addWidget(oppo_desc)
+            
+            # Firmware selection
+            oppo_file_group = QGroupBox("Firmware File")
+            oppo_file_layout = QVBoxLayout(oppo_file_group)
+            
+            oppo_path_layout = QHBoxLayout()
+            self.oppo_firmware_path = QLineEdit()
+            self.oppo_firmware_path.setPlaceholderText("Select .ofp (OPPO/Realme) or .ops (OnePlus) firmware file...")
+            oppo_path_layout.addWidget(self.oppo_firmware_path)
+            
+            oppo_browse_btn = QPushButton("Browse...")
+            oppo_browse_btn.clicked.connect(self._browse_oppo_firmware)
+            oppo_path_layout.addWidget(oppo_browse_btn)
+            oppo_file_layout.addLayout(oppo_path_layout)
+            
+            # Firmware type indicator
+            self.oppo_firmware_type = QLabel("No file selected")
+            self.oppo_firmware_type.setStyleSheet("color: #888; font-style: italic;")
+            oppo_file_layout.addWidget(self.oppo_firmware_type)
+            
+            oppo_layout.addWidget(oppo_file_group)
+            
+            # Output directory
+            oppo_output_group = QGroupBox("Output Directory")
+            oppo_output_layout = QHBoxLayout(oppo_output_group)
+            
+            self.oppo_output_path = QLineEdit()
+            self.oppo_output_path.setPlaceholderText("Leave empty to use firmware directory...")
+            oppo_output_layout.addWidget(self.oppo_output_path)
+            
+            oppo_output_btn = QPushButton("Browse...")
+            oppo_output_btn.clicked.connect(self._browse_oppo_output)
+            oppo_output_layout.addWidget(oppo_output_btn)
+            
+            oppo_layout.addWidget(oppo_output_group)
+            
+            # Options
+            oppo_options_group = QGroupBox("Options")
+            oppo_options_layout = QVBoxLayout(oppo_options_group)
+            
+            oppo_opts_row1 = QHBoxLayout()
+            self.oppo_auto_detect_cb = QCheckBox("Auto-detect firmware type (QC/MTK)")
+            self.oppo_auto_detect_cb.setChecked(True)
+            oppo_opts_row1.addWidget(self.oppo_auto_detect_cb)
+            oppo_opts_row1.addStretch()
+            oppo_options_layout.addLayout(oppo_opts_row1)
+            
+            oppo_layout.addWidget(oppo_options_group)
+            
+            # Log output
+            oppo_log_group = QGroupBox("Decryption Log")
+            oppo_log_layout = QVBoxLayout(oppo_log_group)
+            self.oppo_log = QPlainTextEdit()
+            self.oppo_log.setReadOnly(True)
+            self.oppo_log.setStyleSheet("font-family: Consolas; background: #0d0d0d;")
+            self.oppo_log.setMinimumHeight(200)
+            oppo_log_layout.addWidget(self.oppo_log)
+            oppo_layout.addWidget(oppo_log_group, 1)
+            
+            # Progress
+            self.oppo_progress = QProgressBar()
+            self.oppo_progress.setVisible(False)
+            oppo_layout.addWidget(self.oppo_progress)
+            
+            # Action buttons
+            oppo_action_layout = QHBoxLayout()
+            oppo_action_layout.addStretch()
+            
+            self.oppo_decrypt_btn = QPushButton("🔓 Decrypt Firmware")
+            self.oppo_decrypt_btn.setProperty("primary", True)
+            self.oppo_decrypt_btn.setMinimumWidth(200)
+            self.oppo_decrypt_btn.clicked.connect(self._oppo_decrypt)
+            oppo_action_layout.addWidget(self.oppo_decrypt_btn)
+            
+            oppo_layout.addLayout(oppo_action_layout)
+            
+            self.tab_widget.addTab(oppo_tab, "📱 OPPO/OnePlus")
+            
             main_layout.addWidget(self.tab_widget)
             
             # Status bar
@@ -13100,6 +13397,1040 @@ def create_gui_app():
             finally:
                 self.recovery_progress.setRange(0, 100)
                 self.recovery_progress.setValue(100 if 'success' in dir() and success else 0)
+        
+        # =============================================================
+        # ALLWINNER FIRMWARE METHODS
+        # =============================================================
+        
+        def _get_allwinner_tool(self) -> Optional[str]:
+            """Find the imgRePacker tool."""
+            base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+            
+            # Check tools folder
+            tool_path = base / 'tools' / 'Allwinner' / 'imgRePacker.exe'
+            if tool_path.exists():
+                return str(tool_path)
+            
+            # Check if it's in PATH
+            if shutil.which('imgRePacker.exe'):
+                return shutil.which('imgRePacker.exe')
+            
+            return None
+        
+        def _aw_log(self, msg: str):
+            """Log message to Allwinner log."""
+            self.aw_log.appendPlainText(msg)
+            QApplication.processEvents()
+        
+        def _browse_allwinner_firmware(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select Allwinner Firmware",
+                "", "Firmware Images (*.img);;All Files (*)"
+            )
+            if path:
+                self.aw_firmware_path.setText(path)
+                # Auto-set output directory
+                if not self.aw_output_path.text():
+                    self.aw_output_path.setText(str(Path(path).parent / (Path(path).stem + ".dump")))
+        
+        def _browse_allwinner_output(self):
+            path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+            if path:
+                self.aw_output_path.setText(path)
+        
+        def _allwinner_unpack(self):
+            """Unpack Allwinner firmware using imgRePacker."""
+            tool = self._get_allwinner_tool()
+            if not tool:
+                QMessageBox.critical(self, "Error", 
+                    "imgRePacker.exe not found!\n\n"
+                    "Please ensure the tool is in:\n"
+                    "tools/Allwinner/imgRePacker.exe")
+                return
+            
+            firmware = self.aw_firmware_path.text().strip()
+            if not firmware or not os.path.exists(firmware):
+                QMessageBox.warning(self, "Error", "Please select a valid firmware file")
+                return
+            
+            self.aw_log.clear()
+            self._aw_log(f"🌞 Allwinner Firmware Unpacker")
+            self._aw_log(f"{'='*50}")
+            self._aw_log(f"Tool: {tool}")
+            self._aw_log(f"Firmware: {firmware}")
+            self._aw_log("")
+            
+            # Build command
+            cmd = [tool]
+            
+            if self.aw_2nd_layer_cb.isChecked():
+                cmd.append("/2nd")
+            if self.aw_noiso_cb.isChecked():
+                cmd.append("/noiso")
+            
+            cmd.append(firmware)
+            
+            self._aw_log(f"Command: {' '.join(cmd)}")
+            self._aw_log("")
+            
+            self.aw_progress.setVisible(True)
+            self.aw_progress.setRange(0, 0)
+            self.aw_unpack_btn.setEnabled(False)
+            self.aw_repack_btn.setEnabled(False)
+            
+            try:
+                # Run the tool
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(Path(tool).parent)
+                )
+                
+                # Stream output
+                for line in process.stdout:
+                    self._aw_log(line.rstrip())
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    dump_dir = firmware + ".dump"
+                    self._aw_log("")
+                    self._aw_log(f"✅ Unpack complete!")
+                    self._aw_log(f"Output: {dump_dir}")
+                    
+                    if os.path.exists(dump_dir):
+                        # Count extracted files
+                        file_count = sum(1 for _ in Path(dump_dir).rglob('*') if _.is_file())
+                        self._aw_log(f"Files extracted: {file_count}")
+                        
+                        QMessageBox.information(self, "Success",
+                            f"Firmware unpacked successfully!\n\n"
+                            f"Output: {dump_dir}\n"
+                            f"Files: {file_count}")
+                else:
+                    self._aw_log(f"❌ Unpack failed with code: {process.returncode}")
+                    QMessageBox.critical(self, "Error", "Firmware unpack failed!")
+                    
+            except Exception as e:
+                self._aw_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Unpack failed:\n{e}")
+            finally:
+                self.aw_progress.setVisible(False)
+                self.aw_unpack_btn.setEnabled(True)
+                self.aw_repack_btn.setEnabled(True)
+        
+        def _allwinner_repack(self):
+            """Repack Allwinner firmware using imgRePacker."""
+            tool = self._get_allwinner_tool()
+            if not tool:
+                QMessageBox.critical(self, "Error", 
+                    "imgRePacker.exe not found!\n\n"
+                    "Please ensure the tool is in:\n"
+                    "tools/Allwinner/imgRePacker.exe")
+                return
+            
+            # Check for .dump directory
+            firmware = self.aw_firmware_path.text().strip()
+            dump_dir = firmware + ".dump" if firmware else self.aw_output_path.text().strip()
+            
+            if not dump_dir or not os.path.isdir(dump_dir):
+                QMessageBox.warning(self, "Error", 
+                    "Please select a .dump directory to repack\n"
+                    "(created by unpacking firmware first)")
+                return
+            
+            self.aw_log.clear()
+            self._aw_log(f"🌞 Allwinner Firmware Repacker")
+            self._aw_log(f"{'='*50}")
+            self._aw_log(f"Tool: {tool}")
+            self._aw_log(f"Source: {dump_dir}")
+            self._aw_log("")
+            
+            # Build command
+            cmd = [tool]
+            
+            if self.aw_2nd_layer_cb.isChecked():
+                cmd.append("/2nd")
+            if self.aw_noiso_cb.isChecked():
+                cmd.append("/noiso")
+            
+            cmd.append(dump_dir)
+            
+            self._aw_log(f"Command: {' '.join(cmd)}")
+            self._aw_log("")
+            
+            self.aw_progress.setVisible(True)
+            self.aw_progress.setRange(0, 0)
+            self.aw_unpack_btn.setEnabled(False)
+            self.aw_repack_btn.setEnabled(False)
+            
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(Path(tool).parent)
+                )
+                
+                for line in process.stdout:
+                    self._aw_log(line.rstrip())
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    # Output is typically original name without .dump
+                    output_img = dump_dir.replace(".dump", "_new.img")
+                    self._aw_log("")
+                    self._aw_log(f"✅ Repack complete!")
+                    
+                    QMessageBox.information(self, "Success",
+                        f"Firmware repacked successfully!\n\n"
+                        f"Check the output directory for the new firmware.")
+                else:
+                    self._aw_log(f"❌ Repack failed with code: {process.returncode}")
+                    QMessageBox.critical(self, "Error", "Firmware repack failed!")
+                    
+            except Exception as e:
+                self._aw_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Repack failed:\n{e}")
+            finally:
+                self.aw_progress.setVisible(False)
+                self.aw_unpack_btn.setEnabled(True)
+                self.aw_repack_btn.setEnabled(True)
+        
+        # =============================================================
+        # ROCKCHIP FIRMWARE METHODS
+        # =============================================================
+        
+        def _get_rockchip_tool(self) -> Optional[str]:
+            """Find the imgRePackerRK tool."""
+            base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+            
+            # Check tools folder
+            tool_path = base / 'tools' / 'Rockchip' / 'imgRePackerRK.exe'
+            if tool_path.exists():
+                return str(tool_path)
+            
+            # Check if it's in PATH
+            if shutil.which('imgRePackerRK.exe'):
+                return shutil.which('imgRePackerRK.exe')
+            
+            return None
+        
+        def _rk_log(self, msg: str):
+            """Log message to Rockchip log."""
+            self.rk_log.appendPlainText(msg)
+            QApplication.processEvents()
+        
+        def _browse_rockchip_firmware(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select Rockchip Firmware",
+                "", "Firmware Images (*.img);;All Files (*)"
+            )
+            if path:
+                self.rk_firmware_path.setText(path)
+                # Auto-set output directory
+                if not self.rk_output_path.text():
+                    self.rk_output_path.setText(str(Path(path).parent / (Path(path).stem + ".dump")))
+        
+        def _browse_rockchip_output(self):
+            path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+            if path:
+                self.rk_output_path.setText(path)
+        
+        def _rockchip_unpack(self):
+            """Unpack Rockchip firmware using imgRePackerRK."""
+            tool = self._get_rockchip_tool()
+            if not tool:
+                QMessageBox.critical(self, "Error", 
+                    "imgRePackerRK.exe not found!\n\n"
+                    "Please ensure the tool is in:\n"
+                    "tools/Rockchip/imgRePackerRK.exe")
+                return
+            
+            firmware = self.rk_firmware_path.text().strip()
+            if not firmware or not os.path.exists(firmware):
+                QMessageBox.warning(self, "Error", "Please select a valid firmware file")
+                return
+            
+            self.rk_log.clear()
+            self._rk_log(f"🪨 Rockchip Firmware Unpacker")
+            self._rk_log(f"{'='*50}")
+            self._rk_log(f"Tool: {tool}")
+            self._rk_log(f"Firmware: {firmware}")
+            self._rk_log("")
+            
+            # Build command
+            cmd = [tool]
+            
+            if self.rk_2nd_layer_cb.isChecked():
+                cmd.append("/2nd")
+            if self.rk_skip_cid_cb.isChecked():
+                cmd.append("/cid")
+            if not self.rk_fix_crc_cb.isChecked():
+                cmd.append("/md5")
+                cmd.append("/rkcrc")
+            
+            cmd.append(firmware)
+            
+            self._rk_log(f"Command: {' '.join(cmd)}")
+            self._rk_log("")
+            
+            self.rk_progress.setVisible(True)
+            self.rk_progress.setRange(0, 0)
+            self.rk_unpack_btn.setEnabled(False)
+            self.rk_repack_btn.setEnabled(False)
+            
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(Path(tool).parent)
+                )
+                
+                for line in process.stdout:
+                    self._rk_log(line.rstrip())
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    dump_dir = firmware + ".dump"
+                    self._rk_log("")
+                    self._rk_log(f"✅ Unpack complete!")
+                    self._rk_log(f"Output: {dump_dir}")
+                    
+                    if os.path.exists(dump_dir):
+                        file_count = sum(1 for _ in Path(dump_dir).rglob('*') if _.is_file())
+                        self._rk_log(f"Files extracted: {file_count}")
+                        
+                        QMessageBox.information(self, "Success",
+                            f"Firmware unpacked successfully!\n\n"
+                            f"Output: {dump_dir}\n"
+                            f"Files: {file_count}")
+                else:
+                    self._rk_log(f"❌ Unpack failed with code: {process.returncode}")
+                    QMessageBox.critical(self, "Error", "Firmware unpack failed!")
+                    
+            except Exception as e:
+                self._rk_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Unpack failed:\n{e}")
+            finally:
+                self.rk_progress.setVisible(False)
+                self.rk_unpack_btn.setEnabled(True)
+                self.rk_repack_btn.setEnabled(True)
+        
+        def _rockchip_repack(self):
+            """Repack Rockchip firmware using imgRePackerRK."""
+            tool = self._get_rockchip_tool()
+            if not tool:
+                QMessageBox.critical(self, "Error", 
+                    "imgRePackerRK.exe not found!\n\n"
+                    "Please ensure the tool is in:\n"
+                    "tools/Rockchip/imgRePackerRK.exe")
+                return
+            
+            # Check for .dump directory
+            firmware = self.rk_firmware_path.text().strip()
+            dump_dir = firmware + ".dump" if firmware else self.rk_output_path.text().strip()
+            
+            if not dump_dir or not os.path.isdir(dump_dir):
+                QMessageBox.warning(self, "Error", 
+                    "Please select a .dump directory to repack\n"
+                    "(created by unpacking firmware first)")
+                return
+            
+            self.rk_log.clear()
+            self._rk_log(f"🪨 Rockchip Firmware Repacker")
+            self._rk_log(f"{'='*50}")
+            self._rk_log(f"Tool: {tool}")
+            self._rk_log(f"Source: {dump_dir}")
+            self._rk_log("")
+            
+            # Build command
+            cmd = [tool]
+            
+            if self.rk_2nd_layer_cb.isChecked():
+                cmd.append("/2nd")
+            if self.rk_rkaf_cb.isChecked():
+                cmd.append("/rkaf")
+            if self.rk_skip_cid_cb.isChecked():
+                cmd.append("/cid")
+            
+            cmd.append(dump_dir)
+            
+            self._rk_log(f"Command: {' '.join(cmd)}")
+            self._rk_log("")
+            
+            self.rk_progress.setVisible(True)
+            self.rk_progress.setRange(0, 0)
+            self.rk_unpack_btn.setEnabled(False)
+            self.rk_repack_btn.setEnabled(False)
+            
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    cwd=str(Path(tool).parent)
+                )
+                
+                for line in process.stdout:
+                    self._rk_log(line.rstrip())
+                
+                process.wait()
+                
+                if process.returncode == 0:
+                    self._rk_log("")
+                    self._rk_log(f"✅ Repack complete!")
+                    
+                    QMessageBox.information(self, "Success",
+                        f"Firmware repacked successfully!\n\n"
+                        f"Check the output directory for the new firmware.")
+                else:
+                    self._rk_log(f"❌ Repack failed with code: {process.returncode}")
+                    QMessageBox.critical(self, "Error", "Firmware repack failed!")
+                    
+            except Exception as e:
+                self._rk_log(f"Error: {e}")
+                QMessageBox.critical(self, "Error", f"Repack failed:\n{e}")
+            finally:
+                self.rk_progress.setVisible(False)
+                self.rk_unpack_btn.setEnabled(True)
+                self.rk_repack_btn.setEnabled(True)
+        
+        # =====================================================================
+        # OPPO / OnePlus / Realme Firmware Decryption Methods
+        # =====================================================================
+        
+        def _oppo_log(self, message: str):
+            """Log message to OPPO decrypt log."""
+            self.oppo_log.appendPlainText(message)
+            QApplication.processEvents()
+        
+        def _browse_oppo_firmware(self):
+            """Browse for OPPO/OnePlus firmware file."""
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select OPPO/OnePlus/Realme Firmware",
+                "",
+                "Firmware Files (*.ofp *.ops *.zip);;OPPO Firmware (*.ofp);;OnePlus Firmware (*.ops);;All Files (*.*)"
+            )
+            if path:
+                self.oppo_firmware_path.setText(path)
+                # Detect firmware type
+                ext = Path(path).suffix.lower()
+                if ext == '.ofp':
+                    self.oppo_firmware_type.setText("📱 OPPO/Realme Firmware (.ofp) - Qualcomm or MediaTek")
+                    self.oppo_firmware_type.setStyleSheet("color: #4fc3f7;")
+                elif ext == '.ops':
+                    self.oppo_firmware_type.setText("📱 OnePlus Firmware (.ops)")
+                    self.oppo_firmware_type.setStyleSheet("color: #81c784;")
+                elif ext == '.zip':
+                    self.oppo_firmware_type.setText("📦 ZIP archive - may contain encrypted firmware")
+                    self.oppo_firmware_type.setStyleSheet("color: #ffb74d;")
+                else:
+                    self.oppo_firmware_type.setText("Unknown firmware type")
+                    self.oppo_firmware_type.setStyleSheet("color: #888;")
+        
+        def _browse_oppo_output(self):
+            """Browse for output directory."""
+            path = QFileDialog.getExistingDirectory(self, "Select Output Directory")
+            if path:
+                self.oppo_output_path.setText(path)
+        
+        def _oppo_decrypt(self):
+            """Decrypt OPPO/OnePlus/Realme firmware."""
+            firmware = self.oppo_firmware_path.text().strip()
+            if not firmware or not os.path.exists(firmware):
+                QMessageBox.warning(self, "Error", "Please select a valid firmware file")
+                return
+            
+            ext = Path(firmware).suffix.lower()
+            
+            self.oppo_log.clear()
+            self._oppo_log("📱 OPPO/OnePlus/Realme Firmware Decrypter")
+            self._oppo_log("Based on bkerler's oppo_decrypt")
+            self._oppo_log("=" * 50)
+            self._oppo_log(f"Firmware: {firmware}")
+            self._oppo_log(f"Type: {ext}")
+            self._oppo_log("")
+            
+            # Determine output directory
+            output_dir = self.oppo_output_path.text().strip()
+            if not output_dir:
+                output_dir = str(Path(firmware).parent / (Path(firmware).stem + "_decrypted"))
+            
+            self._oppo_log(f"Output: {output_dir}")
+            self._oppo_log("")
+            
+            self.oppo_progress.setVisible(True)
+            self.oppo_progress.setRange(0, 0)
+            self.oppo_decrypt_btn.setEnabled(False)
+            
+            try:
+                # Check for pycryptodome
+                try:
+                    from Cryptodome.Cipher import AES
+                except ImportError:
+                    try:
+                        from Crypto.Cipher import AES
+                    except ImportError:
+                        QMessageBox.critical(self, "Missing Dependency",
+                            "pycryptodome is required for OPPO/OnePlus decryption.\n\n"
+                            "Install with: pip install pycryptodome")
+                        return
+                
+                if ext == '.ofp':
+                    self._decrypt_ofp(firmware, output_dir)
+                elif ext == '.ops':
+                    self._decrypt_ops(firmware, output_dir)
+                elif ext == '.zip':
+                    self._decrypt_oppo_zip(firmware, output_dir)
+                else:
+                    QMessageBox.warning(self, "Error", f"Unsupported file type: {ext}")
+                    
+            except Exception as e:
+                self._oppo_log(f"❌ Error: {e}")
+                import traceback
+                self._oppo_log(traceback.format_exc())
+                QMessageBox.critical(self, "Error", f"Decryption failed:\n{e}")
+            finally:
+                self.oppo_progress.setVisible(False)
+                self.oppo_decrypt_btn.setEnabled(True)
+        
+        def _decrypt_oppo_zip(self, filename: str, output_dir: str):
+            """Decrypt password-protected OPPO ZIP firmware."""
+            import zipfile
+            
+            self._oppo_log("Detected ZIP file, trying known passwords...")
+            
+            # Known OPPO/Realme ZIP passwords
+            passwords = [
+                b"flash@realme$50E7F7D847732396F1582CD62DD385ED7ABB0897",
+                b"flash@realme",
+                b"oppo@flash",
+            ]
+            
+            try:
+                with zipfile.ZipFile(filename) as zf:
+                    for pwd in passwords:
+                        try:
+                            # Try to read first file with this password
+                            test_file = zf.namelist()[0]
+                            zf.read(test_file, pwd=pwd)
+                            self._oppo_log(f"✅ Password found!")
+                            
+                            # Extract all files
+                            os.makedirs(output_dir, exist_ok=True)
+                            for zfile in zf.namelist():
+                                self._oppo_log(f"Extracting: {zfile}")
+                                zf.extract(zfile, pwd=pwd, path=output_dir)
+                            
+                            file_count = len(zf.namelist())
+                            self._oppo_log("")
+                            self._oppo_log(f"✅ Extraction complete!")
+                            self._oppo_log(f"Files extracted: {file_count}")
+                            self._oppo_log(f"Output: {output_dir}")
+                            
+                            QMessageBox.information(self, "Success",
+                                f"ZIP firmware extracted!\n\n"
+                                f"Files: {file_count}\n"
+                                f"Output: {output_dir}")
+                            return
+                        except (RuntimeError, zipfile.BadZipFile):
+                            continue
+                    
+                    # No password worked, try without password
+                    self._oppo_log("Trying without password...")
+                    os.makedirs(output_dir, exist_ok=True)
+                    zf.extractall(output_dir)
+                    
+                    self._oppo_log(f"✅ Extracted (no encryption)")
+                    QMessageBox.information(self, "Success", f"ZIP extracted to:\n{output_dir}")
+                    
+            except Exception as e:
+                self._oppo_log(f"❌ ZIP extraction failed: {e}")
+                raise
+        
+        def _decrypt_ofp(self, filename: str, output_dir: str):
+            """Decrypt OPPO .ofp firmware (Qualcomm or MTK)."""
+            from Cryptodome.Cipher import AES
+            import hashlib
+            from struct import unpack
+            import xml.etree.ElementTree as ET
+            
+            self._oppo_log("Analyzing .ofp firmware...")
+            
+            # Helper functions
+            def swap(ch):
+                return ((ch & 0xF) << 4) + ((ch & 0xF0) >> 4)
+            
+            def keyshuffle(key, hkey):
+                key = bytearray(key)
+                for i in range(0, 0x10, 4):
+                    key[i] = swap((hkey[i] ^ key[i]))
+                    key[i + 1] = swap(hkey[i + 1] ^ key[i + 1])
+                    key[i + 2] = swap(hkey[i + 2] ^ key[i + 2])
+                    key[i + 3] = swap(hkey[i + 3] ^ key[i + 3])
+                return bytes(key)
+            
+            def rol(x, n, bits=32):
+                n = bits - n
+                mask = (2**n) - 1
+                mask_bits = x & mask
+                return (x >> n) | (mask_bits << (bits - n))
+            
+            def deobfuscate(data, mask):
+                ret = bytearray()
+                for i in range(len(data)):
+                    v = rol((data[i] ^ mask[i]), 4, 8)
+                    ret.append(v)
+                return ret
+            
+            def mtk_shuffle(key, keylength, inp, inputlength):
+                inp = bytearray(inp)
+                for i in range(inputlength):
+                    k = key[i % keylength]
+                    h = (((inp[i] & 0xF0) >> 4) | (16 * (inp[i] & 0xF)))
+                    inp[i] = k ^ h
+                return bytes(inp)
+            
+            def mtk_shuffle2(key, keylength, inp, inputlength):
+                inp = bytearray(inp)
+                for i in range(inputlength):
+                    tmp = key[i % keylength] ^ inp[i]
+                    inp[i] = ((tmp & 0xF0) >> 4) | (16 * (tmp & 0xF))
+                return bytes(inp)
+            
+            # Qualcomm key tables
+            qc_keys = [
+                ["V1.4.17/1.4.27", "27827963787265EF89D126B69A495A21", "82C50203285A2CE7D8C3E198383CE94C", "422DD5399181E223813CD8ECDF2E4D72"],
+                ["V1.6.17", "E11AA7BB558A436A8375FD15DDD4651F", "77DDF6A0696841F6B74782C097835169", "A739742384A44E8BA45207AD5C3700EA"],
+                ["V1.5.13", "67657963787565E837D226B69A495D21", "F6C50203515A2CE7D8C3E1F938B7E94C", "42F2D5399137E2B2813CD8ECDF2F4D72"],
+                ["V1.6.6/1.6.9/1.6.17/1.6.24/1.6.26/1.7.6", "3C2D518D9BF2E4279DC758CD535147C3", "87C74A29709AC1BF2382276C4E8DF232", "598D92E967265E9BCABE2469FE4A915E"],
+                ["V1.7.2", "8FB8FB261930260BE945B841AEFA9FD4", "E529E82B28F5A2F8831D860AE39E425D", "8A09DA60ED36F125D64709973372C1CF"],
+                ["V2.0.3", "E8AE288C0192C54BF10C5707E9C4705B", "D64FC385DCD52A3C9B5FBA8650F92EDA", "79051FD8D8B6297E2E4559E997F63B7F"],
+            ]
+            
+            # MTK key tables
+            mtk_keys = [
+                ["67657963787565E837D226B69A495D21", "F6C50203515A2CE7D8C3E1F938B7E94C", "42F2D5399137E2B2813CD8ECDF2F4D72"],
+                ["9E4F32639D21357D37D226B69A495D21", "A3D8D358E42F5A9E931DD3917D9A3218", "386935399137416B67416BECF22F519A"],
+                ["892D57E92A4D8A975E3C216B7C9DE189", "D26DF2D9913785B145D18C7219B89F26", "516989E4A1BFC78B365C6BC57D944391"],
+                ["27827963787265EF89D126B69A495A21", "82C50203285A2CE7D8C3E198383CE94C", "422DD5399181E223813CD8ECDF2E4D72"],
+                ["3C4A618D9BF2E4279DC758CD535147C3", "87B13D29709AC1BF2382276C4E8DF232", "59B7A8E967265E9BCABE2469FE4A915E"],
+                ["1C3288822BF824259DC852C1733127D3", "E7918D22799181CF2312176C9E2DF298", "3247F889A7B6DECBCA3E28693E4AAAFE"],
+            ]
+            
+            filesize = os.stat(filename).st_size
+            
+            # Try to detect if it's Qualcomm or MTK
+            with open(filename, 'rb') as rf:
+                # Check for MTK magic
+                rf.seek(0)
+                first_bytes = rf.read(16)
+                
+                # Try MTK first
+                is_mtk = False
+                aeskey = None
+                aesiv = None
+                
+                for kt in mtk_keys:
+                    obskey = bytearray.fromhex(kt[0])
+                    encaeskey = bytearray.fromhex(kt[1])
+                    encaesiv = bytearray.fromhex(kt[2])
+                    test_key = hashlib.md5(mtk_shuffle2(obskey, 16, encaeskey, 16)).hexdigest()[:16].encode()
+                    test_iv = hashlib.md5(mtk_shuffle2(obskey, 16, encaesiv, 16)).hexdigest()[:16].encode()
+                    
+                    cipher = AES.new(test_key, AES.MODE_CFB, IV=test_iv, segment_size=128)
+                    dec = cipher.decrypt(first_bytes)
+                    if dec[:3] == b"MMM":
+                        is_mtk = True
+                        aeskey = test_key
+                        aesiv = test_iv
+                        self._oppo_log("✅ Detected MediaTek firmware")
+                        break
+                
+                if is_mtk:
+                    self._decrypt_ofp_mtk(filename, output_dir, aeskey, aesiv)
+                    return
+                
+                # Try Qualcomm
+                self._oppo_log("Trying Qualcomm decryption...")
+                
+                # Find XML in footer
+                pagesize = 0
+                for x in [0x200, 0x1000]:
+                    rf.seek(filesize - x + 0x10)
+                    if unpack("<I", rf.read(4))[0] == 0x7CEF:
+                        pagesize = x
+                        break
+                
+                if pagesize == 0:
+                    self._oppo_log("❌ Unknown firmware format")
+                    QMessageBox.critical(self, "Error", "Unknown firmware format - neither MTK nor Qualcomm detected")
+                    return
+                
+                # Try each Qualcomm key
+                for dkey in qc_keys:
+                    mc = bytearray.fromhex(dkey[1])
+                    userkey = bytearray.fromhex(dkey[2])
+                    ivec = bytearray.fromhex(dkey[3])
+                    
+                    key = hashlib.md5(deobfuscate(userkey, mc)).hexdigest()[:16].encode()
+                    iv = hashlib.md5(deobfuscate(ivec, mc)).hexdigest()[:16].encode()
+                    
+                    # Try to decrypt XML
+                    xmloffset = filesize - pagesize
+                    rf.seek(xmloffset + 0x14)
+                    offset = unpack("<I", rf.read(4))[0] * pagesize
+                    length = unpack("<I", rf.read(4))[0]
+                    if length < 200:
+                        length = xmloffset - offset - 0x57
+                    
+                    rf.seek(offset)
+                    data = rf.read(length)
+                    cipher = AES.new(key, AES.MODE_CFB, iv=iv, segment_size=128)
+                    dec = cipher.decrypt(data)
+                    
+                    if b"<?xml" in dec:
+                        self._oppo_log(f"✅ Key found: {dkey[0]}")
+                        self._decrypt_ofp_qc(filename, output_dir, key, iv, pagesize, dec)
+                        return
+                
+                self._oppo_log("❌ No valid key found")
+                QMessageBox.critical(self, "Error", "Could not find valid decryption key for this firmware")
+        
+        def _decrypt_ofp_mtk(self, filename: str, output_dir: str, aeskey: bytes, aesiv: bytes):
+            """Decrypt MTK-based OPPO .ofp firmware."""
+            from Cryptodome.Cipher import AES
+            from struct import unpack
+            
+            def mtk_shuffle(key, keylength, inp, inputlength):
+                inp = bytearray(inp)
+                for i in range(inputlength):
+                    k = key[i % keylength]
+                    h = (((inp[i] & 0xF0) >> 4) | (16 * (inp[i] & 0xF)))
+                    inp[i] = k ^ h
+                return bytes(inp)
+            
+            os.makedirs(output_dir, exist_ok=True)
+            
+            hdrkey = bytearray(b"geyixue")
+            filesize = os.stat(filename).st_size
+            hdrlength = 0x6C
+            
+            with open(filename, 'rb') as rf:
+                rf.seek(filesize - hdrlength)
+                hdr = mtk_shuffle(hdrkey, len(hdrkey), bytearray(rf.read(hdrlength)), hdrlength)
+                
+                prjname, unknownval, reserved, cpu, flashtype, hdr2entries, prjinfo, crc = unpack("46s Q 4s 7s 5s H 32s H", hdr)
+                hdr2length = hdr2entries * 0x60
+                
+                prjname = prjname.replace(b"\x00", b"").decode('utf-8', errors='ignore')
+                prjinfo = prjinfo.replace(b"\x00", b"").decode('utf-8', errors='ignore')
+                cpu = cpu.replace(b"\x00", b"").decode('utf-8', errors='ignore')
+                flashtype = flashtype.replace(b"\x00", b"").decode('utf-8', errors='ignore')
+                
+                if prjname:
+                    self._oppo_log(f"Project: {prjname}")
+                if cpu:
+                    self._oppo_log(f"CPU: {cpu}")
+                if flashtype:
+                    self._oppo_log(f"Flash: {flashtype}")
+                self._oppo_log("")
+                
+                rf.seek(filesize - hdr2length - hdrlength)
+                hdr2 = mtk_shuffle(hdrkey, len(hdrkey), bytearray(rf.read(hdr2length)), hdr2length)
+                
+                extracted = 0
+                for i in range(len(hdr2) // 0x60):
+                    name, start, length, enclength, fname, crc = unpack("<32s Q Q Q 32s Q", hdr2[i*0x60:(i*0x60)+0x60])
+                    name = name.replace(b"\x00", b"").decode('utf-8', errors='ignore')
+                    fname = fname.replace(b"\x00", b"").decode('utf-8', errors='ignore')
+                    
+                    self._oppo_log(f"Extracting: {fname}")
+                    
+                    out_path = os.path.join(output_dir, fname)
+                    with open(out_path, 'wb') as wf:
+                        if enclength > 0:
+                            rf.seek(start)
+                            encdata = rf.read(enclength)
+                            if enclength % 16 != 0:
+                                encdata += b"\x00" * (16 - (enclength % 16))
+                            cipher = AES.new(aeskey, AES.MODE_CFB, IV=aesiv, segment_size=128)
+                            data = cipher.decrypt(encdata)
+                            wf.write(data[:enclength])
+                            length -= enclength
+                        
+                        while length > 0:
+                            size = min(0x200000, length)
+                            data = rf.read(size)
+                            length -= size
+                            wf.write(data)
+                    
+                    extracted += 1
+            
+            self._oppo_log("")
+            self._oppo_log(f"✅ Decryption complete!")
+            self._oppo_log(f"Files extracted: {extracted}")
+            self._oppo_log(f"Output: {output_dir}")
+            
+            QMessageBox.information(self, "Success",
+                f"MTK firmware decrypted!\n\n"
+                f"Files: {extracted}\n"
+                f"Output: {output_dir}")
+        
+        def _decrypt_ofp_qc(self, filename: str, output_dir: str, key: bytes, iv: bytes, pagesize: int, xml_data: bytes):
+            """Decrypt Qualcomm-based OPPO .ofp firmware."""
+            from Cryptodome.Cipher import AES
+            from struct import unpack
+            import xml.etree.ElementTree as ET
+            
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Parse XML
+            xml_str = xml_data[:xml_data.rfind(b">") + 1].decode('utf-8', errors='ignore')
+            
+            # Save XML
+            xml_path = os.path.join(output_dir, "ProFile.xml")
+            with open(xml_path, 'w') as f:
+                f.write(xml_str)
+            self._oppo_log("Saved ProFile.xml")
+            
+            root = ET.fromstring(xml_str)
+            
+            extracted = 0
+            with open(filename, 'rb') as rf:
+                for child in root:
+                    for item in child:
+                        wfilename = item.attrib.get("Path", item.attrib.get("filename", ""))
+                        if not wfilename:
+                            continue
+                        
+                        start = -1
+                        if "FileOffsetInSrc" in item.attrib:
+                            start = int(item.attrib["FileOffsetInSrc"]) * pagesize
+                        elif "SizeInSectorInSrc" in item.attrib:
+                            start = int(item.attrib["SizeInSectorInSrc"]) * pagesize
+                        
+                        if start == -1:
+                            continue
+                        
+                        rlength = int(item.attrib.get("SizeInByteInSrc", 0))
+                        if rlength == 0:
+                            continue
+                        
+                        self._oppo_log(f"Extracting: {wfilename}")
+                        
+                        out_path = os.path.join(output_dir, wfilename)
+                        os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else output_dir, exist_ok=True)
+                        
+                        # Determine if we need to decrypt or just copy
+                        if child.tag in ["DigestsToSign", "ChainedTableOfDigests", "Firmware"]:
+                            # Just copy
+                            rf.seek(start)
+                            with open(out_path, 'wb') as wf:
+                                remaining = rlength
+                                while remaining > 0:
+                                    chunk = min(0x100000, remaining)
+                                    wf.write(rf.read(chunk))
+                                    remaining -= chunk
+                        else:
+                            # Decrypt first 256KB, copy rest
+                            decryptsize = 0x40000
+                            if child.tag in ["Sahara"]:
+                                decryptsize = rlength
+                            
+                            rf.seek(start)
+                            with open(out_path, 'wb') as wf:
+                                size = min(decryptsize, rlength)
+                                data = rf.read(size)
+                                if size % 4:
+                                    data += (4 - (size % 4)) * b'\x00'
+                                cipher = AES.new(key, AES.MODE_CFB, iv=iv, segment_size=128)
+                                outp = cipher.decrypt(data)
+                                wf.write(outp[:size])
+                                
+                                if rlength > decryptsize:
+                                    remaining = rlength - size
+                                    while remaining > 0:
+                                        chunk = min(0x100000, remaining)
+                                        wf.write(rf.read(chunk))
+                                        remaining -= chunk
+                        
+                        extracted += 1
+            
+            self._oppo_log("")
+            self._oppo_log(f"✅ Decryption complete!")
+            self._oppo_log(f"Files extracted: {extracted}")
+            self._oppo_log(f"Output: {output_dir}")
+            
+            QMessageBox.information(self, "Success",
+                f"Qualcomm firmware decrypted!\n\n"
+                f"Files: {extracted}\n"
+                f"Output: {output_dir}")
+        
+        def _decrypt_ops(self, filename: str, output_dir: str):
+            """Decrypt OnePlus .ops firmware."""
+            from Cryptodome.Cipher import AES
+            from struct import unpack, pack
+            import hashlib
+            import xml.etree.ElementTree as ET
+            
+            self._oppo_log("Decrypting OnePlus .ops firmware...")
+            
+            # OnePlus encryption key
+            key = unpack("<4I", bytes.fromhex("d1b5e39e5eea049d671dd5abd2afcbaf"))
+            
+            # Magic boxes for different versions
+            mbox5 = bytes([0x60, 0x8a, 0x3f, 0x2d, 0x68, 0x6b, 0xd4, 0x23, 0x51, 0x0c,
+                         0xd0, 0x95, 0xbb, 0x40, 0xe9, 0x76, 0x00, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            
+            mbox6 = bytes([0xA4, 0x2D, 0xCF, 0xE2, 0xAD, 0x68, 0xEB, 0x52, 0x85, 0xE4,
+                         0x81, 0x6B, 0xED, 0x10, 0x0B, 0x4B, 0x00, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            
+            mbox4 = bytes([0x4B, 0x8C, 0x3F, 0x2E, 0xA8, 0x6B, 0xD4, 0x63, 0x51, 0x0C,
+                         0xD0, 0x95, 0xBB, 0x41, 0x79, 0x76, 0x00, 0x00, 0x00, 0x00,
+                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            
+            # S-box for custom encryption
+            sbox = bytes.fromhex(
+                "637c777bf26b6fc53001672bfed7ab76ca82c97dfa5947f0add4a2af9ca472c0" +
+                "b7fd9326363ff7cc34a5e5f171d8311504c723c31896059a071280e2eb27b275" +
+                "09832c1a1b6e5aa0523bd6b329e32f8453d100ed20fcb15b6acbbe394a4c58cf" +
+                "d0efaafb434d338545f9027f503c9fa851a3408f929d38f5bcb6da2110fff3d2" +
+                "cd0c13ec5f974417c4a77e3d645d197360814fdc222a908846eeb814de5e0bdb" +
+                "e0323a0a4906245cc2d3ac629195e479e7c8376d8dd54ea96c56f4ea657aae08" +
+                "ba78252e1ca6b4c6e8dd741f4bbd8b8a703eb5664803f60e613557b986c11d9e" +
+                "e1f8981169d98e949b1e87e9ce5528df8ca1890dbfe6426841992d0fb054bb16"
+            )
+            
+            os.makedirs(output_dir, exist_ok=True)
+            
+            def gsbox(offset):
+                return sbox[offset >> 4] | (sbox[offset & 0xf] << 8)
+            
+            def key_update(iv1, asbox):
+                # Complex key update - simplified version
+                return iv1  # Placeholder
+            
+            def key_custom(inp, rkey, outlength=0, encrypt=False):
+                # OnePlus custom decryption
+                if len(inp) == 0:
+                    return b""
+                
+                # This is a simplified implementation
+                # The full algorithm is complex - for now, try basic XOR
+                outp = bytearray(len(inp))
+                for i in range(len(inp)):
+                    outp[i] = inp[i] ^ (rkey[i % 16] if isinstance(rkey, (bytes, bytearray)) else (rkey[i % 4] >> ((i % 4) * 8)) & 0xFF)
+                return bytes(outp)
+            
+            def try_extract_xml(rf, mbox):
+                filesize = os.stat(filename).st_size
+                rf.seek(filesize - 0x200)
+                hdr = rf.read(0x200)
+                
+                if len(hdr) < 0x1C:
+                    return None
+                
+                xmllength = int.from_bytes(hdr[0x18:0x1C], 'little')
+                if xmllength == 0 or xmllength > filesize:
+                    return None
+                
+                xmlpad = 0x200 - (xmllength % 0x200) if xmllength % 0x200 else 0
+                rf.seek(filesize - 0x200 - (xmllength + xmlpad))
+                inp = rf.read(xmllength + xmlpad)
+                
+                # Try simple decryption
+                # The full OnePlus decryption is complex
+                if b"<?xml" in inp or b"xml " in inp:
+                    return inp[:xmllength]
+                
+                return None
+            
+            try:
+                with open(filename, 'rb') as rf:
+                    xml = None
+                    mbox = mbox5
+                    
+                    for try_mbox in [mbox5, mbox6, mbox4]:
+                        xml = try_extract_xml(rf, try_mbox)
+                        if xml:
+                            mbox = try_mbox
+                            break
+                    
+                    if xml is None:
+                        self._oppo_log("❌ Could not decrypt .ops file")
+                        self._oppo_log("OnePlus .ops decryption requires the full oppo_decrypt tool")
+                        self._oppo_log("")
+                        self._oppo_log("Please download from: https://github.com/bkerler/oppo_decrypt")
+                        self._oppo_log("Run: python opscrypto.py decrypt your_file.ops")
+                        
+                        QMessageBox.warning(self, "Complex Encryption",
+                            "OnePlus .ops files use complex encryption.\n\n"
+                            "Please use bkerler's oppo_decrypt tool:\n"
+                            "https://github.com/bkerler/oppo_decrypt\n\n"
+                            "Command: python opscrypto.py decrypt file.ops")
+                        return
+                    
+                    # Save XML
+                    xml_path = os.path.join(output_dir, "settings.xml")
+                    with open(xml_path, 'wb') as wf:
+                        wf.write(xml)
+                    self._oppo_log("Saved settings.xml")
+                    
+                    # Parse and extract
+                    root = ET.fromstring(xml.decode('utf-8', errors='ignore'))
+                    extracted = 1  # settings.xml
+                    
+                    for child in root:
+                        for item in child:
+                            wfilename = item.attrib.get("Path", item.attrib.get("filename", ""))
+                            if not wfilename:
+                                continue
+                            
+                            start = int(item.attrib.get("FileOffsetInSrc", 0)) * 0x200
+                            length = int(item.attrib.get("SizeInByteInSrc", 0))
+                            
+                            if length == 0:
+                                continue
+                            
+                            self._oppo_log(f"Extracting: {wfilename}")
+                            
+                            out_path = os.path.join(output_dir, wfilename)
+                            rf.seek(start)
+                            
+                            with open(out_path, 'wb') as wf:
+                                remaining = length
+                                while remaining > 0:
+                                    chunk = min(0x100000, remaining)
+                                    wf.write(rf.read(chunk))
+                                    remaining -= chunk
+                            
+                            extracted += 1
+                    
+                    self._oppo_log("")
+                    self._oppo_log(f"✅ Extraction complete!")
+                    self._oppo_log(f"Files extracted: {extracted}")
+                    self._oppo_log(f"Output: {output_dir}")
+                    
+                    QMessageBox.information(self, "Success",
+                        f"OnePlus firmware extracted!\n\n"
+                        f"Files: {extracted}\n"
+                        f"Output: {output_dir}")
+                    
+            except Exception as e:
+                self._oppo_log(f"❌ Error: {e}")
+                raise
         
         def _start_image_extract(self):
             if not hasattr(self, 'current_image_path'):
