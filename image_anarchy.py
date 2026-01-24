@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
-Version: 2.0
+Version: 2.1
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -191,7 +191,7 @@ def _extract_bundled_resources():
     app_dir = os.path.dirname(sys.executable)
     
     # Resources to extract if they don't exist
-    resources = ['drivers', 'platform-tools', 'PortableGit', 'plugins']
+    resources = ['drivers', 'platform-tools', 'PortableGit', 'plugins', 'Tools']
     
     for resource in resources:
         src = os.path.join(meipass, resource)
@@ -931,6 +931,17 @@ def detect_image_type(file_path: str) -> str:
             erofs_magic = struct.unpack('<I', erofs_header)[0]
             if erofs_magic == EROFS_MAGIC:
                 return 'erofs'
+    
+    # Check for LZ4 compressed file (common for .lz4 images)
+    # LZ4 frame magic: 0x184D2204 (little endian reads as 04 22 4D 18)
+    with open(file_path, 'rb') as f:
+        lz4_header = f.read(4)
+        if len(lz4_header) >= 4:
+            if lz4_header == b'\x04\x22\x4d\x18':  # LZ4 frame magic
+                return 'lz4'
+            # Also check for legacy LZ4 (block format) - magic 0x184C2102
+            if lz4_header == b'\x02\x21\x4c\x18':
+                return 'lz4'
     
     # Check for FAT filesystem (common for modem, firmware partitions)
     with open(file_path, 'rb') as f:
@@ -3986,6 +3997,7 @@ class VbmetaPatcher:
         
     def patch(self, output_path: str, disable_verity: bool = False, 
               disable_verification: bool = False,
+              reset_flags: bool = False,
               signer: Optional['AvbSigner'] = None) -> bool:
         """Patch vbmeta and optionally re-sign with custom key.
         
@@ -3993,12 +4005,13 @@ class VbmetaPatcher:
             output_path: Where to save the patched vbmeta
             disable_verity: Set the HASHTREE_DISABLED flag
             disable_verification: Set the VERIFICATION_DISABLED flag
+            reset_flags: Reset ALL flags to 0 (restore stock behavior)
             signer: Optional AvbSigner for re-signing with custom key
             
         Returns:
             True if successful, False otherwise
         """
-        if not disable_verity and not disable_verification and not signer:
+        if not disable_verity and not disable_verification and not reset_flags and not signer:
             # Nothing to do, just copy
             import shutil
             shutil.copy2(self.input_path, output_path)
@@ -4018,20 +4031,22 @@ class VbmetaPatcher:
             current_flags = struct.unpack('>I', data[self.FLAGS_OFFSET:self.FLAGS_OFFSET+4])[0]
             
             # Apply new flags
-            new_flags = current_flags
-            if disable_verity:
-                new_flags |= self.FLAG_DISABLE_VERITY
-            if disable_verification:
-                new_flags |= self.FLAG_DISABLE_VERIFICATION
+            changes = []
+            if reset_flags:
+                # Reset all flags to 0 (restore stock verification)
+                new_flags = 0
+                changes.append("flags reset to stock (0x00)")
+            else:
+                new_flags = current_flags
+                if disable_verity:
+                    new_flags |= self.FLAG_DISABLE_VERITY
+                    changes.append("verity disabled")
+                if disable_verification:
+                    new_flags |= self.FLAG_DISABLE_VERIFICATION
+                    changes.append("verification disabled")
             
             # Write new flags
             data[self.FLAGS_OFFSET:self.FLAGS_OFFSET+4] = struct.pack('>I', new_flags)
-            
-            changes = []
-            if disable_verity:
-                changes.append("verity disabled")
-            if disable_verification:
-                changes.append("verification disabled")
             
             # Re-sign if signer provided
             if signer:
@@ -6016,6 +6031,1077 @@ class Ext4ImageExtractor:
         logger.info(f"  Extracted symlink: {full_path} -> {target}")
 
 
+class ErofsImageExtractor:
+    """Extract files from EROFS (Enhanced Read-Only File System) images.
+    
+    EROFS is a read-only filesystem used in modern Android devices (Android 13+).
+    It supports LZ4 and LZMA compression for better compression ratios.
+    
+    Superblock layout (at offset 1024):
+    - 0x00: magic (4 bytes) = 0xE0F5E1E2
+    - 0x04: checksum (4 bytes)
+    - 0x08: feature_compat (4 bytes)
+    - 0x0C: blkszbits (1 byte) - log2(block_size)
+    - 0x0D: sb_extslots (1 byte)
+    - 0x0E: root_nid (2 bytes) - root inode number
+    - 0x10: inos (8 bytes) - total inodes
+    - 0x18: build_time (8 bytes)
+    - 0x20: build_time_nsec (4 bytes)
+    - 0x24: blocks (4 bytes) - total blocks
+    - 0x28: meta_blkaddr (4 bytes)
+    - 0x2C: xattr_blkaddr (4 bytes)
+    - 0x30: uuid (16 bytes)
+    - 0x40: volume_name (16 bytes)
+    - 0x50: feature_incompat (4 bytes)
+    - 0x54: union (2 bytes)
+    - 0x56: extra_devices (2 bytes)
+    - 0x58: devt_slotoff (2 bytes)
+    - 0x5A: dirblkbits (1 byte)
+    - 0x5B: xattr_prefix_count (1 byte)
+    - 0x5C: xattr_prefix_start (4 bytes)
+    - 0x60: packed_nid (8 bytes)
+    - 0x68: reserved (24 bytes)
+    """
+    
+    # EROFS constants
+    EROFS_SUPER_OFFSET = 1024
+    EROFS_SUPER_MAGIC = 0xE0F5E1E2
+    
+    # Inode formats
+    EROFS_INODE_FLAT_PLAIN = 0      # No compression, data follows inode
+    EROFS_INODE_FLAT_COMPRESSION_LEGACY = 1  # Deprecated
+    EROFS_INODE_FLAT_INLINE = 2     # Data inline in inode (small files)
+    EROFS_INODE_FLAT_COMPRESSION = 3  # Compressed data
+    EROFS_INODE_CHUNK_BASED = 4     # Chunk-based (newer format)
+    
+    # File types
+    EROFS_FT_UNKNOWN = 0
+    EROFS_FT_REG_FILE = 1
+    EROFS_FT_DIR = 2
+    EROFS_FT_CHRDEV = 3
+    EROFS_FT_BLKDEV = 4
+    EROFS_FT_FIFO = 5
+    EROFS_FT_SOCK = 6
+    EROFS_FT_SYMLINK = 7
+    
+    # Mode flags
+    S_IFMT = 0o170000
+    S_IFREG = 0o100000
+    S_IFDIR = 0o040000
+    S_IFLNK = 0o120000
+    
+    # Feature flags
+    EROFS_FEATURE_INCOMPAT_LZ4_0PADDING = 0x0001
+    EROFS_FEATURE_INCOMPAT_COMPR_CFGS = 0x0002
+    EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER = 0x0004
+    EROFS_FEATURE_INCOMPAT_CHUNKED_FILE = 0x0008
+    EROFS_FEATURE_INCOMPAT_DEVICE_TABLE = 0x0010
+    EROFS_FEATURE_INCOMPAT_ZTAILPACKING = 0x0020
+    EROFS_FEATURE_INCOMPAT_FRAGMENTS = 0x0040
+    EROFS_FEATURE_INCOMPAT_DEDUPE = 0x0080
+    
+    def __init__(self, progress_callback: Optional[Callable] = None):
+        self.progress_callback = progress_callback
+        self.superblock = {}
+        self.block_size = 4096
+        self.meta_blkaddr = 0
+        self.root_nid = 0
+        self.has_lz4 = False
+        self._lz4_available = False
+        self._check_lz4()
+    
+    @staticmethod
+    def is_erofs(file_path: str) -> bool:
+        """Check if a file is an EROFS image.
+        
+        Args:
+            file_path: Path to the file to check
+            
+        Returns:
+            True if the file is an EROFS image
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(1024)  # EROFS superblock offset
+                magic = f.read(4)
+                return magic == b'\xe2\xe1\xf5\xe0'  # Little-endian 0xE0F5E1E2
+        except (IOError, OSError):
+            return False
+    
+    def _check_lz4(self):
+        """Check if LZ4 decompression is available."""
+        try:
+            import lz4.block
+            self._lz4_available = True
+        except ImportError:
+            self._lz4_available = False
+            logger.warning("LZ4 not available - compressed EROFS files cannot be extracted")
+    
+    def analyze(self, input_path: str) -> dict:
+        """Analyze an EROFS image and return metadata."""
+        info = {
+            'type': 'erofs',
+            'valid': False,
+        }
+        
+        try:
+            with open(input_path, 'rb') as f:
+                self._read_superblock(f)
+                info['valid'] = True
+                info['block_size'] = self.block_size
+                info['total_blocks'] = self.superblock.get('blocks', 0)
+                info['total_inodes'] = self.superblock.get('inos', 0)
+                info['volume_name'] = self.superblock.get('volume_name', '')
+                info['uuid'] = self.superblock.get('uuid', '')
+                info['build_time'] = self.superblock.get('build_time', 0)
+                info['feature_incompat'] = self.superblock.get('feature_incompat', 0)
+                
+                # Decode feature flags
+                features = []
+                feat = info['feature_incompat']
+                if feat & self.EROFS_FEATURE_INCOMPAT_LZ4_0PADDING:
+                    features.append('LZ4_0PADDING')
+                    self.has_lz4 = True
+                if feat & self.EROFS_FEATURE_INCOMPAT_COMPR_CFGS:
+                    features.append('COMPR_CFGS')
+                if feat & self.EROFS_FEATURE_INCOMPAT_BIG_PCLUSTER:
+                    features.append('BIG_PCLUSTER')
+                if feat & self.EROFS_FEATURE_INCOMPAT_CHUNKED_FILE:
+                    features.append('CHUNKED_FILE')
+                if feat & self.EROFS_FEATURE_INCOMPAT_DEVICE_TABLE:
+                    features.append('DEVICE_TABLE')
+                if feat & self.EROFS_FEATURE_INCOMPAT_ZTAILPACKING:
+                    features.append('ZTAILPACKING')
+                if feat & self.EROFS_FEATURE_INCOMPAT_FRAGMENTS:
+                    features.append('FRAGMENTS')
+                if feat & self.EROFS_FEATURE_INCOMPAT_DEDUPE:
+                    features.append('DEDUPE')
+                info['features'] = features
+                
+                # Count root directory entries
+                root_inode = self._read_inode(f, self.root_nid)
+                if root_inode:
+                    info['root_inode_size'] = root_inode.get('size', 0)
+                    
+        except Exception as e:
+            info['error'] = str(e)
+            logger.error(f"Failed to analyze EROFS: {e}")
+        
+        return info
+    
+    def list_files(self, input_path: str, max_depth: int = -1) -> list[dict]:
+        """List all files in an EROFS image."""
+        files = []
+        
+        with open(input_path, 'rb') as f:
+            self._read_superblock(f)
+            self._list_directory(f, self.root_nid, '', files, 0, max_depth)
+        
+        return files
+    
+    def extract(self, input_path: str, output_dir: str,
+                file_list: Optional[list[str]] = None,
+                use_native: bool = False) -> dict:
+        """Extract files from EROFS image.
+        
+        Args:
+            input_path: Path to EROFS image
+            output_dir: Output directory for extracted files
+            file_list: Optional list of specific files to extract
+            use_native: Force pure Python extraction (skip fsck.erofs)
+            
+        Returns:
+            Dict with 'files', 'errors', 'skipped' keys
+        """
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        extracted = {'files': {}, 'errors': [], 'skipped': [], 'method': 'unknown'}
+        
+        # Try fsck.erofs first (more reliable for complex images)
+        if not use_native and file_list is None:
+            fsck_info = self._find_fsck_erofs()
+            if fsck_info:
+                logger.info(f"Using fsck.erofs for extraction (WSL: {fsck_info.get('use_wsl', False)})")
+                result = self._extract_via_fsck(input_path, output_dir, fsck_info)
+                if result['success']:
+                    extracted['method'] = 'fsck.erofs'
+                    extracted['files'] = result.get('files', {})
+                    # Write EROFS info file
+                    self._write_erofs_info(input_path, output_dir)
+                    return extracted
+                else:
+                    logger.warning(f"fsck.erofs extraction failed: {result.get('error', 'unknown')}, falling back to native")
+        
+        # Fall back to pure Python extraction
+        logger.info("Using native Python extraction")
+        extracted['method'] = 'native'
+        
+        with open(input_path, 'rb') as f:
+            self._read_superblock(f)
+            
+            # Write EROFS info file
+            self._write_erofs_info(input_path, output_dir)
+            
+            self._extract_directory(f, self.root_nid, '', output_dir, file_list, extracted)
+        
+        return extracted
+    
+    def _write_erofs_info(self, input_path: str, output_dir: str):
+        """Write EROFS image info to a text file."""
+        info_path = Path(output_dir) / 'erofs_info.txt'
+        info = self.analyze(input_path)
+        with open(info_path, 'w') as info_f:
+            info_f.write("EROFS Image Information\n")
+            info_f.write("=" * 40 + "\n")
+            info_f.write(f"Block size: {self.block_size}\n")
+            info_f.write(f"Total blocks: {info.get('total_blocks', 'N/A')}\n")
+            info_f.write(f"Total inodes: {info.get('total_inodes', 'N/A')}\n")
+            info_f.write(f"Volume name: {info.get('volume_name', 'N/A')}\n")
+            info_f.write(f"UUID: {info.get('uuid', 'N/A')}\n")
+            info_f.write(f"Features: {', '.join(info.get('features', []))}\n")
+            info_f.write(f"Extraction method: {info.get('extraction_method', 'N/A')}\n")
+    
+    def _find_fsck_erofs(self) -> Optional[dict]:
+        """Find EROFS extraction tool (extract.erofs or fsck.erofs).
+        
+        Checks:
+        1. Bundled tools directory (extract.erofs.exe, fsck.erofs.exe)
+        2. System PATH (native Windows/Linux)
+        3. WSL (if on Windows)
+        
+        Returns:
+            Dict with 'path', 'use_wsl', and 'tool' keys, or None if not found
+        """
+        import shutil
+        
+        # Check Tools directory first (prefer extract.erofs for extraction)
+        tools_dir = Path(__file__).parent / 'Tools'
+        if tools_dir.exists():
+            # Prefer extract.erofs.exe (dedicated extraction tool)
+            for candidate in ['extract.erofs.exe', 'extract.erofs']:
+                tool_path = tools_dir / candidate
+                if tool_path.exists():
+                    return {'path': str(tool_path), 'use_wsl': False, 'tool': 'extract.erofs'}
+            # Fall back to fsck.erofs
+            for candidate in ['fsck.erofs.exe', 'fsck.erofs']:
+                tool_path = tools_dir / candidate
+                if tool_path.exists():
+                    return {'path': str(tool_path), 'use_wsl': False, 'tool': 'fsck.erofs'}
+        
+        # Check native PATH
+        extract = shutil.which('extract.erofs')
+        if extract:
+            return {'path': extract, 'use_wsl': False, 'tool': 'extract.erofs'}
+        
+        fsck = shutil.which('fsck.erofs')
+        if fsck:
+            return {'path': fsck, 'use_wsl': False, 'tool': 'fsck.erofs'}
+        
+        # On Windows, try WSL (quietly - don't spam errors)
+        if sys.platform == 'win32':
+            try:
+                # Check if WSL is available
+                result = subprocess.run(
+                    ['wsl', '--list'],
+                    capture_output=True,
+                    timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                if result.returncode == 0:
+                    # Check if fsck.erofs exists in WSL
+                    result = subprocess.run(
+                        ['wsl', 'which', 'fsck.erofs'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return {'path': 'fsck.erofs', 'use_wsl': True, 'tool': 'fsck.erofs'}
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                # WSL not available - silently continue
+                pass
+        
+        return None
+    
+    def _extract_via_fsck(self, input_path: str, output_dir: str, fsck_info: dict) -> dict:
+        """Extract EROFS image using extract.erofs or fsck.erofs.
+        
+        Args:
+            input_path: Path to EROFS image
+            output_dir: Output directory
+            fsck_info: Dict with 'path', 'use_wsl', and 'tool' keys
+            
+        Returns:
+            Dict with 'success', 'files', 'error' keys
+        """
+        result = {'success': False, 'files': {}, 'error': None}
+        
+        try:
+            input_file = Path(input_path).resolve()
+            output_path = Path(output_dir).resolve()
+            use_wsl = fsck_info.get('use_wsl', False)
+            tool_path = fsck_info['path']
+            tool_type = fsck_info.get('tool', 'fsck.erofs')
+            
+            if use_wsl:
+                # Convert Windows paths to WSL paths
+                wsl_input = self._windows_to_wsl_path(str(input_file))
+                wsl_output = self._windows_to_wsl_path(str(output_path))
+                
+                # WSL always uses fsck.erofs
+                cmd = [
+                    'wsl', tool_path,
+                    f'--extract={wsl_output}',
+                    '--overwrite',
+                    wsl_input
+                ]
+            elif tool_type == 'extract.erofs':
+                # extract.erofs.exe has different CLI: -i IMAGE -o OUTDIR -x
+                cmd = [
+                    tool_path,
+                    '-i', str(input_file),
+                    '-o', str(output_path),
+                    '-x',  # Extract all
+                    '-f',  # Overwrite existing
+                    '-s',  # Silent (no progress spam)
+                ]
+            else:
+                # fsck.erofs CLI
+                cmd = [
+                    tool_path,
+                    f'--extract={output_path}',
+                    '--overwrite',
+                    str(input_file)
+                ]
+            
+            logger.debug(f"Running: {' '.join(cmd)}")
+            
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,  # 10 minute timeout for large images
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            
+            if proc.returncode == 0:
+                result['success'] = True
+                # Count extracted files
+                for root, dirs, files in os.walk(output_dir):
+                    for f in files:
+                        rel_path = os.path.relpath(os.path.join(root, f), output_dir)
+                        result['files'][rel_path] = {'size': os.path.getsize(os.path.join(root, f))}
+                logger.info(f"{tool_type} extracted {len(result['files'])} files")
+            else:
+                result['error'] = proc.stderr or f"{tool_type} exited with code {proc.returncode}"
+                logger.debug(f"{tool_type} stderr: {proc.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            result['error'] = "Extraction timed out (>10 minutes)"
+        except Exception as e:
+            result['error'] = str(e)
+        
+        return result
+    
+    def can_extract_advanced(self) -> bool:
+        """Check if advanced extraction via fsck.erofs is available.
+        
+        Returns:
+            True if fsck.erofs is available (native or WSL)
+        """
+        return self._find_fsck_erofs() is not None
+    
+    def get_fsck_info(self) -> Optional[dict]:
+        """Get information about fsck.erofs availability.
+        
+        Returns:
+            Dict with 'path' and 'use_wsl' keys, or None if not available
+        """
+        return self._find_fsck_erofs()
+    
+    def _read_superblock(self, f: BinaryIO):
+        """Read and parse EROFS superblock."""
+        f.seek(self.EROFS_SUPER_OFFSET)
+        sb = f.read(128)
+        
+        # Check magic
+        magic = struct.unpack('<I', sb[0x00:0x04])[0]
+        if magic != self.EROFS_SUPER_MAGIC:
+            raise PayloadError(f"Invalid EROFS magic: {hex(magic)}, expected {hex(self.EROFS_SUPER_MAGIC)}")
+        
+        # Parse superblock fields
+        self.superblock = {
+            'magic': magic,
+            'checksum': struct.unpack('<I', sb[0x04:0x08])[0],
+            'feature_compat': struct.unpack('<I', sb[0x08:0x0C])[0],
+            'blkszbits': sb[0x0C],
+            'sb_extslots': sb[0x0D],
+            'root_nid': struct.unpack('<H', sb[0x0E:0x10])[0],
+            'inos': struct.unpack('<Q', sb[0x10:0x18])[0],
+            'build_time': struct.unpack('<Q', sb[0x18:0x20])[0],
+            'build_time_nsec': struct.unpack('<I', sb[0x20:0x24])[0],
+            'blocks': struct.unpack('<I', sb[0x24:0x28])[0],
+            'meta_blkaddr': struct.unpack('<I', sb[0x28:0x2C])[0],
+            'xattr_blkaddr': struct.unpack('<I', sb[0x2C:0x30])[0],
+            'uuid': sb[0x30:0x40].hex(),
+            'volume_name': sb[0x40:0x50].rstrip(b'\x00').decode('utf-8', errors='ignore'),
+            'feature_incompat': struct.unpack('<I', sb[0x50:0x54])[0],
+        }
+        
+        self.block_size = 1 << self.superblock['blkszbits']
+        self.meta_blkaddr = self.superblock['meta_blkaddr']
+        self.root_nid = self.superblock['root_nid']
+        
+        logger.info(f"EROFS: block_size={self.block_size}, blocks={self.superblock['blocks']}, "
+                   f"inodes={self.superblock['inos']}, root_nid={self.root_nid}")
+    
+    def _nid_to_offset(self, nid: int) -> int:
+        """Convert node ID to file offset."""
+        return self.meta_blkaddr * self.block_size + nid * 32
+    
+    def _read_inode(self, f: BinaryIO, nid: int) -> Optional[dict]:
+        """Read an inode by node ID."""
+        if nid == 0:
+            return None
+        
+        offset = self._nid_to_offset(nid)
+        f.seek(offset)
+        
+        # Read compact inode first (32 bytes minimum)
+        inode_data = f.read(64)  # Read extra for extended inode
+        
+        if len(inode_data) < 32:
+            return None
+        
+        # Parse inode format and version
+        i_format = struct.unpack('<H', inode_data[0:2])[0]
+        layout = (i_format >> 1) & 0x7  # bits 1-3 are layout
+        version = i_format & 0x1  # bit 0 is version (0=compact, 1=extended)
+        
+        inode = {
+            'format': i_format,
+            'layout': layout,
+            'version': version,
+            'nid': nid,
+        }
+        
+        if version == 0:
+            # Compact inode (32 bytes)
+            inode['xattr_icount'] = struct.unpack('<H', inode_data[2:4])[0]
+            inode['mode'] = struct.unpack('<H', inode_data[4:6])[0]
+            inode['nlink'] = struct.unpack('<H', inode_data[6:8])[0]
+            inode['size'] = struct.unpack('<I', inode_data[8:12])[0]
+            inode['reserved'] = struct.unpack('<I', inode_data[12:16])[0]
+            # Union field depends on layout
+            inode['raw_blkaddr'] = struct.unpack('<I', inode_data[16:20])[0]
+            inode['ino'] = struct.unpack('<I', inode_data[20:24])[0]
+            inode['uid'] = struct.unpack('<H', inode_data[24:26])[0]
+            inode['gid'] = struct.unpack('<H', inode_data[26:28])[0]
+            inode['reserved2'] = struct.unpack('<I', inode_data[28:32])[0]
+            inode['inode_size'] = 32
+        else:
+            # Extended inode (64 bytes)
+            inode['xattr_icount'] = struct.unpack('<H', inode_data[2:4])[0]
+            inode['mode'] = struct.unpack('<H', inode_data[4:6])[0]
+            inode['reserved'] = struct.unpack('<H', inode_data[6:8])[0]
+            inode['size'] = struct.unpack('<Q', inode_data[8:16])[0]
+            inode['raw_blkaddr'] = struct.unpack('<I', inode_data[16:20])[0]
+            inode['ino'] = struct.unpack('<I', inode_data[20:24])[0]
+            inode['uid'] = struct.unpack('<I', inode_data[24:28])[0]
+            inode['gid'] = struct.unpack('<I', inode_data[28:32])[0]
+            inode['mtime'] = struct.unpack('<Q', inode_data[32:40])[0]
+            inode['mtime_nsec'] = struct.unpack('<I', inode_data[40:44])[0]
+            inode['nlink'] = struct.unpack('<I', inode_data[44:48])[0]
+            inode['reserved2'] = inode_data[48:64]
+            inode['inode_size'] = 64
+        
+        # Determine file type from mode
+        mode = inode['mode']
+        if (mode & self.S_IFMT) == self.S_IFDIR:
+            inode['type'] = 'dir'
+        elif (mode & self.S_IFMT) == self.S_IFREG:
+            inode['type'] = 'file'
+        elif (mode & self.S_IFMT) == self.S_IFLNK:
+            inode['type'] = 'symlink'
+        else:
+            inode['type'] = 'other'
+        
+        return inode
+    
+    def _list_directory(self, f: BinaryIO, dir_nid: int, path: str, 
+                        files: list, depth: int, max_depth: int):
+        """Recursively list directory contents."""
+        if max_depth >= 0 and depth > max_depth:
+            return
+        
+        inode = self._read_inode(f, dir_nid)
+        if not inode or inode['type'] != 'dir':
+            return
+        
+        # Read directory entries
+        entries = self._read_directory_entries(f, inode)
+        
+        for entry in entries:
+            name = entry['name']
+            if name in ('.', '..'):
+                continue
+            
+            full_path = f"{path}/{name}" if path else name
+            entry_inode = self._read_inode(f, entry['nid'])
+            
+            if entry_inode:
+                file_info = {
+                    'path': full_path,
+                    'name': name,
+                    'type': entry_inode['type'],
+                    'size': entry_inode['size'],
+                    'mode': entry_inode['mode'],
+                    'nid': entry['nid'],
+                }
+                files.append(file_info)
+                
+                # Recurse into subdirectories
+                if entry_inode['type'] == 'dir':
+                    self._list_directory(f, entry['nid'], full_path, files, depth + 1, max_depth)
+    
+    def _read_directory_entries(self, f: BinaryIO, inode: dict) -> list[dict]:
+        """Read directory entries from an inode following EROFS on-disk format.
+        
+        EROFS directory format:
+        - Directory entries are 12 bytes each: nid(8) + nameoff(2) + file_type(1) + reserved(1)
+        - Entries are stored at the start of the block
+        - Names are stored after all entries (at nameoff position from block start)
+        - nameoff[0] indicates where names start (= entry_count * 12)
+        - Names are NOT null-terminated; use offsets to determine length
+        """
+        entries = []
+        layout = inode['layout']
+        
+        # Calculate data offset based on layout
+        inode_offset = self._nid_to_offset(inode['nid'])
+        
+        if layout == self.EROFS_INODE_FLAT_INLINE:
+            # Data is inline after inode
+            data_offset = inode_offset + inode['inode_size']
+            # Account for xattr if present
+            if inode.get('xattr_icount', 0) > 0:
+                xattr_size = (inode['xattr_icount'] - 1) * 4 + 12
+                data_offset += xattr_size
+        elif layout == self.EROFS_INODE_FLAT_PLAIN:
+            # Data in separate blocks
+            data_offset = inode['raw_blkaddr'] * self.block_size
+        else:
+            # Other layouts - try plain block reference
+            data_offset = inode['raw_blkaddr'] * self.block_size
+        
+        f.seek(data_offset)
+        dir_data = f.read(min(inode['size'], 65536))  # Read directory data
+        
+        if len(dir_data) < 12:
+            return entries
+        
+        # Read first entry to get nameoff[0] which tells us entry count
+        first_nameoff = struct.unpack('<H', dir_data[8:10])[0]
+        
+        # Number of entries = nameoff[0] / 12
+        if first_nameoff < 12:
+            return entries
+        
+        entry_count = first_nameoff // 12
+        
+        # Parse all entries
+        raw_entries = []
+        for i in range(entry_count):
+            offset = i * 12
+            if offset + 12 > len(dir_data):
+                break
+            
+            nid = struct.unpack('<Q', dir_data[offset:offset+8])[0]
+            nameoff = struct.unpack('<H', dir_data[offset+8:offset+10])[0]
+            file_type = dir_data[offset+10]
+            
+            raw_entries.append({
+                'nid': nid,
+                'nameoff': nameoff,
+                'file_type': file_type,
+            })
+        
+        # Now extract names using offsets
+        for i, entry in enumerate(raw_entries):
+            nameoff = entry['nameoff']
+            
+            # Name ends at next entry's nameoff, or at end of dir_data
+            if i + 1 < len(raw_entries):
+                name_end = raw_entries[i + 1]['nameoff']
+            else:
+                # Last entry - name goes to end of directory data
+                name_end = len(dir_data)
+            
+            # Handle names that might be padded with zeros
+            name_bytes = dir_data[nameoff:name_end]
+            # Strip trailing nulls and decode
+            name_bytes = name_bytes.rstrip(b'\x00')
+            
+            if name_bytes:
+                name = name_bytes.decode('utf-8', errors='ignore')
+                entries.append({
+                    'nid': entry['nid'],
+                    'name': name,
+                    'file_type': entry['file_type'],
+                })
+        
+        return entries
+    
+    def _extract_directory(self, f: BinaryIO, dir_nid: int, path: str,
+                           output_dir: str, file_list: Optional[list[str]], 
+                           extracted: dict):
+        """Recursively extract directory contents."""
+        inode = self._read_inode(f, dir_nid)
+        if not inode or inode['type'] != 'dir':
+            return
+        
+        entries = self._read_directory_entries(f, inode)
+        total = len(entries)
+        
+        for idx, entry in enumerate(entries):
+            name = entry['name']
+            if name in ('.', '..'):
+                continue
+            
+            full_path = f"{path}/{name}" if path else name
+            
+            # Skip if file_list specified and this file not in it
+            if file_list and full_path not in file_list:
+                # But still recurse into directories
+                entry_inode = self._read_inode(f, entry['nid'])
+                if entry_inode and entry_inode['type'] == 'dir':
+                    self._extract_directory(f, entry['nid'], full_path, output_dir, 
+                                           file_list, extracted)
+                continue
+            
+            if self.progress_callback and total > 0:
+                self.progress_callback(idx, total, f"Extracting: {full_path}")
+            
+            entry_inode = self._read_inode(f, entry['nid'])
+            if not entry_inode:
+                continue
+            
+            if entry_inode['type'] == 'dir':
+                # Create directory and recurse
+                dir_path = Path(output_dir) / full_path
+                dir_path.mkdir(parents=True, exist_ok=True)
+                self._extract_directory(f, entry['nid'], full_path, output_dir,
+                                       file_list, extracted)
+                
+            elif entry_inode['type'] == 'file':
+                self._extract_file(f, entry_inode, full_path, output_dir, extracted)
+                
+            elif entry_inode['type'] == 'symlink':
+                self._extract_symlink(f, entry_inode, full_path, output_dir, extracted)
+    
+    def _extract_file(self, f: BinaryIO, inode: dict, full_path: str,
+                      output_dir: str, extracted: dict):
+        """Extract a regular file."""
+        output_path = Path(output_dir) / full_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            data = self._read_file_data(f, inode)
+            output_path.write_bytes(data)
+            extracted['files'][full_path] = {
+                'path': str(output_path),
+                'size': len(data),
+            }
+            logger.debug(f"  Extracted: {full_path} ({len(data)} bytes)")
+        except Exception as e:
+            extracted['errors'].append({'path': full_path, 'error': str(e)})
+            logger.warning(f"  Failed to extract {full_path}: {e}")
+    
+    def _extract_symlink(self, f: BinaryIO, inode: dict, full_path: str,
+                         output_dir: str, extracted: dict):
+        """Extract a symbolic link."""
+        output_path = Path(output_dir) / full_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            target = self._read_file_data(f, inode).decode('utf-8', errors='ignore')
+            
+            # Write symlink info to a text file
+            link_file = output_path.with_suffix(output_path.suffix + '.symlink')
+            link_file.write_text(f"SYMLINK -> {target}")
+            
+            extracted['files'][full_path] = {
+                'path': str(link_file),
+                'target': target,
+                'type': 'symlink',
+            }
+            logger.debug(f"  Extracted symlink: {full_path} -> {target}")
+        except Exception as e:
+            extracted['errors'].append({'path': full_path, 'error': str(e)})
+    
+    def _read_file_data(self, f: BinaryIO, inode: dict) -> bytes:
+        """Read file data based on inode layout."""
+        layout = inode['layout']
+        size = inode['size']
+        
+        if size == 0:
+            return b''
+        
+        inode_offset = self._nid_to_offset(inode['nid'])
+        
+        if layout == self.EROFS_INODE_FLAT_INLINE:
+            # Data is inline after inode header
+            data_offset = inode_offset + inode['inode_size']
+            # Account for xattr if present
+            if inode.get('xattr_icount', 0) > 0:
+                xattr_size = (inode['xattr_icount'] - 1) * 4 + 12
+                data_offset += xattr_size
+            
+            f.seek(data_offset)
+            return f.read(size)
+        
+        elif layout == self.EROFS_INODE_FLAT_PLAIN:
+            # Data in separate blocks, uncompressed
+            data_offset = inode['raw_blkaddr'] * self.block_size
+            f.seek(data_offset)
+            return f.read(size)
+        
+        elif layout == self.EROFS_INODE_FLAT_COMPRESSION or layout == self.EROFS_INODE_FLAT_COMPRESSION_LEGACY:
+            # Compressed data
+            if not self._lz4_available:
+                raise PayloadError(f"LZ4 not available - cannot extract compressed file (layout={layout})")
+            
+            return self._read_compressed_data(f, inode)
+        
+        elif layout == self.EROFS_INODE_CHUNK_BASED:
+            # Chunk-based - read chunk index
+            return self._read_chunked_data(f, inode)
+        
+        else:
+            # Unknown layout - try plain read
+            logger.warning(f"Unknown EROFS layout {layout}, attempting plain read")
+            data_offset = inode['raw_blkaddr'] * self.block_size
+            f.seek(data_offset)
+            return f.read(size)
+    
+    def _read_compressed_data(self, f: BinaryIO, inode: dict) -> bytes:
+        """Read and decompress LZ4-compressed data."""
+        import lz4.block
+        
+        size = inode['size']
+        raw_blkaddr = inode['raw_blkaddr']
+        
+        # For compressed files, raw_blkaddr points to compressed data
+        # The compression uses LZ4 block format
+        
+        result = bytearray()
+        data_offset = raw_blkaddr * self.block_size
+        
+        f.seek(data_offset)
+        
+        # Read compressed blocks and decompress
+        # This is simplified - actual EROFS compression is more complex
+        remaining = size
+        
+        while remaining > 0:
+            # Read block header (4 bytes for compressed size in simple case)
+            f.seek(data_offset)
+            compressed_data = f.read(self.block_size * 2)  # Read enough for one pcluster
+            
+            try:
+                # Try to decompress
+                decompressed = lz4.block.decompress(compressed_data, uncompressed_size=min(remaining, self.block_size * 4))
+                result.extend(decompressed[:remaining])
+                remaining -= len(decompressed)
+                data_offset += len(compressed_data)
+            except:
+                # If decompression fails, assume uncompressed
+                result.extend(compressed_data[:remaining])
+                remaining = 0
+        
+        return bytes(result[:size])
+    
+    def _read_chunked_data(self, f: BinaryIO, inode: dict) -> bytes:
+        """Read chunk-based file data."""
+        # Chunk-based format stores chunk index after inode
+        # Each chunk can be stored separately
+        
+        size = inode['size']
+        inode_offset = self._nid_to_offset(inode['nid'])
+        
+        # For now, try simple sequential read
+        data_offset = inode['raw_blkaddr'] * self.block_size
+        f.seek(data_offset)
+        return f.read(size)
+
+    def repack(self, source_dir: str, output_path: str,
+               compression: str = 'lz4',
+               block_size: int = 4096,
+               uuid: Optional[str] = None,
+               volume_name: Optional[str] = None,
+               extra_args: Optional[list[str]] = None) -> bool:
+        """Repack a directory into an EROFS image using mkfs.erofs.
+        
+        Args:
+            source_dir: Directory containing files to pack
+            output_path: Output EROFS image path
+            compression: Compression algorithm ('none', 'lz4', 'lzma', 'lz4hc')
+            block_size: Block size (default 4096)
+            uuid: Optional UUID for the filesystem
+            volume_name: Optional volume label
+            extra_args: Additional mkfs.erofs arguments
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        source_path = Path(source_dir).resolve()
+        output_file = Path(output_path).resolve()
+        
+        if not source_path.is_dir():
+            logger.error(f"Source directory does not exist: {source_dir}")
+            return False
+        
+        # Find mkfs.erofs
+        mkfs_info = self._find_mkfs_erofs()
+        if not mkfs_info:
+            logger.error("mkfs.erofs not found. Install erofs-utils or use WSL.")
+            return False
+        
+        use_wsl = mkfs_info.get('use_wsl', False)
+        mkfs_path = mkfs_info['path']
+        
+        try:
+            # Build arguments
+            args = []
+            
+            # Compression option
+            if compression and compression.lower() != 'none':
+                args.extend(['-z', compression.lower()])
+            
+            # Block size
+            args.extend(['-b', str(block_size)])
+            
+            # UUID
+            if uuid:
+                args.extend(['-U', uuid])
+            
+            # Volume name/label  
+            if volume_name:
+                # Truncate to 16 chars (EROFS limit)
+                args.extend(['-L', volume_name[:16]])
+            
+            # Extra arguments
+            if extra_args:
+                args.extend(extra_args)
+            
+            if use_wsl:
+                # Convert Windows paths to WSL paths
+                wsl_output = self._windows_to_wsl_path(str(output_file))
+                wsl_source = self._windows_to_wsl_path(str(source_path))
+                
+                args.append(wsl_output)
+                args.append(wsl_source)
+                
+                cmd = ['wsl', mkfs_path] + args
+            else:
+                args.append(str(output_file))
+                args.append(str(source_path))
+                cmd = [mkfs_path] + args
+            
+            logger.info(f"Creating EROFS image: {' '.join(cmd)}")
+            
+            if self.progress_callback:
+                self.progress_callback(0, 100, "Creating EROFS image...")
+            
+            # Run mkfs.erofs
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3600  # 1 hour timeout for large images
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"mkfs.erofs failed: {result.stderr}")
+                return False
+            
+            # Parse output for stats
+            if result.stderr:
+                logger.info(result.stderr)
+            
+            if self.progress_callback:
+                self.progress_callback(100, 100, "EROFS image created")
+            
+            if output_file.exists():
+                size_mb = output_file.stat().st_size / (1024 * 1024)
+                logger.info(f"Created EROFS image: {output_path} ({size_mb:.2f} MB)")
+                return True
+            else:
+                logger.error("mkfs.erofs did not create output file")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.error("mkfs.erofs timed out")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to create EROFS image: {e}")
+            return False
+    
+    def _windows_to_wsl_path(self, win_path: str) -> str:
+        """Convert Windows path to WSL path.
+        
+        C:\\Users\\name\\file -> /mnt/c/Users/name/file
+        """
+        path = Path(win_path)
+        
+        if len(path.parts) > 0 and len(path.parts[0]) == 3 and path.parts[0][1] == ':':
+            # Has drive letter like C:\\
+            drive = path.parts[0][0].lower()
+            rest = '/'.join(path.parts[1:])
+            return f"/mnt/{drive}/{rest}"
+        
+        # Already a Unix-style path or relative
+        return str(path).replace('\\', '/')
+    
+    def _find_mkfs_erofs(self) -> Optional[dict]:
+        """Find mkfs.erofs executable.
+        
+        Checks:
+        1. Bundled tools directory (mkfs.erofs.exe)
+        2. System PATH (native Windows/Linux)
+        3. WSL (if on Windows)
+        
+        Returns:
+            Dict with 'path' and 'use_wsl' keys, or None if not found
+        """
+        import shutil
+        
+        # Check Tools directory first (prefer bundled native tools)
+        tools_dir = Path(__file__).parent / 'Tools'
+        if tools_dir.exists():
+            for candidate in ['mkfs.erofs.exe', 'mkfs.erofs']:
+                tool_path = tools_dir / candidate
+                if tool_path.exists():
+                    return {'path': str(tool_path), 'use_wsl': False}
+        
+        # Check native PATH
+        mkfs = shutil.which('mkfs.erofs')
+        if mkfs:
+            return {'path': mkfs, 'use_wsl': False}
+        
+        # On Windows, try WSL
+        if sys.platform == 'win32':
+            try:
+                # Check if WSL is available
+                result = subprocess.run(
+                    ['wsl', '--list'],
+                    capture_output=True,
+                    timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                if result.returncode == 0:
+                    # Check if mkfs.erofs exists in WSL
+                    result = subprocess.run(
+                        ['wsl', 'which', 'mkfs.erofs'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return {'path': 'mkfs.erofs', 'use_wsl': True}
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+        
+        return None
+    
+    @staticmethod
+    def get_repack_options() -> dict:
+        """Get available repack options and their descriptions.
+        
+        Returns:
+            Dict of option names to descriptions
+        """
+        return {
+            'compression': {
+                'description': 'Compression algorithm',
+                'choices': ['none', 'lz4', 'lz4hc', 'lzma'],
+                'default': 'lz4',
+            },
+            'block_size': {
+                'description': 'Filesystem block size',
+                'choices': [512, 1024, 2048, 4096],
+                'default': 4096,
+            },
+            'uuid': {
+                'description': 'Filesystem UUID (auto-generated if not specified)',
+                'type': 'string',
+                'default': None,
+            },
+            'volume_name': {
+                'description': 'Volume label (max 16 characters)',
+                'type': 'string',
+                'default': None,
+            },
+            'dedupe': {
+                'description': 'Enable data deduplication',
+                'type': 'bool',
+                'default': False,
+                'extra_arg': '-Ededupe',
+            },
+            'fragments': {
+                'description': 'Enable fragment packing for small files',
+                'type': 'bool',
+                'default': False,
+                'extra_arg': '-Efragments',
+            },
+            'ztailpacking': {
+                'description': 'Inline tail data of compressed files',
+                'type': 'bool',
+                'default': False,
+                'extra_arg': '-Eztailpacking',
+            },
+        }
+    
+    def can_repack(self) -> bool:
+        """Check if EROFS repacking is available.
+        
+        Returns:
+            True if mkfs.erofs is available (native or via WSL)
+        """
+        return self._find_mkfs_erofs() is not None
+    
+    def get_mkfs_info(self) -> Optional[dict]:
+        """Get information about the mkfs.erofs installation.
+        
+        Returns:
+            Dict with 'path', 'use_wsl', and 'version' if available
+        """
+        info = self._find_mkfs_erofs()
+        if not info:
+            return None
+        
+        # Try to get version
+        try:
+            if info['use_wsl']:
+                cmd = ['wsl', 'mkfs.erofs', '--version']
+            else:
+                cmd = [info['path'], '--version']
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                # Parse version from output like "mkfs.erofs 1.7.1"
+                for line in (result.stdout + result.stderr).splitlines():
+                    if 'mkfs.erofs' in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            info['version'] = parts[-1]
+                            break
+        except:
+            pass
+        
+        return info
+
+
 class SuperImageExtractor:
     """Extract partitions from Android super (dynamic partitions) image."""
     
@@ -6599,7 +7685,24 @@ class AndroidImageExtractor:
         
         elif img_type == 'erofs':
             info['filesystem'] = 'erofs'
-            info['note'] = 'EROFS extraction not yet implemented'
+            try:
+                extractor = ErofsImageExtractor(self.progress_callback)
+                erofs_info = extractor.analyze(path)
+                info['block_size'] = erofs_info.get('block_size', 0)
+                info['total_blocks'] = erofs_info.get('total_blocks', 0)
+                info['total_inodes'] = erofs_info.get('total_inodes', 0)
+                info['volume_name'] = erofs_info.get('volume_name', '')
+                info['features'] = erofs_info.get('features', [])
+                
+                # List files for contents
+                files = extractor.list_files(path, max_depth=2)  # Limit depth for quick scan
+                info['file_count'] = len(files)
+                info['contents'] = [
+                    {'name': f['path'], 'size': f['size'], 'type': f.get('type', 'file')}
+                    for f in files[:100]  # Limit shown contents
+                ]
+            except Exception as e:
+                info['error'] = str(e)
         
         elif img_type == 'elf':
             # Parse ELF header for info
@@ -6777,8 +7880,11 @@ class AndroidImageExtractor:
             return {'type': 'ext4', 'files': extracted}
         
         elif img_type == 'erofs':
-            logger.info(f"EROFS format - extraction not yet implemented")
-            return {'type': 'erofs', 'note': 'EROFS extraction not yet implemented'}
+            logger.info("Extracting files from EROFS filesystem image...")
+            extractor = ErofsImageExtractor(self.progress_callback)
+            extracted = extractor.extract(path, output_dir, partition_names)
+            return {'type': 'erofs', 'files': extracted.get('files', {}),
+                    'errors': extracted.get('errors', [])}
         
         elif img_type == 'elf':
             logger.info("Extracting segments from ELF file...")
@@ -9643,12 +10749,12 @@ def create_gui_app():
             vbmeta_options_layout.addWidget(vbmeta_info_label)
             
             vbmeta_check_layout = QHBoxLayout()
-            self.disable_verity_check = QCheckBox("Disable dm-verity (--disable-verity)")
+            self.disable_verity_check = QCheckBox("Disable dm-verity")
             self.disable_verity_check.setToolTip(
                 "Disables dm-verity hashtree verification.\n"
                 "Allows modifying system/vendor partitions without boot failure."
             )
-            self.disable_verification_check = QCheckBox("Disable AVB verification (--disable-verification)")
+            self.disable_verification_check = QCheckBox("Disable AVB verification")
             self.disable_verification_check.setToolTip(
                 "Disables Android Verified Boot signature checking.\n"
                 "Required when using modified boot/system images."
@@ -9657,6 +10763,24 @@ def create_gui_app():
             vbmeta_check_layout.addWidget(self.disable_verification_check)
             vbmeta_check_layout.addStretch()
             vbmeta_options_layout.addLayout(vbmeta_check_layout)
+            
+            # Reset flags option (separate row for visibility)
+            reset_layout = QHBoxLayout()
+            self.reset_vbmeta_flags_check = QCheckBox("🔄 Reset flags to stock (0x00)")
+            self.reset_vbmeta_flags_check.setToolTip(
+                "Reset ALL vbmeta flags to 0 (stock state).\n\n"
+                "⚠️ IMPORTANT: This still invalidates the signature!\n"
+                "The bootloader will REJECT this unless:\n"
+                "  • Bootloader is UNLOCKED, or\n"
+                "  • You also re-sign with a custom enrolled key\n\n"
+                "To truly restore stock verification:\n"
+                "Flash the ORIGINAL untouched vbmeta.img from factory firmware."
+            )
+            self.reset_vbmeta_flags_check.setStyleSheet("color: #00ff88;")
+            self.reset_vbmeta_flags_check.stateChanged.connect(self._toggle_reset_flags_mode)
+            reset_layout.addWidget(self.reset_vbmeta_flags_check)
+            reset_layout.addStretch()
+            vbmeta_options_layout.addLayout(reset_layout)
             
             # Current flags display
             self.vbmeta_current_flags = QLabel("Current flags: -")
@@ -9807,7 +10931,8 @@ def create_gui_app():
                 "Sparse Image (from raw)",
                 "vbmeta Image (disabled AVB)",
                 "Ramdisk (from directory)",
-                "Super Partition (dynamic partitions)"
+                "Super Partition (dynamic partitions)",
+                "EROFS Image (from directory)"
             ])
             self.repack_type_combo.currentIndexChanged.connect(self._on_repack_type_changed)
             repack_type_layout.addWidget(self.repack_type_combo)
@@ -10146,6 +11271,91 @@ def create_gui_app():
             super_layout.addStretch()
             self.super_widget.setVisible(False)
             self.repack_stack_layout.addWidget(self.super_widget)
+            
+            # === EROFS Image Options ===
+            self.erofs_widget = QWidget()
+            erofs_layout = QVBoxLayout(self.erofs_widget)
+            
+            erofs_info = QLabel(
+                "🔥 Create an EROFS (Enhanced Read-Only File System) image from a directory.\n"
+                "EROFS is used by modern Android devices for system/vendor/product partitions."
+            )
+            erofs_info.setStyleSheet("color: #FF6B35; font-style: italic;")
+            erofs_info.setWordWrap(True)
+            erofs_layout.addWidget(erofs_info)
+            
+            # Source directory
+            erofs_src_layout = QHBoxLayout()
+            erofs_src_layout.addWidget(QLabel("Source Directory:"))
+            self.erofs_source_edit = QLineEdit()
+            self.erofs_source_edit.setPlaceholderText("Directory containing files to pack...")
+            erofs_src_layout.addWidget(self.erofs_source_edit, 1)
+            self.erofs_source_browse = QPushButton("Browse...")
+            self.erofs_source_browse.clicked.connect(self._browse_erofs_source)
+            erofs_src_layout.addWidget(self.erofs_source_browse)
+            erofs_layout.addLayout(erofs_src_layout)
+            
+            # Compression settings
+            erofs_comp_group = QGroupBox("Compression")
+            erofs_comp_layout = QFormLayout(erofs_comp_group)
+            
+            # Compression algorithm
+            self.erofs_compression_combo = QComboBox()
+            self.erofs_compression_combo.addItems(["lz4", "lz4hc", "lzma", "none"])
+            self.erofs_compression_combo.setCurrentIndex(0)  # Default lz4
+            self.erofs_compression_combo.setToolTip(
+                "lz4: Fast compression (default)\n"
+                "lz4hc: Higher compression, slower\n"
+                "lzma: Best compression, slowest\n"
+                "none: No compression"
+            )
+            erofs_comp_layout.addRow("Algorithm:", self.erofs_compression_combo)
+            
+            # Block size
+            self.erofs_block_size_combo = QComboBox()
+            self.erofs_block_size_combo.addItems(["4096", "2048", "1024", "512"])
+            self.erofs_block_size_combo.setToolTip("Filesystem block size (4096 recommended)")
+            erofs_comp_layout.addRow("Block Size:", self.erofs_block_size_combo)
+            
+            erofs_layout.addWidget(erofs_comp_group)
+            
+            # Advanced options
+            erofs_adv_group = QGroupBox("Advanced Options")
+            erofs_adv_layout = QVBoxLayout(erofs_adv_group)
+            
+            # Volume name
+            erofs_vol_layout = QHBoxLayout()
+            erofs_vol_layout.addWidget(QLabel("Volume Name:"))
+            self.erofs_volume_name = QLineEdit()
+            self.erofs_volume_name.setPlaceholderText("Optional (max 16 chars)")
+            self.erofs_volume_name.setMaxLength(16)
+            erofs_vol_layout.addWidget(self.erofs_volume_name, 1)
+            erofs_adv_layout.addLayout(erofs_vol_layout)
+            
+            # Feature checkboxes
+            erofs_feat_layout = QHBoxLayout()
+            self.erofs_dedupe_check = QCheckBox("Deduplication")
+            self.erofs_dedupe_check.setToolTip("Enable data deduplication (reduces size)")
+            self.erofs_fragments_check = QCheckBox("Fragments")
+            self.erofs_fragments_check.setToolTip("Pack small files as fragments (reduces size)")
+            self.erofs_ztailpacking_check = QCheckBox("Tail Packing")
+            self.erofs_ztailpacking_check.setToolTip("Inline tail data of compressed files")
+            erofs_feat_layout.addWidget(self.erofs_dedupe_check)
+            erofs_feat_layout.addWidget(self.erofs_fragments_check)
+            erofs_feat_layout.addWidget(self.erofs_ztailpacking_check)
+            erofs_feat_layout.addStretch()
+            erofs_adv_layout.addLayout(erofs_feat_layout)
+            
+            erofs_layout.addWidget(erofs_adv_group)
+            
+            # Tool availability check
+            self.erofs_tool_label = QLabel()
+            self._check_erofs_tool_availability()
+            erofs_layout.addWidget(self.erofs_tool_label)
+            
+            erofs_layout.addStretch()
+            self.erofs_widget.setVisible(False)
+            self.repack_stack_layout.addWidget(self.erofs_widget)
             
             repack_img_layout.addWidget(self.repack_stack)
             
@@ -10910,6 +12120,17 @@ def create_gui_app():
             if show:
                 self._update_signing_status()
         
+        def _toggle_reset_flags_mode(self, state):
+            """Toggle reset flags mode - disable other options when reset is checked."""
+            reset_mode = state == Qt.CheckState.Checked.value
+            # When reset is checked, disable the individual disable checkboxes
+            self.disable_verity_check.setEnabled(not reset_mode)
+            self.disable_verification_check.setEnabled(not reset_mode)
+            if reset_mode:
+                # Uncheck the disable options when in reset mode
+                self.disable_verity_check.setChecked(False)
+                self.disable_verification_check.setChecked(False)
+        
         def _toggle_key_source(self, generate: bool):
             """Toggle between generate and load key modes."""
             self.key_size_widget.setVisible(generate)
@@ -10956,6 +12177,7 @@ def create_gui_app():
             self.vbmeta_widget.setVisible(False)
             self.ramdisk_widget.setVisible(False)
             self.super_widget.setVisible(False)
+            self.erofs_widget.setVisible(False)
             
             # Show selected widget and set default output filename
             if index == 0:  # Boot Image
@@ -10980,6 +12202,10 @@ def create_gui_app():
                 self.super_widget.setVisible(True)
                 if not self.repack_img_output_edit.text():
                     self.repack_img_output_edit.setText("super.img")
+            elif index == 6:  # EROFS Image
+                self.erofs_widget.setVisible(True)
+                if not self.repack_img_output_edit.text():
+                    self.repack_img_output_edit.setText("system.img")
         
         def _on_boot_version_changed(self, index: int):
             """Handle boot image version change."""
@@ -11005,6 +12231,32 @@ def create_gui_app():
             if path:
                 self.ramdisk_input_edit.setText(path)
         
+        def _browse_erofs_source(self):
+            """Browse for EROFS source directory."""
+            path = QFileDialog.getExistingDirectory(
+                self, "Select EROFS Source Directory"
+            )
+            if path:
+                self.erofs_source_edit.setText(path)
+        
+        def _check_erofs_tool_availability(self):
+            """Check if mkfs.erofs is available and update UI."""
+            extractor = ErofsImageExtractor()
+            mkfs_info = extractor._find_mkfs_erofs()
+            
+            if mkfs_info:
+                tool_path = mkfs_info.get('path', 'Unknown')
+                use_wsl = mkfs_info.get('use_wsl', False)
+                if use_wsl:
+                    self.erofs_tool_label.setText("✅ mkfs.erofs available via WSL")
+                    self.erofs_tool_label.setStyleSheet("color: #4CAF50;")
+                else:
+                    self.erofs_tool_label.setText(f"✅ mkfs.erofs available: {Path(tool_path).name}")
+                    self.erofs_tool_label.setStyleSheet("color: #4CAF50;")
+            else:
+                self.erofs_tool_label.setText("❌ mkfs.erofs not found - place mkfs.erofs.exe in Tools/ folder")
+                self.erofs_tool_label.setStyleSheet("color: #F44336;")
+        
         def _browse_repack_output_file(self):
             """Browse for repack output file."""
             repack_type = self.repack_type_combo.currentIndex()
@@ -11019,6 +12271,10 @@ def create_gui_app():
                 default_name = "vbmeta.img"
             elif repack_type == 4:
                 default_name = "ramdisk.cpio.gz"
+            elif repack_type == 5:
+                default_name = "super.img"
+            elif repack_type == 6:
+                default_name = "system.img"
             else:
                 default_name = "output.img"
             
@@ -11057,6 +12313,8 @@ def create_gui_app():
                     self._repack_ramdisk(output_path)
                 elif repack_type == 5:
                     self._repack_super(output_path)
+                elif repack_type == 6:
+                    self._repack_erofs(output_path)
             except Exception as e:
                 self._repack_log(f"Error: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to create image:\n{e}")
@@ -11462,6 +12720,96 @@ def create_gui_app():
                 self.repack_img_progress_label.setText("Failed")
                 raise
         
+        def _repack_erofs(self, output_path: str):
+            """Create EROFS image from directory."""
+            source_dir = self.erofs_source_edit.text().strip()
+            if not source_dir:
+                QMessageBox.warning(self, "Error", "Please select a source directory")
+                return
+            
+            if not os.path.isdir(source_dir):
+                QMessageBox.warning(self, "Error", f"Source directory not found:\n{source_dir}")
+                return
+            
+            # Get settings
+            compression = self.erofs_compression_combo.currentText()
+            block_size = int(self.erofs_block_size_combo.currentText())
+            volume_name = self.erofs_volume_name.text().strip() or None
+            
+            # Build extra args for features
+            extra_args = []
+            if self.erofs_dedupe_check.isChecked():
+                extra_args.append('-Ededupe')
+            if self.erofs_fragments_check.isChecked():
+                extra_args.append('-Efragments')
+            if self.erofs_ztailpacking_check.isChecked():
+                extra_args.append('-Eztailpacking')
+            
+            self._repack_log(f"🔥 Creating EROFS image...")
+            self._repack_log(f"  Source: {source_dir}")
+            self._repack_log(f"  Compression: {compression}")
+            self._repack_log(f"  Block size: {block_size}")
+            if volume_name:
+                self._repack_log(f"  Volume name: {volume_name}")
+            if extra_args:
+                self._repack_log(f"  Features: {', '.join(extra_args)}")
+            
+            def progress_callback(current, total, msg):
+                pct = int(current / total * 100) if total > 0 else 0
+                self.repack_img_progress.setValue(pct)
+                self.repack_img_progress_label.setText(msg)
+            
+            self.repack_img_progress.setRange(0, 100)
+            self.repack_img_progress.setValue(0)
+            
+            try:
+                extractor = ErofsImageExtractor(progress_callback)
+                
+                # Check tool availability
+                if not extractor.can_repack():
+                    self._repack_log("❌ mkfs.erofs not found!")
+                    self._repack_log("   Place mkfs.erofs.exe in the Tools/ folder")
+                    self._repack_log("   Or install erofs-utils on your system")
+                    QMessageBox.critical(self, "Error", 
+                        "mkfs.erofs not found!\n\n"
+                        "Place mkfs.erofs.exe in the Tools/ folder,\n"
+                        "or install erofs-utils on your system.")
+                    return
+                
+                self._repack_log("\nBuilding EROFS image...")
+                
+                success = extractor.repack(
+                    source_dir=source_dir,
+                    output_path=output_path,
+                    compression=compression,
+                    block_size=block_size,
+                    volume_name=volume_name,
+                    extra_args=extra_args if extra_args else None
+                )
+                
+                if success:
+                    size = os.path.getsize(output_path)
+                    self._repack_log(f"\n🔥 EROFS image created successfully!")
+                    self._repack_log(f"  Output: {output_path}")
+                    self._repack_log(f"  Size: {size / (1024*1024):.2f} MB")
+                    self.repack_img_progress.setValue(100)
+                    self.repack_img_progress_label.setText("Complete")
+                    self._show_toast(f"EROFS image created: {size / (1024*1024):.0f} MB", 'success')
+                    QMessageBox.information(self, "Success", 
+                        f"EROFS image created!\n\n"
+                        f"Output: {output_path}\n"
+                        f"Size: {size / (1024*1024):.2f} MB\n"
+                        f"Compression: {compression}")
+                else:
+                    self._repack_log("💀 Failed to create EROFS image")
+                    self.repack_img_progress_label.setText("Failed")
+                    QMessageBox.critical(self, "Error", "Failed to create EROFS image. Check the log for details.")
+                    
+            except Exception as e:
+                self._repack_log(f"💀 Error: {e}")
+                self.repack_img_progress_label.setText("Failed")
+                raise
+        
         # ===== Recovery Porter Methods =====
         def _recovery_log(self, msg: str):
             """Add message to recovery log."""
@@ -11771,6 +13119,7 @@ def create_gui_app():
             # Get vbmeta patching options
             disable_verity = self.disable_verity_check.isChecked()
             disable_verification = self.disable_verification_check.isChecked()
+            reset_flags = self.reset_vbmeta_flags_check.isChecked()
             
             # Get signing options
             signing_options = None
@@ -11810,6 +13159,7 @@ def create_gui_app():
                 self.extract_boot_check.isChecked(),
                 disable_verity,
                 disable_verification,
+                reset_flags,
                 signing_options
             )
             self.image_extract_thread.progress.connect(self._on_image_progress)
@@ -11899,6 +13249,7 @@ def create_gui_app():
         def __init__(self, image_path: str, output_dir: str, image_info: dict,
                      selected_items: list[dict], convert_sparse: bool, extract_boot: bool,
                      disable_verity: bool = False, disable_verification: bool = False,
+                     reset_flags: bool = False,
                      signing_options: Optional[dict] = None):
             super().__init__()
             self.image_path = image_path
@@ -11909,6 +13260,7 @@ def create_gui_app():
             self.extract_boot = extract_boot
             self.disable_verity = disable_verity
             self.disable_verification = disable_verification
+            self.reset_flags = reset_flags
             self.signing_options = signing_options
             self._cancelled = False
         
@@ -11933,6 +13285,10 @@ def create_gui_app():
                     self._extract_fat()
                 elif image_type == 'ext4':
                     self._extract_ext4()
+                elif image_type == 'erofs':
+                    self._extract_erofs()
+                elif image_type == 'lz4':
+                    self._extract_lz4()
                 elif image_type == 'elf':
                     self._extract_elf()
                 elif image_type == 'vbmeta':
@@ -12048,6 +13404,100 @@ def create_gui_app():
                 self.log.emit(f"  Error: {e}")
                 raise
         
+        def _extract_erofs(self):
+            self.log.emit("Extracting files from EROFS filesystem image...")
+            
+            extractor = ErofsImageExtractor()
+            file_names = [item.get('name') for item in self.selected_items if item.get('name')]
+            
+            total = len(file_names) if file_names else 1
+            self.progress.emit(0, total, "Extracting files from EROFS...")
+            
+            try:
+                # Extract all files if none selected, otherwise only selected
+                results = extractor.extract(
+                    self.image_path, 
+                    self.output_dir, 
+                    file_names if file_names else None
+                )
+                
+                file_count = len(results.get('files', {}))
+                method = results.get('method', 'unknown')
+                
+                for name in results.get('files', {}).keys():
+                    self.log.emit(f"  Extracted: {name}")
+                
+                # Report any errors
+                for err in results.get('errors', []):
+                    self.log.emit(f"  Warning: {err}")
+                
+                self.log.emit(f"\nExtracted {file_count} file(s) using {method}")
+                self.progress.emit(file_count, file_count, "EROFS extraction complete")
+            except Exception as e:
+                self.log.emit(f"  Error: {e}")
+                raise
+        
+        def _extract_lz4(self):
+            self.log.emit("Decompressing LZ4 compressed image...")
+            
+            self.progress.emit(0, 1, "Decompressing LZ4 file...")
+            
+            try:
+                import lz4.frame  # type: ignore
+                has_lz4 = True
+            except ImportError:
+                has_lz4 = False
+            
+            if not has_lz4:
+                self.log.emit("Error: lz4 module not available")
+                self.log.emit("Install with: pip install lz4")
+                raise ImportError("lz4 module required for LZ4 decompression")
+            
+            try:
+                # Determine output filename
+                input_name = Path(self.image_path).name
+                if input_name.endswith('.lz4'):
+                    output_name = input_name[:-4]  # Remove .lz4 extension
+                else:
+                    output_name = f"{input_name}.decompressed"
+                
+                output_path = Path(self.output_dir) / output_name
+                
+                self.log.emit(f"Input: {input_name}")
+                self.log.emit(f"Output: {output_name}")
+                
+                # Decompress the file
+                with open(self.image_path, 'rb') as f_in:
+                    with lz4.frame.open(f_in, mode='rb') as lz4_file:
+                        with open(output_path, 'wb') as f_out:
+                            # Read and write in chunks for memory efficiency
+                            chunk_size = 16 * 1024 * 1024  # 16MB chunks
+                            total_written = 0
+                            while True:
+                                chunk = lz4_file.read(chunk_size)
+                                if not chunk:
+                                    break
+                                f_out.write(chunk)
+                                total_written += len(chunk)
+                
+                # Check what the decompressed file is
+                decompressed_type = detect_image_type(str(output_path))
+                self.log.emit(f"\nDecompressed {total_written / (1024*1024):.2f} MB")
+                self.log.emit(f"Detected inner format: {decompressed_type}")
+                
+                # Offer hint about next step
+                if decompressed_type == 'erofs':
+                    self.log.emit("Hint: The decompressed file is EROFS - load it to extract contents")
+                elif decompressed_type == 'ext4':
+                    self.log.emit("Hint: The decompressed file is ext4 - load it to extract contents")
+                elif decompressed_type == 'sparse':
+                    self.log.emit("Hint: The decompressed file is sparse - load it to convert/extract")
+                
+                self.progress.emit(1, 1, "LZ4 decompression complete")
+            except Exception as e:
+                self.log.emit(f"  Error: {e}")
+                raise
+        
         def _extract_elf(self):
             self.log.emit("Extracting segments from ELF file...")
             self.log.emit("ELF files contain program segments (code/data for firmware).")
@@ -12081,10 +13531,14 @@ def create_gui_app():
             self.log.emit("vbmeta contains cryptographic verification data for partitions.")
             
             # Check if patching is requested
-            need_patch = self.disable_verity or self.disable_verification
+            need_patch = self.disable_verity or self.disable_verification or self.reset_flags
             need_sign = self.signing_options is not None and CRYPTO_AVAILABLE
             
-            if need_patch:
+            if self.reset_flags:
+                self.log.emit("\n🔄 RESET FLAGS requested:")
+                self.log.emit("  - Will RESET all flags to 0x00 (stock behavior)")
+                self.log.emit("  - This RE-ENABLES verity and verification!")
+            elif need_patch:
                 self.log.emit("\n⚠️ Patching requested:")
                 if self.disable_verity:
                     self.log.emit("  - Will DISABLE dm-verity")
@@ -12184,7 +13638,9 @@ def create_gui_app():
                         current_step += 1
                         self.progress.emit(current_step, total_steps, "Patching vbmeta...")
                         
-                        if need_patch:
+                        if self.reset_flags:
+                            self.log.emit("Resetting vbmeta flags to stock...")
+                        elif need_patch:
                             self.log.emit("Applying vbmeta patches...")
                         if signer:
                             self.log.emit("Re-signing with custom key...")
@@ -12197,6 +13653,7 @@ def create_gui_app():
                             str(output_path),
                             disable_verity=self.disable_verity,
                             disable_verification=self.disable_verification,
+                            reset_flags=self.reset_flags,
                             signer=signer
                         )
                         
@@ -12211,9 +13668,15 @@ def create_gui_app():
                                     flag_list.append("VERITY_DISABLED")
                                 if new_flags['verification_disabled']:
                                     flag_list.append("VERIFICATION_DISABLED")
-                                self.log.emit(f"  New flags: 0x{new_flags['raw_flags']:08X} ({', '.join(flag_list) if flag_list else 'NONE'})")
+                                flag_display = ', '.join(flag_list) if flag_list else 'NONE (stock)'
+                                self.log.emit(f"  New flags: 0x{new_flags['raw_flags']:08X} ({flag_display})")
                             
-                            if signer:
+                            if self.reset_flags:
+                                self.log.emit("\n🔄 Flags have been RESET to 0x00.")
+                                if not signer:
+                                    self.log.emit("   ⚠️ Signature is INVALID - bootloader will reject unless UNLOCKED!")
+                                    self.log.emit("   To truly restore stock: flash original untouched vbmeta.img")
+                            elif signer:
                                 self.log.emit(f"\n🔐 Image re-signed with RSA-{signer.key_bits} key")
                                 self.log.emit("   Note: This will only work with:")
                                 self.log.emit("   - Unlocked bootloader")
