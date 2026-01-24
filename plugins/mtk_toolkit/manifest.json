@@ -1,0 +1,29 @@
+{
+    "id": "mtk_toolkit",
+    "name": "MTK Toolkit",
+    "version": "1.2",
+    "description": "Advanced MediaTek device toolkit - BROM exploit, flash read/write, unlock bootloader, erase FRP, dump partitions, and more. Powered by mtkclient.",
+    "author": "Image Anarchy Team",
+    "icon": "⚡",
+    "license_type": "free",
+    "website": "https://github.com/bkerler/mtkclient",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "2.0",
+    "requirements": [
+        "pyusb",
+        "pycryptodome",
+        "pycryptodomex",
+        "colorama",
+        "pyserial",
+        "capstone",
+        "unicorn"
+    ],
+    "git_clone": {
+        "repo": "https://github.com/bkerler/mtkclient.git",
+        "target": "mtkclient"
+    },
+    "setup_commands": [
+        "pip install ."
+    ],
+    "enabled": true
+}
