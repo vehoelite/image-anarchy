@@ -1,0 +1,55 @@
+<div class="plugin-description">
+    <h2>⚡ Fastboot Toolkit</h2>
+    <p class="tagline">Lightning-fast bootloader-level device control for Image Anarchy</p>
+    
+    <h3>🔥 Features</h3>
+    <ul>
+        <li><strong>Device Info</strong> - View all fastboot variables: bootloader version, serial, secure boot status, slot info, and more</li>
+        <li><strong>Flash Partitions</strong> - Flash any partition image (boot, recovery, system, vbmeta, etc.)</li>
+        <li><strong>Boot Image</strong> - Temporarily boot a custom image without flashing (great for testing)</li>
+        <li><strong>Erase Partitions</strong> - Securely erase partitions with one click</li>
+        <li><strong>Fetch Partitions</strong> - Pull partition images directly from device</li>
+        <li><strong>OEM Unlock/Lock</strong> - Toggle bootloader lock state</li>
+        <li><strong>Format Data</strong> - Factory reset with filesystem formatting</li>
+        <li><strong>Slot Switching</strong> - Set active A/B slot on dual-slot devices</li>
+        <li><strong>Reboot Options</strong> - Reboot to System, Bootloader, Recovery, or EDL</li>
+    </ul>
+    
+    <h3>📦 Bundled Components</h3>
+    <p>This plugin includes <strong>Fastboot + utilities</strong> bundled directly - no separate installation required!</p>
+    <ul>
+        <li>fastboot.exe</li>
+        <li>mke2fs.exe (for format operations)</li>
+        <li>make_f2fs.exe (F2FS formatting)</li>
+        <li>Required DLLs</li>
+    </ul>
+    
+    <h3>💡 Requirements</h3>
+    <ul>
+        <li>Device must be in <strong>Fastboot/Bootloader mode</strong></li>
+        <li>USB drivers installed (Google USB Driver recommended)</li>
+        <li>OEM unlocking enabled in Developer Options (for unlock operations)</li>
+    </ul>
+    
+    <h3>🚀 Quick Start</h3>
+    <ol>
+        <li>Boot your device into Fastboot mode (Power + Volume Down on most devices)</li>
+        <li>Connect via USB</li>
+        <li>Open Fastboot Toolkit from the Plugins tab</li>
+        <li>Click "Refresh" to detect your device</li>
+        <li>Flash, boot, or manage your device!</li>
+    </ol>
+    
+    <h3>⚠️ Safety Notes</h3>
+    <ul>
+        <li>Always backup before flashing critical partitions</li>
+        <li>Wrong images can brick your device - double check partition names</li>
+        <li>OEM unlock will factory reset your device</li>
+    </ul>
+    
+    <div class="plugin-meta">
+        <span class="version">v1.0</span>
+        <span class="size">~5 MB (with bundled Fastboot)</span>
+        <span class="license">Free</span>
+    </div>
+</div>

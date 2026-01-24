@@ -1,0 +1,15 @@
+{
+    "id": "fastboot_toolkit",
+    "name": "Fastboot Toolkit",
+    "version": "1.0",
+    "description": "Comprehensive Fastboot toolkit - Flash partitions, Boot images, OEM unlock/lock, Erase, Device info, Reboot options and more. Includes bundled platform-tools (Fastboot).",
+    "author": "Image Anarchy Team",
+    "icon": "⚡",
+    "license_type": "free",
+    "website": "https://github.com/vehoelite/image-anarchy",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "1.0",
+    "requirements": [],
+    "bundled_binaries": ["platform-tools/fastboot.exe", "platform-tools/AdbWinApi.dll", "platform-tools/AdbWinUsbApi.dll", "platform-tools/libwinpthread-1.dll", "platform-tools/mke2fs.exe", "platform-tools/mke2fs.conf", "platform-tools/make_f2fs.exe"],
+    "enabled": true
+}
