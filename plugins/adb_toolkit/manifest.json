@@ -1,0 +1,15 @@
+{
+    "id": "adb_toolkit",
+    "name": "ADB Toolkit",
+    "version": "1.0",
+    "description": "Comprehensive ADB toolkit - Pull/Push files, Install APKs, Reboot options, Shell commands, Logcat, Screenshot, Device info, App manager and more. Includes bundled platform-tools (ADB).",
+    "author": "Image Anarchy Team",
+    "icon": "📱",
+    "license_type": "free",
+    "website": "https://github.com/vehoelite/image-anarchy",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "1.0",
+    "requirements": [],
+    "bundled_binaries": ["platform-tools/adb.exe", "platform-tools/AdbWinApi.dll", "platform-tools/AdbWinUsbApi.dll", "platform-tools/libwinpthread-1.dll"],
+    "enabled": true
+}
