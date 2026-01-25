@@ -171,6 +171,22 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
+# Visual Plugin Maker v2 - AST-based plugin editor module
+# Imported lazily to avoid import errors during initial load
+_VisualPluginMakerV2 = None
+
+def _get_visual_plugin_maker_v2():
+    """Lazy import of VisualPluginMakerV2 to avoid circular imports."""
+    global _VisualPluginMakerV2
+    if _VisualPluginMakerV2 is None:
+        try:
+            from visual_plugin_maker_v2 import VisualPluginMakerV2
+            _VisualPluginMakerV2 = VisualPluginMakerV2
+        except ImportError as e:
+            logger.warning(f"Could not import VisualPluginMakerV2: {e}")
+            _VisualPluginMakerV2 = None
+    return _VisualPluginMakerV2
+
 # Application version - used for update checking
 APP_VERSION = "2.5.0"
 APP_VERSION_CODE = 250  # Numeric version for comparison (2.5.0 = 250)
@@ -9425,7 +9441,7 @@ def create_gui_app():
         QComboBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QHeaderView,
         QFormLayout, QRadioButton, QScrollArea, QFrame, QMenu, QDoubleSpinBox,
         QGridLayout, QDialog, QInputDialog, QSystemTrayIcon, QGraphicsOpacityEffect,
-        QPlainTextEdit, QStackedWidget, QButtonGroup
+        QPlainTextEdit, QStackedWidget, QButtonGroup, QSizePolicy
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QPoint, QEasingCurve, QMimeData
     from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor, QAction, QIcon, QPixmap, QPainter, QDrag
@@ -10745,7 +10761,7 @@ def create_gui_app():
                 event.accept()
         
         def _setup_ui(self):
-            self.setWindowTitle("Image Anarchy 2.0 - Android Image Swiss Army Knife")
+            self.setWindowTitle(f"Image Anarchy {APP_VERSION} - Android Image Swiss Army Knife")
             self.setMinimumSize(1100, 800)
             self.resize(1200, 900)
             
@@ -15932,15 +15948,41 @@ def create_gui_app():
             'scrcpy_mirror': ('📺', 'Scrcpy Mirror', '#2196f3', 'Mirror device screen', 'plugins', 'scrcpy_toolkit'),
             'scrcpy_record': ('🎬', 'Scrcpy Record', '#1976d2', 'Record device screen', 'plugins', 'scrcpy_toolkit'),
 
-            # === UI ELEMENTS ===
+            # === UI ELEMENTS - Basic ===
             'button': ('🔘', 'Button', '#e91e63', 'Add a clickable button', 'ui', None),
             'label': ('🏷️', 'Label', '#00bcd4', 'Add a text label', 'ui', None),
             'input': ('📝', 'Text Input', '#795548', 'Add a text input field', 'ui', None),
+            'text_area': ('📄', 'Text Area', '#8d6e63', 'Multi-line text input', 'ui', None),
             'dropdown': ('📋', 'Dropdown', '#607d8b', 'Add a dropdown selector', 'ui', None),
             'file_picker': ('📁', 'File Picker', '#9e9e9e', 'Add a file selection button', 'ui', None),
             'folder_picker': ('📂', 'Folder Picker', '#757575', 'Add a folder selection button', 'ui', None),
             'log_output': ('📜', 'Log Output', '#455a64', 'Add a log/output text area', 'ui', None),
             'progress_bar': ('📊', 'Progress Bar', '#546e7a', 'Add a progress indicator', 'ui', None),
+
+            # === UI ELEMENTS - Controls ===
+            'checkbox': ('☑️', 'Checkbox', '#4caf50', 'Add a checkbox toggle', 'ui', None),
+            'radio': ('🔘', 'Radio Button', '#2196f3', 'Add a radio button option', 'ui', None),
+            'spinbox': ('🔢', 'Number Input', '#ff9800', 'Add a numeric spinner', 'ui', None),
+            'slider': ('🎚️', 'Slider', '#9c27b0', 'Add a value slider', 'ui', None),
+            'switch': ('🔀', 'Toggle Switch', '#00bcd4', 'Add an on/off toggle', 'ui', None),
+
+            # === UI ELEMENTS - Containers ===
+            'group_box': ('📦', 'Group Box', '#3f51b5', 'Group related controls', 'ui', None),
+            'tab_panel': ('📑', 'Tab Panel', '#673ab7', 'Add tabbed sections', 'ui', None),
+            'scroll_area': ('📜', 'Scroll Area', '#009688', 'Scrollable container', 'ui', None),
+            'splitter': ('↔️', 'Splitter', '#795548', 'Resizable split view', 'ui', None),
+
+            # === UI ELEMENTS - Data Display ===
+            'table': ('📊', 'Table', '#ff5722', 'Add a data table', 'ui', None),
+            'tree': ('🌳', 'Tree View', '#8bc34a', 'Hierarchical data view', 'ui', None),
+            'list_widget': ('📋', 'List View', '#03a9f4', 'Simple list display', 'ui', None),
+            'image_display': ('🖼️', 'Image Display', '#e91e63', 'Show an image', 'ui', None),
+
+            # === UI ELEMENTS - Layout ===
+            'separator': ('➖', 'Separator', '#616161', 'Visual divider line', 'ui', None),
+            'spacer': ('⬜', 'Spacer', '#9e9e9e', 'Add empty space', 'ui', None),
+            'horizontal_layout': ('↔️', 'Horizontal Layout', '#607d8b', 'Arrange items horizontally', 'ui', None),
+            'vertical_layout': ('↕️', 'Vertical Layout', '#546e7a', 'Arrange items vertically', 'ui', None),
         }
 
         @classmethod
@@ -16092,104 +16134,186 @@ def create_gui_app():
             return new_block
 
 
-    class BlockCanvas(QFrame):
-        """Canvas where blocks are dropped and arranged."""
+    class ScrollableBlockList(QScrollArea):
+        """A scrollable list for blocks within a tab."""
 
-        blocks_changed = pyqtSignal()  # Emitted when blocks are added/removed/modified
-        block_selected = pyqtSignal(object)  # Emitted when a block is selected
+        block_deleted = pyqtSignal(object)
+        block_selected = pyqtSignal(object)
+        block_changed = pyqtSignal()
 
-        def __init__(self, parent=None):
+        def __init__(self, placeholder_text: str, parent=None):
             super().__init__(parent)
             self.blocks: list = []
             self.setAcceptDrops(True)
-            self.setMinimumHeight(300)
-            self._setup_ui()
-
-        def _setup_ui(self):
+            self.setWidgetResizable(True)
+            self.setFrameShape(QFrame.Shape.NoFrame)
             self.setStyleSheet("""
-                BlockCanvas {
-                    background: #1a1a1a;
-                    border: 2px dashed #444;
-                    border-radius: 8px;
-                }
+                QScrollArea { background: transparent; border: none; }
+                QScrollBar:vertical { background: #2a2a2a; width: 10px; border-radius: 5px; }
+                QScrollBar::handle:vertical { background: #555; border-radius: 5px; min-height: 30px; }
+                QScrollBar::handle:vertical:hover { background: #e91e63; }
             """)
 
-            self.layout = QVBoxLayout(self)
-            self.layout.setContentsMargins(12, 12, 12, 12)
-            self.layout.setSpacing(8)
-            self.layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            # Container widget
+            self.container = QWidget()
+            self.container.setStyleSheet("background: #1a1a1a; border-radius: 6px;")
+            self.container_layout = QVBoxLayout(self.container)
+            self.container_layout.setContentsMargins(8, 8, 8, 8)
+            self.container_layout.setSpacing(6)
+            self.container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-            # Placeholder text
-            self.placeholder = QLabel(
-                "🎯 Drop blocks here to build your plugin\n\n"
-                "📦 Dependencies → Add pip packages, git repos, drivers\n"
-                "🔧 Tools → Use built-in or external tools\n"
-                "🖥️ UI Elements → Add buttons, inputs, outputs\n\n"
-                "💡 Click a block to edit its properties on the right"
-            )
-            self.placeholder.setStyleSheet("color: #666; font-size: 13px;")
+            # Placeholder
+            self.placeholder = QLabel(placeholder_text)
+            self.placeholder.setStyleSheet("color: #666; font-size: 12px; padding: 20px;")
             self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.layout.addWidget(self.placeholder)
-            self.layout.addStretch()
+            self.placeholder.setWordWrap(True)
+            self.container_layout.addWidget(self.placeholder)
+            self.container_layout.addStretch()
+
+            self.setWidget(self.container)
 
         def _update_placeholder(self):
             self.placeholder.setVisible(len(self.blocks) == 0)
 
         def add_block(self, block: PluginBlock):
+            """Add a block to this list."""
             block.show_delete_button(True)
-            block.block_deleted.connect(self._on_block_deleted)
+            block.block_deleted.connect(lambda b: self._on_block_deleted(b))
             block.block_selected.connect(lambda b: self.block_selected.emit(b))
-            block.block_changed.connect(self.blocks_changed.emit)
+            block.block_changed.connect(self.block_changed.emit)
+            block.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
             # Insert before stretch
-            self.layout.insertWidget(self.layout.count() - 1, block)
+            insert_idx = max(0, self.container_layout.count() - 1)
+            self.container_layout.insertWidget(insert_idx, block)
             self.blocks.append(block)
             self._update_placeholder()
-            self.blocks_changed.emit()
+            self.block_changed.emit()
 
         def _on_block_deleted(self, block: PluginBlock):
             if block in self.blocks:
                 self.blocks.remove(block)
-                self.layout.removeWidget(block)
+                self.container_layout.removeWidget(block)
                 block.deleteLater()
                 self._update_placeholder()
-                self.blocks_changed.emit()
+                self.block_deleted.emit(block)
+                self.block_changed.emit()
 
         def clear_blocks(self):
+            """Clear all blocks."""
             for block in self.blocks[:]:
-                self._on_block_deleted(block)
+                self.container_layout.removeWidget(block)
+                block.deleteLater()
+            self.blocks = []
+            self._update_placeholder()
 
         def dragEnterEvent(self, event):
             if event.mimeData().hasFormat('application/x-plugin-block'):
                 event.acceptProposedAction()
-                self.setStyleSheet("""
-                    BlockCanvas {
-                        background: #1a1a1a;
-                        border: 2px solid #e91e63;
-                        border-radius: 8px;
-                    }
-                """)
+                self.container.setStyleSheet("background: #252525; border: 2px solid #e91e63; border-radius: 6px;")
 
         def dragLeaveEvent(self, event):
-            self._setup_ui_style_only()
-
-        def _setup_ui_style_only(self):
-            self.setStyleSheet("""
-                BlockCanvas {
-                    background: #1a1a1a;
-                    border: 2px dashed #444;
-                    border-radius: 8px;
-                }
-            """)
+            self.container.setStyleSheet("background: #1a1a1a; border-radius: 6px;")
 
         def dropEvent(self, event):
-            self._setup_ui_style_only()
+            self.container.setStyleSheet("background: #1a1a1a; border-radius: 6px;")
             if event.mimeData().hasFormat('application/x-plugin-block'):
                 block_type = event.mimeData().data('application/x-plugin-block').data().decode()
                 new_block = PluginBlock(block_type)
-                new_block.show_delete_button(True)
+                # Mark as user-added (not from import)
+                new_block.block_data['_is_new'] = True
                 self.add_block(new_block)
                 event.acceptProposedAction()
+
+    class BlockCanvas(QFrame):
+        """Canvas with tabs for Setup (manifest.json) and GUI (plugin.py) blocks."""
+
+        blocks_changed = pyqtSignal()  # Emitted when blocks are added/removed/modified
+        block_selected = pyqtSignal(object)  # Emitted when a block is selected
+
+        # Block categories for routing
+        SETUP_CATEGORIES = ('dependencies',)  # pip, git, binary, command, driver
+        GUI_CATEGORIES = ('ui', 'builtin', 'tools', 'plugins')  # buttons, inputs, tools
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setMinimumHeight(300)
+            self._setup_ui()
+
+        def _setup_ui(self):
+            self.setStyleSheet("BlockCanvas { background: transparent; border: none; }")
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+            # Tab widget for Setup vs GUI
+            self.tabs = QTabWidget()
+            self.tabs.setStyleSheet("""
+                QTabWidget::pane { border: 1px solid #444; border-radius: 6px; background: #1a1a1a; }
+                QTabBar::tab {
+                    background: #2a2a2a; color: #888; padding: 8px 20px;
+                    border: 1px solid #444; border-bottom: none; border-radius: 6px 6px 0 0;
+                    margin-right: 2px;
+                }
+                QTabBar::tab:selected { background: #e91e63; color: white; }
+                QTabBar::tab:hover:!selected { background: #3a3a3a; color: white; }
+            """)
+
+            # Setup tab (manifest.json blocks)
+            self.setup_list = ScrollableBlockList(
+                "📦 Setup Blocks (manifest.json)\n\n"
+                "Drop here:\n"
+                "• Pip Packages\n"
+                "• Git Clone\n"
+                "• Binary Downloads\n"
+                "• Setup Commands\n"
+                "• Driver Installs"
+            )
+            self.setup_list.block_selected.connect(lambda b: self.block_selected.emit(b))
+            self.setup_list.block_changed.connect(self.blocks_changed.emit)
+            self.tabs.addTab(self.setup_list, "📦 Setup (manifest.json)")
+
+            # GUI tab (plugin.py blocks)
+            self.gui_list = ScrollableBlockList(
+                "🖥️ GUI Blocks (plugin.py)\n\n"
+                "Drop here:\n"
+                "• Buttons, Labels, Inputs\n"
+                "• Dropdowns, File Pickers\n"
+                "• Progress Bars, Log Output\n"
+                "• Built-in Tools\n"
+                "• Plugin Actions"
+            )
+            self.gui_list.block_selected.connect(lambda b: self.block_selected.emit(b))
+            self.gui_list.block_changed.connect(self.blocks_changed.emit)
+            self.tabs.addTab(self.gui_list, "🖥️ GUI (plugin.py)")
+
+            layout.addWidget(self.tabs)
+
+        @property
+        def blocks(self) -> list:
+            """Get all blocks from both tabs."""
+            return self.setup_list.blocks + self.gui_list.blocks
+
+        def add_block(self, block: PluginBlock):
+            """Add a block to the appropriate tab based on its category."""
+            if block.category in self.SETUP_CATEGORIES:
+                self.setup_list.add_block(block)
+                self.tabs.setCurrentIndex(0)  # Switch to setup tab
+            else:
+                self.gui_list.add_block(block)
+                self.tabs.setCurrentIndex(1)  # Switch to GUI tab
+            self.blocks_changed.emit()
+
+        def clear_blocks(self):
+            """Clear all blocks from both tabs."""
+            self.setup_list.clear_blocks()
+            self.gui_list.clear_blocks()
+            self.blocks_changed.emit()
+
+        def _on_block_deleted(self, block: PluginBlock):
+            """Handle block deletion (called by child lists)."""
+            self.blocks_changed.emit()
 
         def get_manifest_data(self) -> dict:
             """Generate manifest.json content from blocks."""
@@ -16285,7 +16409,19 @@ def create_gui_app():
 
         def get_ui_blocks(self) -> list:
             """Get UI-related blocks for plugin.py generation."""
-            ui_types = ('button', 'label', 'input', 'dropdown', 'action', 'file_picker', 'folder_picker', 'log_output', 'progress_bar')
+            ui_types = (
+                # Basic UI
+                'button', 'label', 'input', 'text_area', 'dropdown',
+                'file_picker', 'folder_picker', 'log_output', 'progress_bar', 'action',
+                # Controls
+                'checkbox', 'radio', 'spinbox', 'slider', 'switch',
+                # Containers
+                'group_box', 'tab_panel', 'scroll_area', 'splitter',
+                # Data Display
+                'table', 'tree', 'list_widget', 'image_display',
+                # Layout
+                'separator', 'spacer', 'horizontal_layout', 'vertical_layout'
+            )
             return [b for b in self.blocks if b.block_type in ui_types]
 
         def get_tool_blocks(self) -> list:
@@ -16678,7 +16814,37 @@ def create_gui_app():
 
             elif block.block_type == 'button':
                 self._add_field("Button Label:", "label", "Click Me")
-                self._add_field("Action Code:", "action_code", "Python code to run", multiline=True)
+                self._add_field("Variable Name:", "var_name", "my_button")
+
+                # Action code - show in a larger multiline field
+                action_label = QLabel("Action Code:")
+                action_label.setStyleSheet("color: #aaa; font-size: 11px;")
+                self.content_layout.addWidget(action_label)
+
+                action_field = QTextEdit()
+                action_field.setMinimumHeight(120)
+                action_field.setMaximumHeight(200)
+                action_field.setPlaceholderText("# Python code to run when clicked\nprint('Button clicked!')")
+                action_field.setStyleSheet("""
+                    QTextEdit {
+                        background: #1a1a1a;
+                        border: 1px solid #444;
+                        border-radius: 4px;
+                        padding: 6px;
+                        color: #4fc3f7;
+                        font-family: 'Consolas', 'Monaco', monospace;
+                        font-size: 11px;
+                    }
+                    QTextEdit:focus { border-color: #e91e63; }
+                """)
+                if block.block_data.get('action_code'):
+                    action_field.setPlainText(str(block.block_data['action_code']))
+                action_field.textChanged.connect(lambda: self._on_field_changed('action_code', action_field.toPlainText()))
+                self.content_layout.addWidget(action_field)
+
+                hint = QLabel("💡 Code that runs when the button is clicked")
+                hint.setStyleSheet("color: #666; font-size: 9px;")
+                self.content_layout.addWidget(hint)
 
             elif block.block_type == 'label':
                 self._add_field("Label Text:", "text", "Your text here")
@@ -16769,6 +16935,116 @@ def create_gui_app():
 
             elif block.block_type == 'progress_bar':
                 self._add_field("Variable Name:", "var_name", "progress")
+                self._add_field("Minimum Value:", "min_val", "0")
+                self._add_field("Maximum Value:", "max_val", "100")
+
+            # === NEW UI ELEMENT PROPERTIES ===
+            elif block.block_type == 'text_area':
+                self._add_field("Variable Name:", "var_name", "text_area")
+                self._add_field("Placeholder:", "placeholder", "Enter text here...")
+                self._add_field("Initial Text:", "initial", "")
+
+            elif block.block_type == 'checkbox':
+                self._add_field("Label:", "label", "Enable feature")
+                self._add_field("Variable Name:", "var_name", "checkbox")
+                checked_options = ["Unchecked", "Checked"]
+                self._add_dropdown("Default State:", "default", checked_options)
+
+            elif block.block_type == 'radio':
+                self._add_field("Label:", "label", "Option A")
+                self._add_field("Group Name:", "group", "options")
+                self._add_field("Variable Name:", "var_name", "radio_option")
+
+            elif block.block_type == 'spinbox':
+                self._add_field("Variable Name:", "var_name", "number_input")
+                self._add_field("Minimum:", "min_val", "0")
+                self._add_field("Maximum:", "max_val", "100")
+                self._add_field("Default Value:", "default", "0")
+                self._add_field("Step:", "step", "1")
+
+            elif block.block_type == 'slider':
+                self._add_field("Variable Name:", "var_name", "slider")
+                self._add_field("Minimum:", "min_val", "0")
+                self._add_field("Maximum:", "max_val", "100")
+                self._add_field("Default Value:", "default", "50")
+                orientation_options = ["Horizontal", "Vertical"]
+                self._add_dropdown("Orientation:", "orientation", orientation_options)
+
+            elif block.block_type == 'switch':
+                self._add_field("Label:", "label", "Enable feature")
+                self._add_field("Variable Name:", "var_name", "toggle")
+                state_options = ["Off", "On"]
+                self._add_dropdown("Default State:", "default", state_options)
+
+            elif block.block_type == 'group_box':
+                self._add_field("Title:", "title", "Settings")
+                self._add_field("Variable Name:", "var_name", "group")
+                hint = QLabel("💡 Add child elements inside this group")
+                hint.setStyleSheet("color: #666; font-size: 9px;")
+                self.content_layout.addWidget(hint)
+
+            elif block.block_type == 'tab_panel':
+                self._add_field("Variable Name:", "var_name", "tabs")
+                self._add_field("Tab Names (comma separated):", "tabs", "Tab 1, Tab 2, Tab 3")
+                hint = QLabel("💡 Each tab can contain child elements")
+                hint.setStyleSheet("color: #666; font-size: 9px;")
+                self.content_layout.addWidget(hint)
+
+            elif block.block_type == 'scroll_area':
+                self._add_field("Variable Name:", "var_name", "scroll")
+                self._add_field("Max Height:", "max_height", "400")
+
+            elif block.block_type == 'splitter':
+                self._add_field("Variable Name:", "var_name", "splitter")
+                orientation_options = ["Horizontal", "Vertical"]
+                self._add_dropdown("Orientation:", "orientation", orientation_options)
+
+            elif block.block_type == 'table':
+                self._add_field("Variable Name:", "var_name", "table")
+                self._add_field("Columns (comma separated):", "columns", "Name, Value, Status")
+                self._add_field("Rows:", "rows", "5")
+
+            elif block.block_type == 'tree':
+                self._add_field("Variable Name:", "var_name", "tree")
+                self._add_field("Columns (comma separated):", "columns", "Name, Type")
+
+            elif block.block_type == 'list_widget':
+                self._add_field("Variable Name:", "var_name", "list")
+                self._add_field("Items (comma separated):", "items", "Item 1, Item 2, Item 3")
+
+            elif block.block_type == 'image_display':
+                self._add_field("Variable Name:", "var_name", "image")
+                self._add_field_with_browse("Image File:", "image_path",
+                                            placeholder="Select image...",
+                                            file_filter="Images (*.png *.jpg *.gif *.svg);;All Files (*.*)")
+                self._add_field("Width:", "width", "auto")
+                self._add_field("Height:", "height", "auto")
+
+            elif block.block_type == 'separator':
+                orientation_options = ["Horizontal", "Vertical"]
+                self._add_dropdown("Orientation:", "orientation", orientation_options)
+                hint = QLabel("💡 Adds a visual divider line")
+                hint.setStyleSheet("color: #666; font-size: 9px;")
+                self.content_layout.addWidget(hint)
+
+            elif block.block_type == 'spacer':
+                self._add_field("Size (pixels):", "size", "20")
+                orientation_options = ["Horizontal", "Vertical"]
+                self._add_dropdown("Direction:", "orientation", orientation_options)
+
+            elif block.block_type == 'horizontal_layout':
+                self._add_field("Variable Name:", "var_name", "h_layout")
+                self._add_field("Spacing:", "spacing", "6")
+                hint = QLabel("💡 Child elements arranged side by side")
+                hint.setStyleSheet("color: #666; font-size: 9px;")
+                self.content_layout.addWidget(hint)
+
+            elif block.block_type == 'vertical_layout':
+                self._add_field("Variable Name:", "var_name", "v_layout")
+                self._add_field("Spacing:", "spacing", "6")
+                hint = QLabel("💡 Child elements stacked vertically")
+                hint.setStyleSheet("color: #666; font-size: 9px;")
+                self.content_layout.addWidget(hint)
 
             # === BUILT-IN TOOL PROPERTIES ===
             elif block.block_type == 'extract_payload':
@@ -17434,1348 +17710,68 @@ def create_gui_app():
 
 
     class VisualPluginMaker(QWidget):
-        """Full visual plugin maker interface."""
+        """Visual Plugin Maker - Wrapper for AST-based V2 editor.
+
+        This is a wrapper class that loads the new VisualPluginMakerV2 from
+        the visual_plugin_maker_v2 module. The V2 editor uses Python's AST
+        module to parse plugins properly, preserving all code during edits.
+
+        Features:
+        - Parse any plugin.py into editable blocks (imports, functions, classes)
+        - Edit manifest.json fields with proper form widgets
+        - Edit code directly with syntax highlighting
+        - Add new blocks (imports, functions, classes, variables)
+        - Export without losing ANY code - AST-based reconstruction
+        """
 
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.plugin_metadata = {
-                'id': '',
-                'name': '',
-                'version': '1.0',
-                'description': '',
-                'author': '',
-                'icon': '🔌',
-                'license_type': 'free'
-            }
             self._setup_ui()
 
         def _setup_ui(self):
+            """Setup UI - loads the V2 editor or shows fallback."""
             main_layout = QVBoxLayout(self)
             main_layout.setContentsMargins(0, 0, 0, 0)
             main_layout.setSpacing(0)
 
-            # Header with title and mode toggle
-            header = QFrame()
-            header.setStyleSheet("background: #1e1e1e; border-bottom: 1px solid #444;")
-            header_layout = QHBoxLayout(header)
-            header_layout.setContentsMargins(16, 10, 16, 10)
-
-            title = QLabel("🎨 Visual Plugin Creator")
-            title.setStyleSheet("font-size: 16px; font-weight: bold; color: #e91e63;")
-            header_layout.addWidget(title)
-
-            header_layout.addStretch()
-
-            # Mode toggle
-            self.mode_label = QLabel("Visual Mode")
-            self.mode_label.setStyleSheet("color: #888; font-size: 11px;")
-            header_layout.addWidget(self.mode_label)
-
-            # New from Template button
-            template_btn = QPushButton("📋 Templates")
-            template_btn.setToolTip("Start with a pre-built template")
-            template_btn.setStyleSheet("""
-                QPushButton {
-                    background: #4caf50;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 5px 12px;
-                    color: white;
-                }
-                QPushButton:hover { background: #388e3c; }
-            """)
-            template_btn.clicked.connect(self._show_templates)
-            header_layout.addWidget(template_btn)
-
-            # Import existing plugin button
-            import_btn = QPushButton("📥 Import")
-            import_btn.setToolTip("Load an existing plugin to edit")
-            import_btn.setStyleSheet("""
-                QPushButton {
-                    background: #2196f3;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 5px 12px;
-                    color: white;
-                }
-                QPushButton:hover { background: #1976d2; }
-            """)
-            import_btn.clicked.connect(self._import_plugin)
-            header_layout.addWidget(import_btn)
-
-            self.mode_toggle = QPushButton("Switch to Code Mode")
-            self.mode_toggle.setStyleSheet("""
-                QPushButton {
-                    background: #333;
-                    border: 1px solid #555;
-                    border-radius: 4px;
-                    padding: 5px 12px;
-                    color: #aaa;
-                }
-                QPushButton:hover { background: #444; color: white; }
-            """)
-            self.mode_toggle.clicked.connect(self._toggle_mode)
-            header_layout.addWidget(self.mode_toggle)
-
-            main_layout.addWidget(header)
-
-            # Content area with stacked widget for visual/code modes
-            self.mode_stack = QStackedWidget()
-
-            # === VISUAL MODE ===
-            visual_widget = QWidget()
-            visual_layout = QHBoxLayout(visual_widget)
-            visual_layout.setContentsMargins(12, 12, 12, 12)
-            visual_layout.setSpacing(12)
-
-            # Left: Block Palette (Scrollable with Categories)
-            palette_frame = QFrame()
-            palette_frame.setStyleSheet("""
-                QFrame { background: #252525; border: 1px solid #444; border-radius: 8px; }
-            """)
-            palette_frame.setFixedWidth(220)
-            palette_outer_layout = QVBoxLayout(palette_frame)
-            palette_outer_layout.setContentsMargins(0, 10, 0, 10)
-            palette_outer_layout.setSpacing(0)
-
-            # Palette header
-            palette_header = QWidget()
-            palette_header_layout = QVBoxLayout(palette_header)
-            palette_header_layout.setContentsMargins(10, 0, 10, 8)
-
-            palette_title = QLabel("🧰 Block Palette")
-            palette_title.setStyleSheet("font-weight: bold; color: #e91e63; font-size: 13px;")
-            palette_header_layout.addWidget(palette_title)
-
-            palette_hint = QLabel("Drag available blocks to canvas →")
-            palette_hint.setStyleSheet("color: #666; font-size: 10px;")
-            palette_header_layout.addWidget(palette_hint)
-
-            # Refresh button to rescan tools
-            refresh_palette_btn = QPushButton("🔄 Rescan Tools")
-            refresh_palette_btn.setStyleSheet("""
-                QPushButton { background: #333; border: 1px solid #555; padding: 4px 8px; color: #aaa; font-size: 10px; border-radius: 3px; }
-                QPushButton:hover { background: #444; color: white; }
-            """)
-            refresh_palette_btn.clicked.connect(self._refresh_palette)
-            palette_header_layout.addWidget(refresh_palette_btn)
-
-            palette_outer_layout.addWidget(palette_header)
-
-            # Scrollable palette content
-            palette_scroll = QScrollArea()
-            palette_scroll.setWidgetResizable(True)
-            palette_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            palette_scroll.setStyleSheet("""
-                QScrollArea { border: none; background: transparent; }
-                QScrollBar:vertical { width: 8px; background: #1a1a1a; }
-                QScrollBar::handle:vertical { background: #555; border-radius: 4px; }
-            """)
-
-            palette_content = QWidget()
-            self.palette_layout = QVBoxLayout(palette_content)
-            self.palette_layout.setContentsMargins(10, 0, 10, 10)
-            self.palette_layout.setSpacing(4)
-
-            # Build categorized palette
-            self._build_palette()
-
-            self.palette_layout.addStretch()
-            palette_scroll.setWidget(palette_content)
-            palette_outer_layout.addWidget(palette_scroll)
-
-            visual_layout.addWidget(palette_frame)
-
-            # Center: Main work area
-            center_widget = QWidget()
-            center_layout = QVBoxLayout(center_widget)
-            center_layout.setContentsMargins(0, 0, 0, 0)
-            center_layout.setSpacing(10)
-
-            # Metadata section
-            meta_frame = QFrame()
-            meta_frame.setStyleSheet("background: #252525; border: 1px solid #444; border-radius: 8px;")
-            meta_layout = QVBoxLayout(meta_frame)
-            meta_layout.setContentsMargins(12, 12, 12, 12)
-            meta_layout.setSpacing(8)
-
-            meta_title = QLabel("📋 Plugin Metadata")
-            meta_title.setStyleSheet("font-weight: bold; color: #e91e63;")
-            meta_layout.addWidget(meta_title)
-
-            meta_grid = QGridLayout()
-            meta_grid.setSpacing(8)
-
-            fields = [
-                ("Plugin ID:", "id", "my_plugin"),
-                ("Name:", "name", "My Plugin"),
-                ("Version:", "version", "1.0"),
-                ("Author:", "author", "Your Name"),
-                ("Icon:", "icon", "🔌"),
-            ]
-
-            self.meta_fields = {}
-            for i, (label, key, placeholder) in enumerate(fields):
-                lbl = QLabel(label)
-                lbl.setStyleSheet("color: #aaa; font-size: 11px;")
-                meta_grid.addWidget(lbl, i, 0)
-
-                field = QLineEdit()
-                field.setPlaceholderText(placeholder)
-                field.setStyleSheet("""
-                    QLineEdit {
-                        background: #1a1a1a; border: 1px solid #444; border-radius: 4px;
-                        padding: 5px; color: white;
-                    }
-                    QLineEdit:focus { border-color: #e91e63; }
-                """)
-                field.textChanged.connect(lambda t, k=key: self._on_meta_changed(k, t))
-                self.meta_fields[key] = field
-                meta_grid.addWidget(field, i, 1)
-
-            # Description (spans 2 columns)
-            desc_lbl = QLabel("Description:")
-            desc_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
-            meta_grid.addWidget(desc_lbl, len(fields), 0)
-
-            self.desc_field = QLineEdit()
-            self.desc_field.setPlaceholderText("Short description of your plugin")
-            self.desc_field.setStyleSheet("""
-                QLineEdit {
-                    background: #1a1a1a; border: 1px solid #444; border-radius: 4px;
-                    padding: 5px; color: white;
-                }
-                QLineEdit:focus { border-color: #e91e63; }
-            """)
-            self.desc_field.textChanged.connect(lambda t: self._on_meta_changed('description', t))
-            meta_grid.addWidget(self.desc_field, len(fields), 1)
-
-            meta_layout.addLayout(meta_grid)
-            center_layout.addWidget(meta_frame)
-
-            # Canvas
-            canvas_label = QLabel("🎯 Plugin Builder Canvas")
-            canvas_label.setStyleSheet("font-weight: bold; color: #e91e63; margin-top: 4px;")
-            center_layout.addWidget(canvas_label)
-
-            # Scroll area for canvas
-            canvas_scroll = QScrollArea()
-            canvas_scroll.setWidgetResizable(True)
-            canvas_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-
-            self.canvas = BlockCanvas()
-            self.canvas.blocks_changed.connect(self._update_preview)
-            self.canvas.block_selected.connect(self._on_block_selected)
-            canvas_scroll.setWidget(self.canvas)
-            center_layout.addWidget(canvas_scroll, 1)
-
-            visual_layout.addWidget(center_widget, 1)
-
-            # Right: Properties Panel
-            self.properties_panel = BlockPropertiesPanel()
-            self.properties_panel.properties_changed.connect(self._update_preview)
-            visual_layout.addWidget(self.properties_panel)
-
-            self.mode_stack.addWidget(visual_widget)
-
-            # === CODE MODE ===
-            code_widget = QWidget()
-            code_layout = QVBoxLayout(code_widget)
-            code_layout.setContentsMargins(12, 12, 12, 12)
-            code_layout.setSpacing(10)
-
-            code_tabs = QTabWidget()
-            code_tabs.setStyleSheet("""
-                QTabWidget::pane { border: 1px solid #444; border-radius: 4px; }
-                QTabBar::tab { padding: 8px 16px; }
-                QTabBar::tab:selected { background: #3a3a3a; }
-            """)
-
-            # manifest.json editor
-            manifest_widget = QWidget()
-            manifest_layout = QVBoxLayout(manifest_widget)
-            manifest_layout.setContentsMargins(8, 8, 8, 8)
-
-            self.manifest_editor = QTextEdit()
-            self.manifest_editor.setStyleSheet("""
-                QTextEdit {
-                    background: #1a1a1a; border: 1px solid #444; border-radius: 4px;
-                    font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; color: #ddd;
-                }
-            """)
-            self.manifest_editor.setPlaceholderText("manifest.json will be generated here...")
-            manifest_layout.addWidget(self.manifest_editor)
-            code_tabs.addTab(manifest_widget, "📄 manifest.json")
-
-            # plugin.py editor
-            plugin_widget = QWidget()
-            plugin_layout = QVBoxLayout(plugin_widget)
-            plugin_layout.setContentsMargins(8, 8, 8, 8)
-
-            self.plugin_editor = QTextEdit()
-            self.plugin_editor.setStyleSheet("""
-                QTextEdit {
-                    background: #1a1a1a; border: 1px solid #444; border-radius: 4px;
-                    font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; color: #ddd;
-                }
-            """)
-            self.plugin_editor.setPlaceholderText("plugin.py will be generated here...")
-            plugin_layout.addWidget(self.plugin_editor)
-            code_tabs.addTab(plugin_widget, "🐍 plugin.py")
-
-            code_layout.addWidget(code_tabs)
-
-            self.mode_stack.addWidget(code_widget)
-
-            main_layout.addWidget(self.mode_stack, 1)
-
-            # Bottom: Action buttons
-            actions_frame = QFrame()
-            actions_frame.setStyleSheet("background: #1e1e1e; border-top: 1px solid #444;")
-            actions_layout = QHBoxLayout(actions_frame)
-            actions_layout.setContentsMargins(16, 10, 16, 10)
-
-            clear_btn = QPushButton("🗑️ Clear All")
-            clear_btn.clicked.connect(self._clear_all)
-            actions_layout.addWidget(clear_btn)
-
-            actions_layout.addStretch()
-
-            preview_btn = QPushButton("👁️ Preview Code")
-            preview_btn.clicked.connect(self._show_code_preview)
-            actions_layout.addWidget(preview_btn)
-
-            export_btn = QPushButton("📦 Export Plugin")
-            export_btn.setStyleSheet("""
-                QPushButton {
-                    background: #e91e63;
-                    color: white;
-                    border: none;
-                    border-radius: 4px;
-                    padding: 8px 20px;
-                    font-weight: bold;
-                }
-                QPushButton:hover { background: #c2185b; }
-            """)
-            export_btn.clicked.connect(self._export_plugin)
-            actions_layout.addWidget(export_btn)
-
-            main_layout.addWidget(actions_frame)
-
-        def _build_palette(self):
-            """Build the block palette organized by categories."""
-            # Clear existing blocks (except stretches)
-            while self.palette_layout.count() > 0:
-                item = self.palette_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-
-            # Category order
-            category_order = ['dependencies', 'builtin', 'tools', 'plugins', 'ui']
-
-            for category in category_order:
-                cat_info = PluginBlock.BLOCK_CATEGORIES.get(category)
-                if not cat_info:
-                    continue
-
-                cat_name, cat_desc = cat_info
-                blocks_in_cat = PluginBlock.get_blocks_by_category(category)
-
-                if not blocks_in_cat:
-                    continue
-
-                # Count available vs total
-                available_count = sum(1 for bt in blocks_in_cat if PluginBlock.is_block_available(bt))
-                total_count = len(blocks_in_cat)
-
-                # Category header
-                cat_header = QLabel(f"{cat_name}")
-                cat_header.setStyleSheet("color: #e91e63; font-size: 11px; font-weight: bold; margin-top: 10px;")
-                cat_header.setToolTip(cat_desc)
-                self.palette_layout.addWidget(cat_header)
-
-                # Availability indicator for categories with requirements
-                if category in ('tools', 'plugins'):
-                    avail_label = QLabel(f"✓ {available_count}/{total_count} available")
-                    avail_color = "#4caf50" if available_count == total_count else ("#ff9800" if available_count > 0 else "#f44336")
-                    avail_label.setStyleSheet(f"color: {avail_color}; font-size: 9px; margin-bottom: 4px;")
-                    self.palette_layout.addWidget(avail_label)
-
-                # Add blocks (available first, then unavailable)
-                sorted_blocks = sorted(blocks_in_cat, key=lambda bt: (0 if PluginBlock.is_block_available(bt) else 1, bt))
-
-                for bt in sorted_blocks:
-                    block = PluginBlock(bt, check_availability=True)
-                    self.palette_layout.addWidget(block)
-
-        def _refresh_palette(self):
-            """Refresh the palette by rescanning for available tools."""
-            # Show we're refreshing
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            QApplication.processEvents()
-            try:
-                results = tool_detector.scan(force_refresh=True)
-                logger.debug(f"Tool scan results: {results}")
-                self._build_palette()
-                self.palette_layout.addStretch()
-                # Count available tools for feedback
-                available = sum(1 for v in results.values() if v)
-                total = len(results)
-                logger.info(f"Palette refreshed: {available}/{total} tools available")
-            except Exception as e:
-                logger.error(f"Error refreshing palette: {e}")
-            finally:
-                QApplication.restoreOverrideCursor()
-            QApplication.processEvents()
-
-        def _on_meta_changed(self, key: str, value: str):
-            self.plugin_metadata[key] = value
-            self._update_preview()
-
-        def _on_block_selected(self, block: PluginBlock):
-            # Deselect all other blocks
-            for b in self.canvas.blocks:
-                b.set_selected(b == block)
-            self.properties_panel.show_block_properties(block)
-
-        def _toggle_mode(self):
-            if self.mode_stack.currentIndex() == 0:
-                # Switch to code mode
-                self._update_preview()
-                self.mode_stack.setCurrentIndex(1)
-                self.mode_toggle.setText("Switch to Visual Mode")
-                self.mode_label.setText("Code Mode")
+            # Try to load VisualPluginMakerV2
+            V2Class = _get_visual_plugin_maker_v2()
+
+            if V2Class:
+                # Use the new AST-based V2 editor
+                self.v2_editor = V2Class(self)
+                main_layout.addWidget(self.v2_editor)
             else:
-                # Switch to visual mode
-                self.mode_stack.setCurrentIndex(0)
-                self.mode_toggle.setText("Switch to Code Mode")
-                self.mode_label.setText("Visual Mode")
-
-        def _update_preview(self):
-            """Update the code preview panels with generated manifest and plugin code."""
-            try:
-                manifest = self._generate_manifest()
-                plugin_code = self._generate_plugin_code()
-
-                self.manifest_editor.setPlainText(json.dumps(manifest, indent=2))
-                self.plugin_editor.setPlainText(plugin_code)
-            except Exception as e:
-                logger.error(f"Error updating preview: {e}")
-                self.manifest_editor.setPlainText(f"Error generating manifest:\n{str(e)}")
-                self.plugin_editor.setPlainText(f"Error generating plugin code:\n{str(e)}")
-
-        def _generate_manifest(self) -> dict:
-            """Generate complete manifest.json."""
-            manifest = {
-                'id': self.plugin_metadata.get('id') or 'my_plugin',
-                'name': self.plugin_metadata.get('name') or 'My Plugin',
-                'version': self.plugin_metadata.get('version') or '1.0',
-                'description': self.plugin_metadata.get('description') or '',
-                'author': self.plugin_metadata.get('author') or 'Unknown',
-                'icon': self.plugin_metadata.get('icon') or '🔌',
-                'license_type': self.plugin_metadata.get('license_type') or 'free',
-                'min_version': '2.0',
-                'enabled': True
-            }
-
-            # Add blocks data
-            manifest.update(self.canvas.get_manifest_data())
-
-            return manifest
-
-        def _generate_plugin_code(self) -> str:
-            """Generate plugin.py code from UI and tool blocks."""
-            ui_blocks = self.canvas.get_ui_blocks()
-            tool_blocks = self.canvas.get_tool_blocks()
-
-            plugin_name = self.plugin_metadata.get('name') or 'MyPlugin'
-            class_name = ''.join(word.title() for word in plugin_name.split())
-            class_name = ''.join(c for c in class_name if c.isalnum())
-
-            # Determine imports needed based on blocks used
-            needs_subprocess = any(b.block_type.startswith(('adb_', 'fastboot_', 'mtk_', 'scrcpy_', 'erofs_', 'allwinner_', 'rockchip_')) for b in tool_blocks)
-            needs_file_dialog = any(b.block_type in ('file_picker', 'folder_picker') for b in ui_blocks)
-            needs_progress = any(b.block_type == 'progress_bar' for b in ui_blocks)
-
-            code = f'''"""
-{plugin_name}
-Generated by Image Anarchy Visual Plugin Maker
-"""
-
-import os
-import subprocess
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QLineEdit, QComboBox, QTextEdit,
-    QProgressBar, QFileDialog, QMessageBox
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-
-# Import PluginBase if available
-try:
-    from image_anarchy import PluginBase
-except ImportError:
-    class PluginBase:
-        manifest = None
-        def get_name(self): return "{plugin_name}"
-        def get_icon(self): return "{self.plugin_metadata.get('icon', '🔌')}"
-        def get_description(self): return "{self.plugin_metadata.get('description', '')}"
-        def create_widget(self, parent): return None
-
-
-def get_plugin_dir():
-    """Get this plugin's directory."""
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-class {class_name}Plugin(PluginBase):
-    """Plugin implementation."""
-
-    def __init__(self):
-        super().__init__()
-        self.parent_window = None
-
-    def create_widget(self, parent_window) -> QWidget:
-        """Create and return the plugin's main widget."""
-        self.parent_window = parent_window
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        # Title
-        title = QLabel("{plugin_name}")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #e91e63;")
-        layout.addWidget(title)
-'''
-
-            # Generate UI code for each block
-            for i, block in enumerate(ui_blocks):
-                data = block.block_data
-
-                if block.block_type == 'label':
-                    text = data.get('text', 'Label')
-                    code += f'''
-        # Label {i+1}
-        label_{i} = QLabel("{text}")
-        layout.addWidget(label_{i})
-'''
-
-                elif block.block_type == 'button':
-                    label = data.get('label', 'Button')
-                    code += f'''
-        # Button {i+1}
-        btn_{i} = QPushButton("{label}")
-        btn_{i}.clicked.connect(lambda checked, idx={i}: self._action_{i}())
-        layout.addWidget(btn_{i})
-'''
-
-                elif block.block_type == 'input':
-                    placeholder = data.get('placeholder', '')
-                    var_name = data.get('var_name', f'input_{i}')
-                    code += f'''
-        # Input {i+1}
-        self.{var_name} = QLineEdit()
-        self.{var_name}.setPlaceholderText("{placeholder}")
-        layout.addWidget(self.{var_name})
-'''
-
-                elif block.block_type == 'dropdown':
-                    options = data.get('options', 'Option 1, Option 2').split(',')
-                    var_name = data.get('var_name', f'dropdown_{i}')
-                    opts_str = ', '.join(f'"{o.strip()}"' for o in options)
-                    code += f'''
-        # Dropdown {i+1}
-        self.{var_name} = QComboBox()
-        self.{var_name}.addItems([{opts_str}])
-        layout.addWidget(self.{var_name})
-'''
-
-                elif block.block_type == 'file_picker':
-                    label = data.get('label', 'Select File...')
-                    var_name = data.get('var_name', f'selected_file_{i}')
-                    file_filter = data.get('filter', 'All Files (*.*)')
-                    code += f'''
-        # File Picker {i+1}
-        file_row_{i} = QHBoxLayout()
-        self.{var_name} = QLineEdit()
-        self.{var_name}.setPlaceholderText("No file selected")
-        self.{var_name}.setReadOnly(True)
-        file_row_{i}.addWidget(self.{var_name})
-        file_btn_{i} = QPushButton("{label}")
-        file_btn_{i}.clicked.connect(lambda: self._pick_file_{i}())
-        file_row_{i}.addWidget(file_btn_{i})
-        layout.addLayout(file_row_{i})
-'''
-
-                elif block.block_type == 'folder_picker':
-                    label = data.get('label', 'Select Folder...')
-                    var_name = data.get('var_name', f'selected_folder_{i}')
-                    code += f'''
-        # Folder Picker {i+1}
-        folder_row_{i} = QHBoxLayout()
-        self.{var_name} = QLineEdit()
-        self.{var_name}.setPlaceholderText("No folder selected")
-        self.{var_name}.setReadOnly(True)
-        folder_row_{i}.addWidget(self.{var_name})
-        folder_btn_{i} = QPushButton("{label}")
-        folder_btn_{i}.clicked.connect(lambda: self._pick_folder_{i}())
-        folder_row_{i}.addWidget(folder_btn_{i})
-        layout.addLayout(folder_row_{i})
-'''
-
-                elif block.block_type == 'log_output':
-                    var_name = data.get('var_name', f'log_output_{i}')
-                    initial = data.get('initial', 'Ready...')
-                    code += f'''
-        # Log Output {i+1}
-        self.{var_name} = QTextEdit()
-        self.{var_name}.setReadOnly(True)
-        self.{var_name}.setPlainText("{initial}")
-        self.{var_name}.setMaximumHeight(150)
-        layout.addWidget(self.{var_name})
-'''
-
-                elif block.block_type == 'progress_bar':
-                    var_name = data.get('var_name', f'progress_{i}')
-                    code += f'''
-        # Progress Bar {i+1}
-        self.{var_name} = QProgressBar()
-        self.{var_name}.setValue(0)
-        layout.addWidget(self.{var_name})
-'''
-
-                elif block.block_type == 'action':
-                    action_type = data.get('action_type', 'Custom Code')
-                    code += f'''
-        # Action Button: {action_type}
-        action_btn_{i} = QPushButton("⚡ {action_type}")
-        action_btn_{i}.clicked.connect(lambda checked, idx={i}: self._run_action_{i}())
-        layout.addWidget(action_btn_{i})
-'''
-
-            # Generate tool action buttons
-            for i, block in enumerate(tool_blocks):
-                data = block.block_data
-                tool_name = block.display_name
-                code += f'''
-        # Tool: {tool_name}
-        tool_btn_{i} = QPushButton("{block.icon} {tool_name}")
-        tool_btn_{i}.clicked.connect(lambda checked, idx={i}: self._run_tool_{i}())
-        layout.addWidget(tool_btn_{i})
-'''
-
-            code += '''
-        layout.addStretch()
-        return widget
-'''
-
-            # Add helper methods for file/folder pickers
-            for i, block in enumerate(ui_blocks):
-                if block.block_type == 'file_picker':
-                    var_name = block.block_data.get('var_name', f'selected_file_{i}')
-                    file_filter = block.block_data.get('filter', 'All Files (*.*)')
-                    code += f'''
-    def _pick_file_{i}(self):
-        """Open file picker dialog."""
-        path, _ = QFileDialog.getOpenFileName(None, "Select File", "", "{file_filter}")
-        if path:
-            self.{var_name}.setText(path)
-'''
-                elif block.block_type == 'folder_picker':
-                    var_name = block.block_data.get('var_name', f'selected_folder_{i}')
-                    code += f'''
-    def _pick_folder_{i}(self):
-        """Open folder picker dialog."""
-        path = QFileDialog.getExistingDirectory(None, "Select Folder")
-        if path:
-            self.{var_name}.setText(path)
-'''
-
-            # Add action methods for buttons
-            for i, block in enumerate(ui_blocks):
-                if block.block_type == 'button':
-                    action = block.block_data.get('action_code', 'print("Button clicked!")')
-                    code += f'''
-    def _action_{i}(self):
-        """Action for button {i+1}."""
-        {action}
-'''
-                elif block.block_type == 'action':
-                    action_type = block.block_data.get('action_type', 'Custom Code')
-                    params = block.block_data.get('params', '')
-                    code += f'''
-    def _run_action_{i}(self):
-        """Run action: {action_type}."""
-        try:
-            {self._get_action_code(action_type, params)}
-        except Exception as e:
-            QMessageBox.warning(None, "Error", str(e))
-'''
-
-            # Add tool methods
-            for i, block in enumerate(tool_blocks):
-                data = block.block_data
-                code += self._generate_tool_method(i, block)
-
-            code += '''
-
-# Export the plugin class
-Plugin = ''' + class_name + '''Plugin
-'''
-
-            return code
-
-        def _get_action_code(self, action_type: str, params: str) -> str:
-            """Generate code for pre-built action types."""
-            if 'ADB' in action_type:
-                cmd = params if params else 'adb devices'
-                return f'''result = subprocess.run({repr(cmd)}.split(), capture_output=True, text=True)
-            print(result.stdout)'''
-            elif 'Fastboot' in action_type:
-                cmd = params if params else 'fastboot devices'
-                return f'''result = subprocess.run({repr(cmd)}.split(), capture_output=True, text=True)
-            print(result.stdout)'''
-            elif 'Extract Payload' in action_type:
-                return 'print("Use Extract Payload block for full implementation")'
-            elif 'Pack Payload' in action_type:
-                return 'print("Use Repack Payload block for full implementation")'
-            elif 'Extract Super' in action_type:
-                return 'print("Use Extract Super block for full implementation")'
-            else:
-                return params if params else 'pass'
-
-        def _generate_tool_method(self, idx: int, block) -> str:
-            """Generate method code for tool blocks."""
-            data = block.block_data
-            bt = block.block_type
-
-            if bt == 'adb_command':
-                cmd = data.get('command', 'shell ls /sdcard')
-                output_var = data.get('output_var', 'result')
-                return f'''
-    def _run_tool_{idx}(self):
-        """Run ADB command."""
-        try:
-            result = subprocess.run(['adb'] + {repr(cmd)}.split(), capture_output=True, text=True, timeout=30)
-            print(result.stdout or result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "ADB Error", str(e))
-'''
-
-            elif bt == 'adb_pull':
-                remote = data.get('remote', '/sdcard/file.txt')
-                return f'''
-    def _run_tool_{idx}(self):
-        """Pull file from device."""
-        try:
-            local_path, _ = QFileDialog.getSaveFileName(None, "Save As")
-            if local_path:
-                result = subprocess.run(['adb', 'pull', '{remote}', local_path], capture_output=True, text=True)
-                if result.returncode == 0:
-                    QMessageBox.information(None, "Success", f"File saved to {{local_path}}")
-                else:
-                    QMessageBox.warning(None, "Error", result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "ADB Error", str(e))
-'''
-
-            elif bt == 'adb_push':
-                remote = data.get('remote', '/sdcard/')
-                return f'''
-    def _run_tool_{idx}(self):
-        """Push file to device."""
-        try:
-            local_path, _ = QFileDialog.getOpenFileName(None, "Select File to Push")
-            if local_path:
-                result = subprocess.run(['adb', 'push', local_path, '{remote}'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    QMessageBox.information(None, "Success", "File pushed successfully!")
-                else:
-                    QMessageBox.warning(None, "Error", result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "ADB Error", str(e))
-'''
-
-            elif bt == 'adb_install':
-                return f'''
-    def _run_tool_{idx}(self):
-        """Install APK on device."""
-        try:
-            apk_path, _ = QFileDialog.getOpenFileName(None, "Select APK", "", "APK Files (*.apk)")
-            if apk_path:
-                result = subprocess.run(['adb', 'install', '-r', apk_path], capture_output=True, text=True)
-                if result.returncode == 0:
-                    QMessageBox.information(None, "Success", "APK installed successfully!")
-                else:
-                    QMessageBox.warning(None, "Error", result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "ADB Error", str(e))
-'''
-
-            elif bt == 'fastboot_flash':
-                partition = data.get('partition', 'boot')
-                return f'''
-    def _run_tool_{idx}(self):
-        """Flash partition via fastboot."""
-        try:
-            image_path, _ = QFileDialog.getOpenFileName(None, "Select Image", "", "Image Files (*.img)")
-            if image_path:
-                result = subprocess.run(['fastboot', 'flash', '{partition}', image_path], capture_output=True, text=True)
-                if result.returncode == 0:
-                    QMessageBox.information(None, "Success", "{partition} flashed successfully!")
-                else:
-                    QMessageBox.warning(None, "Error", result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "Fastboot Error", str(e))
-'''
-
-            elif bt == 'fastboot_boot':
-                return f'''
-    def _run_tool_{idx}(self):
-        """Boot image via fastboot."""
-        try:
-            image_path, _ = QFileDialog.getOpenFileName(None, "Select Boot Image", "", "Image Files (*.img)")
-            if image_path:
-                result = subprocess.run(['fastboot', 'boot', image_path], capture_output=True, text=True)
-                if result.returncode == 0:
-                    QMessageBox.information(None, "Success", "Booting image...")
-                else:
-                    QMessageBox.warning(None, "Error", result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "Fastboot Error", str(e))
-'''
-
-            elif bt == 'fastboot_erase':
-                partition = data.get('partition', 'userdata')
-                return f'''
-    def _run_tool_{idx}(self):
-        """Erase partition via fastboot."""
-        try:
-            reply = QMessageBox.question(None, "Confirm Erase",
-                "Are you sure you want to erase {partition}?\\nThis cannot be undone!")
-            if reply == QMessageBox.StandardButton.Yes:
-                result = subprocess.run(['fastboot', 'erase', '{partition}'], capture_output=True, text=True)
-                if result.returncode == 0:
-                    QMessageBox.information(None, "Success", "{partition} erased!")
-                else:
-                    QMessageBox.warning(None, "Error", result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "Fastboot Error", str(e))
-'''
-
-            elif bt == 'erofs_extract':
-                return f'''
-    def _run_tool_{idx}(self):
-        """Extract EROFS filesystem."""
-        try:
-            input_path, _ = QFileDialog.getOpenFileName(None, "Select EROFS Image", "", "Image Files (*.img)")
-            if input_path:
-                output_dir = QFileDialog.getExistingDirectory(None, "Select Output Directory")
-                if output_dir:
-                    tool_path = os.path.join(get_plugin_dir(), '..', '..', 'tools', 'extract.erofs.exe')
-                    result = subprocess.run([tool_path, '-i', input_path, '-o', output_dir], capture_output=True, text=True)
-                    print(result.stdout or result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "EROFS Error", str(e))
-'''
-
-            elif bt == 'erofs_create':
-                return f'''
-    def _run_tool_{idx}(self):
-        """Create EROFS filesystem."""
-        try:
-            input_dir = QFileDialog.getExistingDirectory(None, "Select Source Directory")
-            if input_dir:
-                output_path, _ = QFileDialog.getSaveFileName(None, "Save EROFS Image", "", "Image Files (*.img)")
-                if output_path:
-                    tool_path = os.path.join(get_plugin_dir(), '..', '..', 'tools', 'mkfs.erofs.exe')
-                    result = subprocess.run([tool_path, output_path, input_dir], capture_output=True, text=True)
-                    print(result.stdout or result.stderr)
-        except Exception as e:
-            QMessageBox.warning(None, "EROFS Error", str(e))
-'''
-
-            # Default for unimplemented tools
-            return f'''
-    def _run_tool_{idx}(self):
-        """Run {block.display_name}."""
-        QMessageBox.information(None, "Info", "{block.display_name} - Implementation pending")
-'''
-
-        def _show_templates(self):
-            """Show template selection dialog for quick-start plugins."""
-            templates = {
-                '🛠️ Basic Tool Plugin': {
-                    'description': 'Simple plugin with a button and log output',
-                    'metadata': {'name': 'My Tool', 'icon': '🛠️', 'version': '1.0'},
-                    'blocks': [
-                        ('button', {'label': 'Run Tool'}),
-                        ('log_output', {'var_name': 'log', 'initial': 'Ready...'}),
-                    ]
-                },
-                '📦 Package Wrapper': {
-                    'description': 'Wrap a pip package with a UI',
-                    'metadata': {'name': 'Package Wrapper', 'icon': '📦', 'version': '1.0'},
-                    'blocks': [
-                        ('pip', {'package': 'your-package'}),
-                        ('button', {'label': 'Execute'}),
-                        ('log_output', {'var_name': 'output'}),
-                    ]
-                },
-                '📥 Git Tool Wrapper': {
-                    'description': 'Clone a git repo and provide UI for it',
-                    'metadata': {'name': 'Git Tool', 'icon': '📥', 'version': '1.0'},
-                    'blocks': [
-                        ('git', {'repo': 'https://github.com/user/repo.git', 'target': 'tool'}),
-                        ('command', {'command': 'pip install .'}),
-                        ('file_picker', {'label': 'Select Input...', 'var_name': 'input_file'}),
-                        ('button', {'label': 'Process'}),
-                        ('progress_bar', {'var_name': 'progress'}),
-                        ('log_output', {'var_name': 'log'}),
-                    ]
-                },
-                '📱 ADB Tool': {
-                    'description': 'ADB-based device tool',
-                    'metadata': {'name': 'ADB Tool', 'icon': '📱', 'version': '1.0'},
-                    'blocks': [
-                        ('input', {'placeholder': 'Device command...', 'var_name': 'cmd'}),
-                        ('adb_command', {'command': 'shell {cmd}', 'output_var': 'result'}),
-                        ('log_output', {'var_name': 'log'}),
-                    ]
-                },
-                '⚡ MTK Tool': {
-                    'description': 'MediaTek device operations',
-                    'metadata': {'name': 'MTK Tool', 'icon': '⚡', 'version': '1.0'},
-                    'blocks': [
-                        ('pip', {'package': 'pyusb'}),
-                        ('git', {'repo': 'https://github.com/bkerler/mtkclient.git', 'target': 'mtkclient'}),
-                        ('command', {'command': 'pip install .'}),
-                        ('driver', {'file': 'UsbDk_1.0.22_x64.msi', 'optional': True}),
-                        ('dropdown', {'options': 'boot, recovery, vbmeta, dtbo', 'var_name': 'partition'}),
-                        ('button', {'label': 'Read Partition'}),
-                        ('log_output', {'var_name': 'log'}),
-                    ]
-                },
-                '🖼️ Image Processor': {
-                    'description': 'Process Android images',
-                    'metadata': {'name': 'Image Tool', 'icon': '🖼️', 'version': '1.0'},
-                    'blocks': [
-                        ('file_picker', {'label': 'Select Image...', 'var_name': 'input_image', 'filter': 'Images (*.img);;All Files (*.*)'}),
-                        ('folder_picker', {'label': 'Output Folder...', 'var_name': 'output_dir'}),
-                        ('button', {'label': 'Extract'}),
-                        ('progress_bar', {'var_name': 'progress'}),
-                        ('log_output', {'var_name': 'log'}),
-                    ]
-                },
-            }
-
-            dialog = QDialog(self)
-            dialog.setWindowTitle("📋 Plugin Templates")
-            dialog.setMinimumSize(500, 400)
-            dialog.setStyleSheet("background: #1e1e1e; color: white;")
-
-            layout = QVBoxLayout(dialog)
-            layout.setSpacing(12)
-
-            title = QLabel("Choose a template to get started quickly:")
-            title.setStyleSheet("font-weight: bold; color: #e91e63; font-size: 14px;")
-            layout.addWidget(title)
-
-            # Template list
-            template_list = QListWidget()
-            template_list.setStyleSheet("""
-                QListWidget { background: #252525; border: 1px solid #444; border-radius: 4px; }
-                QListWidget::item { padding: 12px; border-bottom: 1px solid #333; }
-                QListWidget::item:selected { background: #e91e63; }
-                QListWidget::item:hover { background: #333; }
-            """)
-
-            for name, data in templates.items():
-                item = QListWidgetItem(f"{name}\n   {data['description']}")
-                item.setData(Qt.ItemDataRole.UserRole, name)
-                template_list.addItem(item)
-
-            layout.addWidget(template_list)
-
-            # Buttons
-            btn_row = QHBoxLayout()
-            btn_row.addStretch()
-
-            cancel_btn = QPushButton("Cancel")
-            cancel_btn.setStyleSheet("background: #444; border: none; padding: 8px 16px; border-radius: 4px;")
-            cancel_btn.clicked.connect(dialog.reject)
-            btn_row.addWidget(cancel_btn)
-
-            apply_btn = QPushButton("🚀 Use Template")
-            apply_btn.setStyleSheet("""
-                QPushButton { background: #e91e63; border: none; padding: 8px 20px; border-radius: 4px; font-weight: bold; }
-                QPushButton:hover { background: #c2185b; }
-            """)
-
-            def apply_template():
-                if not template_list.currentItem():
-                    QMessageBox.warning(dialog, "No Selection", "Please select a template.")
-                    return
-
-                template_name = template_list.currentItem().data(Qt.ItemDataRole.UserRole)
-                template_data = templates[template_name]
-                dialog.accept()
-                self._apply_template(template_data)
-
-            apply_btn.clicked.connect(apply_template)
-            btn_row.addWidget(apply_btn)
-            layout.addLayout(btn_row)
-
-            # Double-click to apply
-            template_list.itemDoubleClicked.connect(lambda: apply_template())
-
-            dialog.exec()
-
-        def _apply_template(self, template_data: dict):
-            """Apply a template to the visual editor."""
-            # Clear current state
-            self._clear_all()
-
-            # Apply metadata
-            metadata = template_data.get('metadata', {})
-            for key, value in metadata.items():
-                if key in self.meta_fields:
-                    self.meta_fields[key].setText(str(value))
-                    self.plugin_metadata[key] = value
-
-            # Add blocks
-            for block_type, block_data in template_data.get('blocks', []):
-                block = PluginBlock(block_type)
-                block.block_data = block_data.copy()
-
-                # Update display text based on block type
-                if block_type == 'pip' and block_data.get('package'):
-                    block.set_display_text(f"📦 {block_data['package']}")
-                elif block_type == 'git' and block_data.get('repo'):
-                    repo_name = block_data['repo'].rstrip('/').split('/')[-1].replace('.git', '')
-                    block.set_display_text(f"📥 {repo_name}")
-                elif block_type == 'command' and block_data.get('command'):
-                    short = block_data['command'][:20] + '...' if len(block_data['command']) > 20 else block_data['command']
-                    block.set_display_text(f"⚙️ {short}")
-                elif block_type == 'button' and block_data.get('label'):
-                    block.set_display_text(f"🔘 {block_data['label']}")
-                elif block_type == 'driver' and block_data.get('file'):
-                    block.set_display_text(f"🔌 {block_data['file']}")
-
-                self.canvas.add_block(block)
-
-            # Update preview
-            self._update_preview()
-
-            QMessageBox.information(
-                self, "✅ Template Applied!",
-                "Template has been applied.\n\n"
-                "Now customize the blocks in the Properties panel,\n"
-                "fill in the metadata, and export when ready!"
+                # Fallback: Show message if module not found
+                self._show_fallback(main_layout)
+
+        def _show_fallback(self, layout):
+            """Show fallback message when V2 module isn't available."""
+            fallback = QFrame()
+            fallback.setStyleSheet("background: #1e1e1e;")
+            fallback_layout = QVBoxLayout(fallback)
+            fallback_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            icon = QLabel("⚠️")
+            icon.setStyleSheet("font-size: 48px;")
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_layout.addWidget(icon)
+
+            title = QLabel("Visual Plugin Maker V2 Not Available")
+            title.setStyleSheet("font-size: 18px; font-weight: bold; color: #e91e63;")
+            title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            fallback_layout.addWidget(title)
+
+            msg = QLabel(
+                "The visual_plugin_maker_v2.py module could not be loaded.\n\n"
+                "Make sure this file exists in the same directory as image_anarchy.py"
             )
+            msg.setStyleSheet("color: #888; font-size: 12px;")
+            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            msg.setWordWrap(True)
+            fallback_layout.addWidget(msg)
 
-        def _import_plugin(self):
-            """Import an existing plugin to edit in the visual maker."""
-            # Let user select a plugin folder or manifest.json
-            plugins_dir = os.path.join(get_app_dir(), 'plugins')
-
-            # Show a dialog to select from existing plugins or browse
-            dialog = QDialog(self)
-            dialog.setWindowTitle("📥 Import Plugin")
-            dialog.setMinimumWidth(450)
-            dialog.setStyleSheet("background: #1e1e1e; color: white;")
-
-            layout = QVBoxLayout(dialog)
-            layout.setSpacing(12)
-
-            title = QLabel("Select a plugin to import and edit:")
-            title.setStyleSheet("font-weight: bold; color: #e91e63;")
-            layout.addWidget(title)
-
-            # List existing plugins
-            plugin_list = QListWidget()
-            plugin_list.setStyleSheet("""
-                QListWidget { background: #252525; border: 1px solid #444; border-radius: 4px; }
-                QListWidget::item { padding: 8px; border-bottom: 1px solid #333; }
-                QListWidget::item:selected { background: #e91e63; }
-                QListWidget::item:hover { background: #333; }
-            """)
-
-            if os.path.exists(plugins_dir):
-                for item in sorted(os.listdir(plugins_dir)):
-                    manifest_path = os.path.join(plugins_dir, item, 'manifest.json')
-                    if os.path.exists(manifest_path):
-                        try:
-                            with open(manifest_path, 'r', encoding='utf-8') as f:
-                                manifest = json.load(f)
-                            name = manifest.get('name', item)
-                            icon = manifest.get('icon', '🔌')
-                            version = manifest.get('version', '?')
-                            list_item = QListWidgetItem(f"{icon} {name} (v{version})")
-                            list_item.setData(Qt.ItemDataRole.UserRole, item)  # Store folder name
-                            plugin_list.addItem(list_item)
-                        except Exception:
-                            pass
-
-            layout.addWidget(plugin_list)
-
-            # Or browse for manifest
-            browse_row = QHBoxLayout()
-            browse_label = QLabel("Or browse for manifest.json:")
-            browse_label.setStyleSheet("color: #888;")
-            browse_row.addWidget(browse_label)
-
-            browse_btn = QPushButton("📁 Browse...")
-            browse_btn.setStyleSheet("""
-                QPushButton { background: #444; border: none; border-radius: 4px; padding: 6px 12px; color: white; }
-                QPushButton:hover { background: #555; }
-            """)
-
-            selected_path = [None]  # Use list to allow modification in nested function
-
-            def browse_manifest():
-                path, _ = QFileDialog.getOpenFileName(
-                    dialog, "Select manifest.json",
-                    plugins_dir, "Manifest (manifest.json);;JSON Files (*.json)"
-                )
-                if path:
-                    selected_path[0] = path
-                    plugin_list.clearSelection()
-                    browse_btn.setText(f"📁 {os.path.basename(os.path.dirname(path))}")
-
-            browse_btn.clicked.connect(browse_manifest)
-            browse_row.addWidget(browse_btn)
-            browse_row.addStretch()
-            layout.addLayout(browse_row)
-
-            # Buttons
-            btn_row = QHBoxLayout()
-            btn_row.addStretch()
-
-            cancel_btn = QPushButton("Cancel")
-            cancel_btn.setStyleSheet("background: #444; border: none; padding: 8px 16px; border-radius: 4px;")
-            cancel_btn.clicked.connect(dialog.reject)
-            btn_row.addWidget(cancel_btn)
-
-            import_btn = QPushButton("📥 Import")
-            import_btn.setStyleSheet("""
-                QPushButton { background: #e91e63; border: none; padding: 8px 20px; border-radius: 4px; font-weight: bold; }
-                QPushButton:hover { background: #c2185b; }
-            """)
-
-            def do_import():
-                manifest_path = None
-                if selected_path[0]:
-                    manifest_path = selected_path[0]
-                elif plugin_list.currentItem():
-                    folder = plugin_list.currentItem().data(Qt.ItemDataRole.UserRole)
-                    manifest_path = os.path.join(plugins_dir, folder, 'manifest.json')
-
-                if manifest_path and os.path.exists(manifest_path):
-                    dialog.accept()
-                    self._load_from_manifest(manifest_path)
-                else:
-                    QMessageBox.warning(dialog, "No Selection", "Please select a plugin or browse for a manifest.json")
-
-            import_btn.clicked.connect(do_import)
-            btn_row.addWidget(import_btn)
-            layout.addLayout(btn_row)
-
-            # Double-click to import
-            plugin_list.itemDoubleClicked.connect(lambda: do_import())
-
-            dialog.exec()
-
-        def _load_from_manifest(self, manifest_path: str):
-            """Load plugin data from a manifest.json file into the visual editor."""
-            try:
-                with open(manifest_path, 'r', encoding='utf-8') as f:
-                    manifest = json.load(f)
-            except Exception as e:
-                QMessageBox.critical(self, "Load Error", f"Failed to read manifest:\n{e}")
-                return
-
-            # Clear current state
-            self._clear_all()
-
-            # Load metadata
-            for key in ['id', 'name', 'version', 'author', 'icon']:
-                if key in manifest and key in self.meta_fields:
-                    self.meta_fields[key].setText(str(manifest[key]))
-                    self.plugin_metadata[key] = manifest[key]
-
-            if 'description' in manifest:
-                self.desc_field.setText(manifest['description'])
-                self.plugin_metadata['description'] = manifest['description']
-
-            if 'license_type' in manifest:
-                self.plugin_metadata['license_type'] = manifest['license_type']
-
-            # Load requirements as pip blocks
-            for pkg in manifest.get('requirements', []):
-                block = PluginBlock('pip')
-                block.block_data['package'] = pkg
-                block.set_display_text(f"📦 {pkg}")
-                self.canvas.add_block(block)
-
-            # Load git_clone as git block
-            if manifest.get('git_clone'):
-                git_data = manifest['git_clone']
-                block = PluginBlock('git')
-                block.block_data['repo'] = git_data.get('repo', '')
-                block.block_data['target'] = git_data.get('target', '')
-                if git_data.get('branch'):
-                    block.block_data['branch'] = git_data['branch']
-                repo_name = git_data.get('repo', '').rstrip('/').split('/')[-1].replace('.git', '')
-                block.set_display_text(f"📥 {repo_name}")
-                self.canvas.add_block(block)
-
-            # Load bundled_binaries as binary blocks
-            for binary in manifest.get('bundled_binaries', []):
-                block = PluginBlock('binary')
-                if isinstance(binary, str):
-                    if binary.startswith(('http://', 'https://')):
-                        block.block_data['source_type'] = 'url'
-                        block.block_data['url'] = binary
-                    else:
-                        block.block_data['source_type'] = 'local'
-                        block.block_data['local_path'] = binary
-                elif isinstance(binary, dict):
-                    if binary.get('url'):
-                        block.block_data['source_type'] = 'url'
-                        block.block_data['url'] = binary['url']
-                        block.block_data['sha256'] = binary.get('sha256', '')
-                    block.block_data['target_path'] = binary.get('target_path', '')
-                self.canvas.add_block(block)
-
-            # Load setup_commands as command blocks
-            for cmd in manifest.get('setup_commands', []):
-                block = PluginBlock('command')
-                block.block_data['command'] = cmd
-                short = cmd[:20] + '...' if len(cmd) > 20 else cmd
-                block.set_display_text(f"⚙️ {short}")
-                self.canvas.add_block(block)
-
-            # Load post_install as driver blocks (or other types)
-            for step in manifest.get('post_install', []):
-                if step.get('type') == 'driver':
-                    block = PluginBlock('driver')
-                    block.block_data['file'] = step.get('file', '')
-                    block.block_data['optional'] = step.get('optional', True)
-                    self.canvas.add_block(block)
-
-            # Update preview
-            self._update_preview()
-
-            QMessageBox.information(
-                self, "✅ Plugin Imported!",
-                f"Loaded: {manifest.get('name', 'Unknown')}\n\n"
-                f"You can now edit and re-export this plugin."
-            )
-
-        def _clear_all(self):
-            self.canvas.clear_blocks()
-            for field in self.meta_fields.values():
-                field.clear()
-            self.desc_field.clear()
-            self.plugin_metadata = {
-                'id': '', 'name': '', 'version': '1.0', 'description': '',
-                'author': '', 'icon': '🔌', 'license_type': 'free'
-            }
-            self.properties_panel.show_block_properties(None)
-            self._update_preview()
-
-        def _show_code_preview(self):
-            """Show the code preview mode."""
-            try:
-                self._update_preview()
-                self.mode_stack.setCurrentIndex(1)
-                self.mode_toggle.setText("Switch to Visual Mode")
-                self.mode_label.setText("Code Mode")
-            except Exception as e:
-                logger.error(f"Error showing code preview: {e}")
-                import traceback
-                traceback.print_exc()
-                QMessageBox.warning(self, "Preview Error", f"Could not generate preview:\n{str(e)}")
-
-        def _export_plugin(self):
-            """Export the plugin to a folder."""
-            import shutil
-
-            plugin_id = self.plugin_metadata.get('id', '').strip()
-            if not plugin_id:
-                QMessageBox.warning(self, "Missing ID", "Please enter a Plugin ID before exporting.")
-                return
-
-            # Sanitize plugin ID
-            plugin_id = ''.join(c if c.isalnum() or c == '_' else '_' for c in plugin_id.lower())
-
-            plugins_dir = os.path.join(get_app_dir(), 'plugins')
-            os.makedirs(plugins_dir, exist_ok=True)
-
-            plugin_dir = os.path.join(plugins_dir, plugin_id)
-
-            if os.path.exists(plugin_dir):
-                reply = QMessageBox.question(
-                    self, "Overwrite?",
-                    f"Plugin '{plugin_id}' already exists. Overwrite?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-
-            os.makedirs(plugin_dir, exist_ok=True)
-
-            # Generate manifest
-            manifest = self._generate_manifest()
-            manifest['id'] = plugin_id
-
-            # Copy local binary files if any
-            local_files = manifest.pop('_local_files', [])
-            for file_info in local_files:
-                src = file_info['source']
-                target = file_info['target']
-                if os.path.exists(src):
-                    dest_path = os.path.join(plugin_dir, target)
-                    os.makedirs(os.path.dirname(dest_path) if os.path.dirname(dest_path) else plugin_dir, exist_ok=True)
-                    try:
-                        shutil.copy2(src, dest_path)
-                    except Exception as e:
-                        logger.warning(f"Failed to copy local file {src}: {e}")
-
-            # Copy custom driver files if any
-            custom_drivers = manifest.pop('_custom_drivers', [])
-            drivers_dir = os.path.join(get_app_dir(), 'drivers')
-            for driver_info in custom_drivers:
-                src = driver_info['source']
-                filename = driver_info['filename']
-                if os.path.exists(src):
-                    dest_path = os.path.join(drivers_dir, filename)
-                    try:
-                        shutil.copy2(src, dest_path)
-                    except Exception as e:
-                        logger.warning(f"Failed to copy driver {src}: {e}")
-
-            # Write manifest.json (clean, without internal fields)
-            with open(os.path.join(plugin_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
-                json.dump(manifest, f, indent=2)
-
-            # Write plugin.py
-            with open(os.path.join(plugin_dir, 'plugin.py'), 'w', encoding='utf-8') as f:
-                f.write(self._generate_plugin_code())
-
-            # Count what was exported
-            file_count = 2  # manifest.json + plugin.py
-            file_count += len(local_files)
-            file_count += len(custom_drivers)
-
-            QMessageBox.information(
-                self, "🎉 Plugin Exported!",
-                f"Your plugin has been exported to:\n\nplugins/{plugin_id}/\n\n"
-                f"📁 {file_count} files created\n\n"
-                f"Refresh the plugins list to see it!"
-            )
+            layout.addWidget(fallback)
 
     # =========================================================================
     # PLUGINS MANAGEMENT TAB
