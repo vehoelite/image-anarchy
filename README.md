@@ -6,7 +6,7 @@
 /_/  |_/_/ /_/\__,_/_/   \___/  \___//_/  |_/_/ /_/\__,_/\__, /\__,_/\__, /   
                                                         /____/      /____/    
 ```
-
+<h2>Announcement: XDA for tyrants not for phones. A bunch of n00bs are at xdaforums.com (AVOID AT ALL COSTS!)</h2>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Image Anarchy Logo" width="150">
 </p>
@@ -820,6 +820,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
 
