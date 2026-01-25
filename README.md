@@ -22,6 +22,7 @@
 
 <h1 align="center">Ⓐ Image Anarchy Ⓐ</h1>
 <h3 align="center">Android Image Swiss Army Knife</h3>
+<h3 align="center"><a href="https://imageanarchy.com" border=0>https://imageanarchy.com</a></h3>
 
 <p align="center">
   <i>Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.</i>
@@ -48,6 +49,9 @@ Create plugins without writing code! Drag-and-drop interface for building custom
 </p>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm3.png?raw=true" alt="Visual Plugin Maker - Properties" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpmv2.png?raw=true" alt="Visual Plugin Maker V2 - More Advanced" width="700">
 </p>
 
 ### 🧪 Plugin Playground (NEW!)
@@ -814,5 +818,6 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
