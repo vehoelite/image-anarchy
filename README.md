@@ -12,8 +12,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.1-red" alt="Version">
-  <img src="https://img.shields.io/badge/HOT-Update-orange" alt="HOT">
+  <img src="https://img.shields.io/badge/Version-2.5-red" alt="Version">
+  <img src="https://img.shields.io/badge/MAJOR-Release-orange" alt="MAJOR">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
@@ -29,7 +29,67 @@
 
 ---
 
-## 🔥 What's New in v2.1 - HOT UPDATE
+## 🔥 What's New in v2.5 - MAJOR RELEASE
+
+### 🎨 Visual Plugin Maker (NEW!)
+Create plugins without writing code! Drag-and-drop interface for building custom plugins:
+- **📦 Block Palette** - Drag building blocks for dependencies, tools, and UI elements
+- **🎯 Tool Detection** - Automatically scans for available tools and capabilities
+- **🔧 5 Block Categories** - Dependencies, Built-in Tools, External Tools, Plugin Tools, UI Elements
+- **🔌 30+ Blocks** - From pip packages to ADB commands, EROFS extraction to MTK flashing
+- **💾 Export** - Generate manifest.json and plugin.py from your visual design
+- **🔒 Smart Availability** - Blocks show locked status if required tools aren't installed
+
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm1.png?raw=true" alt="Visual Plugin Maker - Block Palette" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm2.png?raw=true" alt="Visual Plugin Maker - Canvas" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm3.png?raw=true" alt="Visual Plugin Maker - Properties" width="700">
+</p>
+
+### 🧪 Plugin Playground (NEW!)
+Test and validate your plugins in a dedicated sandbox environment:
+- **🔄 Hot Reload** - Automatically reload plugin when files change
+- **✅ 11-Point Validation** - Comprehensive checklist ensures plugin quality
+- **🖼️ Live Preview** - See your plugin widget rendered in real-time
+- **🐛 Console Output** - View logs, errors, and debug messages
+- **📦 Dependency Check** - Verify all requirements are available
+
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm4.png?raw=true" alt="Plugin Playground - Validation" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm5.png?raw=true" alt="Plugin Playground - Preview" width="700">
+</p>
+
+### 🔄 Auto-Update System (NEW!)
+Never miss an update with automatic version checking:
+- **🔔 Background Check** - Silently checks for updates on startup
+- **📊 Update Dialog** - Shows changelog and download size
+- **⬇️ One-Click Download** - Download updates directly in the app
+- **📋 Progress Tracking** - See download progress in real-time
+- **🔄 Easy Install** - Replaces exe automatically on Windows
+
+### 📱 OPPO/OnePlus/Realme Firmware Decryption
+- **OFP Decryption** - Decrypt OPPO/Realme .ofp firmware files
+- **Auto-Detect Chipset** - Automatically detects Qualcomm vs MediaTek firmware
+- **OPS Support** - Decrypt OnePlus .ops firmware packages
+- **ZIP Password Cracking** - Extract password-protected OPPO/Realme ZIPs
+- **Multiple Key Tables** - Supports wide range of firmware versions (V1.4.17 to V2.0.3+)
+- Based on [bkerler's oppo_decrypt](https://github.com/bkerler/oppo_decrypt)
+
+### 🌞 Allwinner Firmware Support
+- **Unpack LiveSuit/PhoenixSuit** - Extract Allwinner .img firmware
+- **Repack Firmware** - Create new Allwinner firmware images
+- **Chipset Support** - SC8600/9800, A10-A80, A133, H2/H3/H5/H6/H313/H616/H618
+
+### 🪨 Rockchip Firmware Support
+- **Unpack RKFW/RKAF** - Extract Rockchip update.img firmware
+- **Repack Firmware** - Create new Rockchip firmware images
+- **Chipset Support** - RK28xx through RK35xx series
 
 ### 🗂️ EROFS Support (Android 13+)
 - **Full EROFS Extraction** - Extract files from Enhanced Read-Only File System images
@@ -162,6 +222,12 @@ Complete Android Debug Bridge management with 7 specialized tabs:
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/shell.png?raw=true" alt="ADB Shell" width="700">
 </p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/makedir.png?raw=true" alt="ADB File Browser" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/oem.png?raw=true" alt="ADB OEM Commands" width="700">
+</p>
 
 ### Fastboot Toolkit  
 Complete bootloader operations with 8 specialized tabs:
@@ -218,6 +284,9 @@ MediaTek device support with advanced operations:
 </p>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk5.png?raw=true" alt="MTK Tools" width="700">
+</p>
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/mtkclient.png?raw=true" alt="MTK Client Console" width="700">
 </p>
 
 ### Scrcpy Toolkit
@@ -311,13 +380,16 @@ lz4>=4.0.0            # Optional: for LZ4 ramdisk compression
 python image_anarchy.py
 ```
 
-The GUI provides 6 tabs:
+The GUI provides 8+ tabs:
 1. **📦 Extract** - Extract partitions from payload.bin
 2. **🔧 Repack** - Create new payload.bin from images
 3. **🔍 Image Extract** - Analyze and extract Android images
 4. **🔨 Image Repack** - Create boot, sparse, vbmeta images
 5. **🔄 Recovery Porter** - Port/modify custom recoveries
 6. **🔌 Plugins** - ADB Toolkit, Fastboot Toolkit, and more
+7. **🌞 Allwinner** - Allwinner firmware unpack/repack
+8. **🪨 Rockchip** - Rockchip firmware unpack/repack
+9. **📱 OPPO/OnePlus** - OPPO/Realme/OnePlus firmware decryption
 
 ### CLI Mode
 
@@ -605,6 +677,10 @@ image-anarchy/
 │   ├── adb.exe
 │   ├── fastboot.exe
 │   └── ...
+├── tools/                 # CLI tools
+│   ├── *.erofs.exe        # EROFS utilities
+│   ├── Allwinner/         # imgRePacker for Allwinner
+│   └── Rockchip/          # imgRePackerRK for Rockchip
 └── plugins/               # Plugin directory
     ├── adb_toolkit/       # ADB Toolkit plugin
     ├── fastboot_toolkit/  # Fastboot Toolkit plugin
@@ -617,7 +693,11 @@ The entire application is contained in a single Python file with embedded protob
 
 ## 📜 Changelog
 
-### v2.1 - HOT UPDATE: EROFS & Scrcpy
+### v2.1 - HOT UPDATE: Multi-Platform Firmware Support
+- 🔥 **New:** OPPO/Realme .ofp firmware decryption (Qualcomm & MediaTek)
+- 🔥 **New:** OnePlus .ops firmware decryption
+- 🔥 **New:** Allwinner firmware unpack/repack (LiveSuit, PhoenixSuit)
+- 🔥 **New:** Rockchip firmware unpack/repack (RKFW, RKAF)
 - 🔥 **New:** Full EROFS filesystem extraction (Android 13+ system/vendor/product images)
 - 🔥 **New:** EROFS image creation from directories with LZ4/LZ4HC/LZMA compression
 - 🔥 **New:** EROFS superblock analysis (UUID, block size, features, compression)
@@ -626,9 +706,11 @@ The entire application is contained in a single Python file with embedded protob
 - ✨ **New:** Screen recording with audio support
 - ✨ **New:** WiFi mirroring mode for wireless connection
 - ✨ **New:** "Run as Root" checkbox in ADB Shell tab
+- ✨ **New:** Password-protected OPPO/Realme ZIP extraction
 - 🔧 **Improved:** Shell prompt shows # for root mode, $ for normal
 - 🔧 **Improved:** Scrcpy defaults to always-on-top and half-size window
 - 🔧 **Improved:** Better error handling for EROFS compressed blocks
+- 🔧 **Improved:** Auto-detect QC vs MTK firmware variants
 
 ### v2.0 - Plugin Store & Advanced Dependencies
 - ✨ **New:** Online Plugin Store with browse, install, ratings & reviews
@@ -732,4 +814,5 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
