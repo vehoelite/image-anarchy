@@ -50,6 +50,7 @@ Create plugins without writing code! Drag-and-drop interface for building custom
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm3.png?raw=true" alt="Visual Plugin Maker - Properties" width="700">
 </p>
+### 🎨 Visual Plugin Maker V2
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpmv2.png?raw=true" alt="Visual Plugin Maker V2 - More Advanced" width="700">
 </p>
@@ -818,6 +819,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
 
