@@ -380,9 +380,35 @@ lz4>=4.0.0            # Optional: for LZ4 ramdisk compression
 
 ## 🚀 Usage
 
-### GUI Mode (Default)
+### GUI Mode (Default) (Build from Windows)
+You need Microsoft Visual C++ Redis pack
+https://imageanarchy.com/VC_redist.x64.exe
+
+You need the Microsoft C++ Build Tools. (or bsdiff4 will fail during pip install)
+https://imageanarchy.com/vs_BuildTools.exe
+
+Select Desktop development with C++ --> Goto Individual components Tab and select -->
+MSVC Build Tools for x64/x86 (Latest)
+
+Windows 11 SDK (10.0.26100.7175)
+
+C++ CMake tools for Windows
+
+MTesting tools core features - Build Tools
+
+MSVC AddressSanitizer
+
+vcpkg package manager
+
+Confirm version here*
+Windows 11 SDK (10.0.22621.0) 
+
+Then select Install
 
 ```bash
+python -m venv venv
+venv/Scripts/activate.ps1
+pip install -r requirements.txt
 python image_anarchy.py
 ```
 
@@ -820,6 +846,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
 
