@@ -401,6 +401,7 @@ MSVC AddressSanitizer
 vcpkg package manager
 
 Confirm version here*
+
 Windows 11 SDK (10.0.22621.0) 
 
 Then select Install
@@ -846,6 +847,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
 
