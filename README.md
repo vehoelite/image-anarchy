@@ -6,7 +6,9 @@
 /_/  |_/_/ /_/\__,_/_/   \___/  \___//_/  |_/_/ /_/\__,_/\__, /\__,_/\__, /   
                                                         /____/      /____/    
 ```
-<h2>Announcement: XDA for tyrants not for phones. A bunch of n00bs are at xdaforums.com (AVOID AT ALL COSTS!)</h2>
+<h2>Announcement: Performing heavy work on releasing v3.0 and until it's released you may notice heavy plugin store down time,
+functions not working as it should and possible sneak peaks if you are in a place were testing features. Stay tuned, the v3.0 is the start of
+something truly amazing. </h2>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Image Anarchy Logo" width="150">
 </p>
@@ -847,6 +849,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
 
