@@ -6,16 +6,14 @@
 /_/  |_/_/ /_/\__,_/_/   \___/  \___//_/  |_/_/ /_/\__,_/\__, /\__,_/\__, /   
                                                         /____/      /____/    
 ```
-<h2>Announcement: Performing heavy work on releasing v3.0 and until it's released you may notice heavy plugin store down time,
-functions not working as it should and possible sneak peaks if you are in a place were testing features. Stay tuned, the v3.0 is the start of
-something truly amazing. </h2>
+<h2>Announcement: XDA for tyrants not for phones. A bunch of n00bs are at xdaforums.com (AVOID AT ALL COSTS!)</h2>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Image Anarchy Logo" width="150">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.5-red" alt="Version">
-  <img src="https://img.shields.io/badge/MAJOR-Release-orange" alt="MAJOR">
+  <img src="https://img.shields.io/badge/Version-3.0-red" alt="Version">
+  <img src="https://img.shields.io/badge/REVOLUTIONARY-Release-orange" alt="REVOLUTIONARY">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
@@ -32,9 +30,119 @@ something truly amazing. </h2>
 
 ---
 
-## 🔥 What's New in v2.5 - MAJOR RELEASE
+## 🔥 What's New in v3.0 - REVOLUTIONARY RELEASE
 
-### 🎨 Visual Plugin Maker (NEW!)
+### 📋 Community Forum (NOW LIVE!)
+A full phpBB forum integrated directly into Image Anarchy!
+
+- **📋 Dedicated Forum Tab** - Browse and post without leaving the app
+- **🔗 Unified Login** - Same account for app, chat, and forum
+- **💬 Device Support** - Get help with your specific device
+- **📖 Guides & Tutorials** - Community-created content
+- **🌐 Web Access** - Also available at [forum.imageanarchy.com](https://forum.imageanarchy.com)
+
+### 🗄️ Backend Overhaul (NOW LIVE!)
+Major infrastructure upgrades powering v3.0:
+
+- **🐬 MySQL Database** - Upgraded from SQLite3 to MySQL for scalability
+- **⚡ Redis Integration** - Lightning-fast caching and session management
+- **🔗 Unified Auth System** - Single sign-on across app, chatrooms, and forum
+- **📧 Email Integration** - Account invites, notifications, password recovery
+
+### 💾 IAABS - Image Anarchy Android Backup Solution (WORLD FIRST!)
+The first-ever live root filesystem backup tool for Android via ADB. **No recovery mode needed** - backup your entire device while it's running!
+
+- **🔓 Live Root Backup** - Backup system partitions while your phone is ON and running
+- **📱 Multiple Backup Profiles** - Full Device, Apps & Data, User Data Only, System Only, Custom
+- **📦 Tar-Based Extraction** - Blazing fast 3-phase backup (create → pull → compress)
+- **🔒 SELinux Context Preservation** - Captures and restores security contexts for proper functionality
+- **♻️ Full Restore Capability** - Restore backups with paths, symlinks, permissions, ownership intact
+- **📊 Progress Tracking** - Real-time percentage indicators throughout all phases
+- **🗂️ Backup History** - Manage and browse previous backups with one-click restore
+
+<p align="center">
+  <img src="https://imageanarchy.com/screenshots/iaabs1.png" alt="IAABS - Backup Profiles" width="700">
+</p>
+<p align="center">
+  <img src="https://imageanarchy.com/screenshots/iaabs2.png" alt="IAABS - Restore" width="700">
+</p>
+
+**Why IAABS is Revolutionary:**
+| Traditional Methods | IAABS |
+|---------------------|-------|
+| Requires recovery mode (TWRP) | Works while phone is running |
+| Device must be offline | Phone stays connected and usable |
+| Complex multi-step process | One-click backup with profiles |
+| Loses SELinux contexts | Preserves and restores security contexts |
+| Manual partition selection | Intelligent preset profiles |
+
+### 🔓 Root Patcher Plugin (NEW!)
+Fully automated boot.img patching - no manual interaction required!
+
+- **🪄 Magisk Auto-Patch** - Extracts magiskboot from APK and patches on device automatically
+- **🔧 KernelSU Support** - Semi-automated patching for GKI kernels
+- **⚡ APatch Support** - Semi-automated patching with KernelPatch
+- **📥 Extract Boot from Device** - Pull boot.img directly from connected device
+- **🔙 Patch & Flash Back** - Complete round-trip patching workflow
+- **📱 Bundled APKs** - Includes latest Magisk, KernelSU, and APatch APKs
+- **✅ Compatibility Checks** - Warns before bricking with incompatible methods
+
+<p align="center">
+  <img src="https://imageanarchy.com/screenshots/rootpatcher1.png" alt="Root Patcher - Main" width="700">
+</p>
+<p align="center">
+  <img src="https://imageanarchy.com/screenshots/rootpatcher2.png" alt="Root Patcher - Patching" width="700">
+</p>
+
+| Root Method | Automation Level | Requirements |
+|-------------|------------------|--------------|
+| Magisk | 🟢 Fully Automated | Any Android device |
+| KernelSU | 🟡 Semi-Automated | GKI kernel (Android 12+) |
+| APatch | 🟡 Semi-Automated | Android 11+ |
+
+### 🛡️ Enhanced Plugin Security
+- **🔍 VirusTotal Integration** - All plugin uploads scanned with 70+ AV engines
+- **🦠 ClamAV Support** - Optional local scanning for instant threat detection
+- **📦 Dependency Scanning** - External binaries scanned before packaging
+- **🚨 Automatic Quarantine** - Detected threats isolated automatically
+- **📧 Admin Alerts** - Email notifications on threat detection
+- **📋 Full Audit Logging** - Complete security event history
+
+### 🎯 Plugin Store Improvements
+- **📊 Better Statistics** - Enhanced plugin analytics and download tracking
+- **🔄 Improved Updates** - More reliable plugin update notifications
+- **🔐 Stricter Validation** - 20-point validation for all plugin submissions
+- **⚡ Redis Caching** - Faster plugin listings and searches
+
+### 💬 Integrated Chatrooms & Community (🔜 COMING SOON)
+Connect with the anarchy community directly from the app!
+
+- **💬 Dedicated Chatroom Tab** - Real-time chat built into Image Anarchy
+- **🏠 Create Your Own Rooms** - Make public or private chatrooms
+- **🔒 Private Rooms** - Invite-only rooms for your crew
+- **📧 Invite System** - Invite anyone via email with automatic account creation
+- **🚀 Auto-Join on Register** - New users automatically join chatrooms from invites
+- **🔗 Unified Accounts** - One login for app, chatrooms, and forum
+
+### 🛠️ Professional Remote Support (🔜 COMING SOON)
+Get help from experts without leaving your chair!
+
+- **🖥️ Remote Desktop** - Allow professionals to see and control your screen
+- **📱 Remote ADB/Fastboot** - Experts can run commands on your connected device
+- **🔐 Secure Connections** - End-to-end encrypted remote sessions
+- **👨‍🔧 Verified Professionals** - Connect with trusted community helpers
+
+### 🔧 Quality of Life Improvements
+- **📜 Scrollable Plugin UIs** - All plugins now have proper scroll areas
+- **🎨 Improved Layouts** - Better spacing and responsive design
+- **🔗 Better ADB Detection** - Plugins share ADB from ADB Toolkit automatically
+- **📝 Enhanced Logging** - More detailed progress and error messages
+
+---
+
+## 🔥 Previous Release Highlights (v2.5)
+
+### 🎨 Visual Plugin Maker
 Create plugins without writing code! Drag-and-drop interface for building custom plugins:
 - **📦 Block Palette** - Drag building blocks for dependencies, tools, and UI elements
 - **🎯 Tool Detection** - Automatically scans for available tools and capabilities
@@ -52,16 +160,17 @@ Create plugins without writing code! Drag-and-drop interface for building custom
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm3.png?raw=true" alt="Visual Plugin Maker - Properties" width="700">
 </p>
-<h1> 🎨 Visual Plugin Maker V2</h1>
+
+<h3>🎨 Visual Plugin Maker V2</h3>
 
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpmv2.png?raw=true" alt="Visual Plugin Maker V2 - More Advanced" width="700">
 </p>
 
-### 🧪 Plugin Playground (NEW!)
+### 🧪 Plugin Playground
 Test and validate your plugins in a dedicated sandbox environment:
 - **🔄 Hot Reload** - Automatically reload plugin when files change
-- **✅ 11-Point Validation** - Comprehensive checklist ensures plugin quality
+- **✅ 20-Point Validation** - Validates ALL 15 manifest fields plus plugin files
 - **🖼️ Live Preview** - See your plugin widget rendered in real-time
 - **🐛 Console Output** - View logs, errors, and debug messages
 - **📦 Dependency Check** - Verify all requirements are available
@@ -73,7 +182,7 @@ Test and validate your plugins in a dedicated sandbox environment:
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/vpm5.png?raw=true" alt="Plugin Playground - Preview" width="700">
 </p>
 
-### 🔄 Auto-Update System (NEW!)
+### 🔄 Auto-Update System
 Never miss an update with automatic version checking:
 - **🔔 Background Check** - Silently checks for updates on startup
 - **📊 Update Dialog** - Shows changelog and download size
@@ -106,42 +215,12 @@ Never miss an update with automatic version checking:
 - **Modern Android Support** - Works with system/vendor/product partitions from Android 13+
 - **Compression Options** - LZ4 (fast), LZ4HC (balanced), LZMA (best compression)
 
-### 📺 NEW: Scrcpy Toolkit Plugin
-- **Live Screen Mirroring** - Mirror your Android screen in real-time
-- **Screenshot Capture** - Take high-quality screenshots with one click
-- **Screen Recording** - Record device screen with audio support
-- **WiFi Mirroring** - Connect wirelessly after initial USB setup
-- **Multiple Quality Options** - Adjust bitrate, resolution, and framerate
-- **Always-On-Top Window** - Keep mirror visible while working
-- **Zero Dependencies** - Uses bundled scrcpy executable
-
-<p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy1.png?raw=true" alt="Scrcpy Mirror" width="700">
-</p>
-<p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy2.png?raw=true" alt="Scrcpy Screenshot" width="700">
-</p>
-<p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy3.png?raw=true" alt="Scrcpy Recording" width="700">
-</p>
-
 ### 🛒 Online Plugin Store
 - **Browse & Download** - Discover plugins directly from the app
 - **One-Click Install** - Download, extract, and activate plugins instantly
 - **Plugin Ratings & Reviews** - See what the community thinks
 - **Version Management** - Check for updates to installed plugins
 - **Featured Plugins** - Curated selection of the best tools
-
-### 🔌 Premium Plugins Available
-- **ADB Toolkit** - Complete Android Debug Bridge management (7 tools + Run as Root)
-- **Fastboot Toolkit** - Comprehensive bootloader operations (8 tools + vbmeta patching)
-- **MTK Toolkit** - MediaTek device support with BROM exploit
-- **Scrcpy Toolkit** - Screen mirroring, screenshots, and recording
-
-### 📦 Bundled Platform Tools
-- **ADB & Fastboot Included** - No need to install Android SDK separately
-- **Zero Configuration** - Works out of the box
-- **Driver Pack** - Common USB drivers bundled for Windows
 
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/plugin_store.png?raw=true" alt="Plugin Store" width="700">
@@ -208,7 +287,30 @@ Never miss an update with automatic version checking:
 
 ## 🔌 Available Plugins (from Store)
 
-### ADB Toolkit
+### 💾 IAABS - Android Backup Solution (NEW in v3.0!)
+Revolutionary live root filesystem backup - the first of its kind:
+
+| Feature | Description |
+|---------|-------------|
+| **🔓 Live Backup** | Backup while device is running - no recovery needed |
+| **📱 Smart Profiles** | Full, Apps & Data, User Data, System Only, Custom |
+| **🔒 SELinux Contexts** | Preserves and restores security labels |
+| **📊 3-Phase Process** | Create tars → Pull to PC → Compress & verify |
+| **♻️ Full Restore** | Restore with all metadata intact |
+| **📋 History** | Browse and manage all previous backups |
+
+### 🔓 Root Patcher (NEW in v3.0!)
+One-click root patching with Magisk, KernelSU, and APatch:
+
+| Feature | Description |
+|---------|-------------|
+| **🪄 Auto-Patch** | Fully automated Magisk patching on device |
+| **📥 Extract Boot** | Pull boot.img directly from device |
+| **🔧 Multi-Method** | Magisk, KernelSU, APatch support |
+| **✅ Safety Checks** | Compatibility verification before patching |
+| **📱 Bundled APKs** | Latest rooting tools included |
+
+### 📱 ADB Toolkit
 Complete Android Debug Bridge management with 7 specialized tabs:
 
 | Tab | Features |
@@ -237,7 +339,7 @@ Complete Android Debug Bridge management with 7 specialized tabs:
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/oem.png?raw=true" alt="ADB OEM Commands" width="700">
 </p>
 
-### Fastboot Toolkit  
+### ⚡ Fastboot Toolkit  
 Complete bootloader operations with 8 specialized tabs:
 
 | Tab | Features |
@@ -267,7 +369,7 @@ Complete bootloader operations with 8 specialized tabs:
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/fastboot5.png?raw=true" alt="Fastboot Slot" width="700">
 </p>
 
-### MTK Toolkit
+### 🔥 MTK Toolkit
 MediaTek device support with advanced operations:
 
 | Feature | Description |
@@ -297,7 +399,7 @@ MediaTek device support with advanced operations:
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/mtkclient.png?raw=true" alt="MTK Client Console" width="700">
 </p>
 
-### Scrcpy Toolkit
+### 📺 Scrcpy Toolkit
 Real-time screen mirroring and capture for Android devices:
 
 | Feature | Description |
@@ -319,7 +421,7 @@ Real-time screen mirroring and capture for Android devices:
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/scrcpy3.png?raw=true" alt="Scrcpy Recording Tab" width="700">
 </p>
 
-### Plugin Developer Guide
+### 📖 Plugin Developer Guide
 Interactive tutorial showing how to create your own plugins with:
 - Plugin structure and manifest format
 - Monetization options (free, paid, donation)
@@ -383,7 +485,7 @@ lz4>=4.0.0            # Optional: for LZ4 ramdisk compression
 ## 🚀 Usage
 
 ### GUI Mode (Default) (Build from Windows)
-You need Microsoft Visual C++ Redis pack
+You need Microsoft Visual C++ Redist pack
 https://imageanarchy.com/VC_redist.x64.exe
 
 You need the Microsoft C++ Build Tools. (or bsdiff4 will fail during pip install)
@@ -396,7 +498,7 @@ Windows 11 SDK (10.0.26100.7175)
 
 C++ CMake tools for Windows
 
-MTesting tools core features - Build Tools
+Testing tools core features - Build Tools
 
 MSVC AddressSanitizer
 
@@ -415,13 +517,13 @@ pip install -r requirements.txt
 python image_anarchy.py
 ```
 
-The GUI provides 8+ tabs:
+The GUI provides 9+ tabs:
 1. **📦 Extract** - Extract partitions from payload.bin
 2. **🔧 Repack** - Create new payload.bin from images
 3. **🔍 Image Extract** - Analyze and extract Android images
 4. **🔨 Image Repack** - Create boot, sparse, vbmeta images
 5. **🔄 Recovery Porter** - Port/modify custom recoveries
-6. **🔌 Plugins** - ADB Toolkit, Fastboot Toolkit, and more
+6. **🔌 Plugins** - IAABS, Root Patcher, ADB, Fastboot, MTK, Scrcpy
 7. **🌞 Allwinner** - Allwinner firmware unpack/repack
 8. **🪨 Rockchip** - Rockchip firmware unpack/repack
 9. **📱 OPPO/OnePlus** - OPPO/Realme/OnePlus firmware decryption
@@ -526,75 +628,53 @@ python image_anarchy.py --extract payload.bin -i boot
 ```
 plugins/
 └── my_plugin/
-    ├── manifest.json    # Plugin metadata
+    ├── manifest.json    # Plugin metadata (ALL 15 fields required!)
     └── plugin.py        # Plugin code
 ```
 
-### manifest.json - Complete Reference
+### ⚠️ STRICT manifest.json Format
+
+**All 15 fields are REQUIRED in the exact order shown below. Missing fields will cause your plugin to be rejected.**
+
 ```json
 {
-    "id": "my-plugin",
+    "id": "my_plugin",
     "name": "My Awesome Plugin",
     "version": "1.0.0",
     "description": "What my plugin does",
     "author": "Your Name",
     "icon": "🔧",
-    "min_app_version": "2.0",
     "license_type": "free",
     "website": "https://example.com",
-    "support_url": "https://example.com/support",
-    "enabled": true,
-    
-    "requirements": [
-        "requests",
-        "pillow"
-    ],
-    
-    "git_clone": {
-        "repo": "https://github.com/user/repo.git",
-        "target": "repo_folder_name"
-    },
-    
-    "setup_commands": [
-        "pip install ."
-    ],
-    
-    "bundled_binaries": [
-        "https://example.com/tool.exe",
-        {
-            "url": "https://example.com/file.zip",
-            "target_path": "tools/file.zip",
-            "sha256": "abc123..."
-        }
-    ],
-    
-    "post_install": [
-        {"type": "driver", "file": "driver.msi"},
-        {"type": "command", "cmd": ["setup.exe", "/silent"]}
-    ]
+    "support_url": "https://example.com/issues",
+    "min_version": "2.0",
+    "git_clone": null,
+    "requirements": [],
+    "bundled_binaries": [],
+    "setup_commands": [],
+    "enabled": true
 }
 ```
 
-### Manifest Fields Reference
+### Manifest Fields Reference (All 15 Required)
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | string | Unique plugin identifier (folder name) |
-| `name` | string | Display name shown in UI |
-| `version` | string | Plugin version (semver recommended) |
-| `description` | string | Short description |
-| `author` | string | Developer name |
-| `icon` | string | Emoji icon for UI |
-| `license_type` | string | `free`, `donation`, or `paid` |
-| `min_app_version` | string | Minimum Image Anarchy version required |
-| `enabled` | bool | Whether plugin is active |
-| `website` | string | Plugin homepage URL |
-| `support_url` | string | Support/docs URL |
-| `requirements` | array | Pip packages to install |
-| `git_clone` | object | Repository to clone (see below) |
-| `setup_commands` | array | Commands to run after clone |
-| `bundled_binaries` | array | Files/URLs to download |
-| `post_install` | array | Final setup steps (drivers, etc.) |
+| `id` | string | **MUST match folder name.** Lowercase letters, numbers, underscores only. Start with letter. |
+| `name` | string | Human-readable display name |
+| `version` | string | Format: `X.Y` or `X.Y.Z` (e.g., "1.0" or "1.0.0") |
+| `description` | string | Brief description shown in plugin list |
+| `author` | string | Developer or team name |
+| `icon` | string | Single emoji (🔧, ⚡, 📱, etc.) |
+| `license_type` | string | Must be: `"free"`, `"paid"`, or `"donation"` |
+| `website` | string | Project homepage URL (can be empty `""`) |
+| `support_url` | string | Issues/support URL (can be empty `""`) |
+| `min_version` | string | Minimum Image Anarchy version required |
+| `git_clone` | object/null | Repository to clone, or `null` if not needed |
+| `requirements` | array | Pip packages to install (can be empty `[]`) |
+| `bundled_binaries` | array | Binary URLs to download (can be empty `[]`) |
+| `setup_commands` | array | Shell commands to run (can be empty `[]`) |
+| `enabled` | boolean | `true` or `false` |
 
 ### Dependency Installation Flow
 
@@ -604,17 +684,18 @@ When a plugin is installed, dependencies are set up in this order:
 2. **Download Binaries** (`bundled_binaries`) - Download any required files
 3. **Pip Packages** (`requirements`) - Install Python dependencies
 4. **Setup Commands** (`setup_commands`) - Run in cloned repo directory
-5. **Post Install** (`post_install`) - Final steps like driver installation
 
 ### git_clone Object
 ```json
-{
+"git_clone": {
     "repo": "https://github.com/user/repo.git",
     "target": "local_folder_name"
 }
 ```
-- `repo`: Git repository URL
-- `target`: Folder name within plugin directory to clone into
+When not using git_clone, set to `null`:
+```json
+"git_clone": null
+```
 
 ### setup_commands Array
 ```json
@@ -630,7 +711,7 @@ When a plugin is installed, dependencies are set up in this order:
     "https://example.com/simple.exe",
     {
         "url": "https://example.com/tool.zip",
-        "target_path": "tools/tool.zip",
+        "path": "tools/tool.zip",
         "sha256": "checksum_for_verification"
     }
 ]
@@ -661,32 +742,30 @@ class Plugin(QWidget):
         layout.addWidget(QLabel("Hello from my plugin!"))
 ```
 
-### Example: Plugin with Git Clone
+### Example: Plugin with Git Clone (Complete Manifest)
 
-For plugins that wrap existing Python libraries:
+For plugins that wrap existing Python libraries, here's a **complete** manifest with all 15 required fields:
 
 ```json
 {
     "id": "mtk_toolkit",
     "name": "MTK Toolkit",
-    "version": "1.0",
-    "description": "MediaTek device toolkit",
-    "author": "Image Anarchy",
-    "icon": "📱",
+    "version": "1.2",
+    "description": "Advanced MediaTek device toolkit - BROM exploit, flash read/write, unlock bootloader",
+    "author": "Image Anarchy Team",
+    "icon": "⚡",
     "license_type": "free",
-    
-    "requirements": [
-        "pyusb", "pycryptodome", "colorama", "pyserial"
-    ],
-    
+    "website": "https://imageanarchy.com",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "2.0",
     "git_clone": {
         "repo": "https://github.com/bkerler/mtkclient.git",
         "target": "mtkclient"
     },
-    
-    "setup_commands": [
-        "pip install ."
-    ]
+    "requirements": ["pyusb", "pyserial"],
+    "bundled_binaries": [],
+    "setup_commands": ["pip install ."],
+    "enabled": true
 }
 ```
 
@@ -717,8 +796,12 @@ image-anarchy/
 │   ├── Allwinner/         # imgRePacker for Allwinner
 │   └── Rockchip/          # imgRePackerRK for Rockchip
 └── plugins/               # Plugin directory
+    ├── iaabs/             # IAABS backup plugin (NEW!)
+    ├── root_patcher/      # Root Patcher plugin (NEW!)
     ├── adb_toolkit/       # ADB Toolkit plugin
     ├── fastboot_toolkit/  # Fastboot Toolkit plugin
+    ├── mtk_toolkit/       # MTK Toolkit plugin
+    ├── scrcpy_toolkit/    # Scrcpy Toolkit plugin
     └── developer_guide/   # Plugin development tutorial
 ```
 
@@ -728,65 +811,69 @@ The entire application is contained in a single Python file with embedded protob
 
 ## 📜 Changelog
 
-### v2.1 - HOT UPDATE: Multi-Platform Firmware Support
-- 🔥 **New:** OPPO/Realme .ofp firmware decryption (Qualcomm & MediaTek)
-- 🔥 **New:** OnePlus .ops firmware decryption
-- 🔥 **New:** Allwinner firmware unpack/repack (LiveSuit, PhoenixSuit)
-- 🔥 **New:** Rockchip firmware unpack/repack (RKFW, RKAF)
-- 🔥 **New:** Full EROFS filesystem extraction (Android 13+ system/vendor/product images)
-- 🔥 **New:** EROFS image creation from directories with LZ4/LZ4HC/LZMA compression
-- 🔥 **New:** EROFS superblock analysis (UUID, block size, features, compression)
-- ✨ **New:** Scrcpy Toolkit plugin for screen mirroring
-- ✨ **New:** Screenshot capture with one-click save
-- ✨ **New:** Screen recording with audio support
-- ✨ **New:** WiFi mirroring mode for wireless connection
-- ✨ **New:** "Run as Root" checkbox in ADB Shell tab
-- ✨ **New:** Password-protected OPPO/Realme ZIP extraction
-- 🔧 **Improved:** Shell prompt shows # for root mode, $ for normal
-- 🔧 **Improved:** Scrcpy defaults to always-on-top and half-size window
-- 🔧 **Improved:** Better error handling for EROFS compressed blocks
-- 🔧 **Improved:** Auto-detect QC vs MTK firmware variants
+### v3.0 - REVOLUTIONARY RELEASE 🔥
+- 📋 **NOW LIVE:** Community Forum
+  - Dedicated Forum tab with full phpBB integration
+  - Also available at [forum.imageanarchy.com](https://forum.imageanarchy.com)
+  - Unified login system (app + chat + forum)
+  - Device support and community guides
+- 🗄️ **NOW LIVE:** Backend Overhaul
+  - Migrated from SQLite3 to MySQL database
+  - Redis integration for caching and sessions
+  - Unified authentication across all services
+- 🔥 **NEW:** IAABS - Image Anarchy Android Backup Solution (World First!)
+  - Live root filesystem backup via ADB - no recovery mode needed
+  - Multiple backup profiles (Full, Apps, User Data, System, Custom)
+  - 3-phase tar-based backup with progress tracking
+  - SELinux context preservation and restoration
+  - Full restore capability with metadata intact
+  - Backup history and management
+- 🔥 **NEW:** Root Patcher Plugin
+  - Fully automated Magisk patching (no manual steps)
+  - KernelSU support for GKI kernels
+  - APatch support with KernelPatch
+  - Extract boot.img directly from device
+  - Bundled latest APKs (Magisk, APatch, KernelSU)
+- 🛡️ **Enhanced Security:** VirusTotal + ClamAV scanning for plugins
+- 🛡️ **Enhanced Security:** Automatic threat quarantine
+- 🛡️ **Enhanced Security:** Full audit logging
+- 🔧 **Improved:** All plugins now have scrollable UIs
+- 🔧 **Improved:** Better ADB detection across plugins
+- 🔧 **Improved:** Enhanced progress indicators
+- 🔧 **Improved:** Plugin Store performance with Redis caching
+- 🔜 **COMING SOON:** Integrated Chatrooms
+  - Dedicated Chatroom tab in the app
+  - Create public or private rooms
+  - Invite system with email-based account signup
+  - Automatic room join after registration
+- 🔜 **COMING SOON:** Professional Remote Support
+  - Remote Desktop for expert assistance
+  - Remote ADB/Fastboot command execution
+  - Secure end-to-end encrypted sessions
 
-### v2.0 - Plugin Store & Advanced Dependencies
-- ✨ **New:** Online Plugin Store with browse, install, ratings & reviews
-- ✨ **New:** One-click plugin installation with automatic dependency setup
-- ✨ **New:** Git clone support for plugins (`git_clone` manifest field)
-- ✨ **New:** Setup commands for complex installations (`setup_commands` field)
-- ✨ **New:** Bundled binary downloads (`bundled_binaries` field)
-- ✨ **New:** Post-install actions for drivers & commands (`post_install` field)
-- ✨ **New:** MTK Toolkit plugin with BROM exploit support
-- ✨ **New:** System tray with minimize-to-tray functionality
-- ✨ **New:** 4-phase plugin setup progress with clear "Step X/N" display
-- 🔧 **Improved:** Plugin dependencies work in frozen exe (PyInstaller)
-- 🔧 **Improved:** Better plugin manifest validation
-- 🔧 **Improved:** Proper application quit from system tray
+### v2.5 - MAJOR RELEASE
+- 🎨 **New:** Visual Plugin Maker - Create plugins without code
+- 🧪 **New:** Plugin Playground - Test plugins with hot reload
+- 🔄 **New:** Auto-Update System with one-click install
+- 📱 **New:** OPPO/OnePlus/Realme firmware decryption
+- 🌞 **New:** Allwinner firmware support
+- 🪨 **New:** Rockchip firmware support
+- 🗂️ **New:** Full EROFS extraction and repacking
+- 📺 **New:** Scrcpy Toolkit plugin
 
-### v1.1 - Plugin System Release
-- ✨ **New:** Extensible plugin system with folder-based discovery
-- ✨ **New:** Plugin monetization support (free/paid/donation)
-- ✨ **New:** Auto pip requirements installation for plugins
-- ✨ **New:** ADB Toolkit plugin with 7 comprehensive tools
-- ✨ **New:** Fastboot Toolkit plugin with 8 comprehensive tools
-- ✨ **New:** Plugin Developer Guide with complete tutorial
-- ✨ **New:** Bundled platform-tools (ADB & Fastboot) - zero setup needed
-- 🔧 **Improved:** Expanded window size (1200x900 default)
-- 🔧 **Improved:** Better error handling throughout
+### v2.0 - Plugin Store & Dependencies
+- ✨ **New:** Online Plugin Store
+- ✨ **New:** Git clone support for plugins
+- ✨ **New:** Setup commands and bundled binaries
+- ✨ **New:** MTK Toolkit plugin
+- ✨ **New:** System tray support
 
-### v1.0 - Initial Release
-- 📦 Payload extraction from OTA files
-- 📦 Payload repacking with multiple compression formats
-- 🖼️ Sparse/raw image extraction and conversion
-- 🖼️ Boot/recovery image extraction (v0-v4)
-- 🖼️ Super partition extraction
-- 🖼️ vbmeta parsing, patching, and re-signing
-- 🖼️ ABL/bootloader analysis
-- 🔨 Boot/recovery image repacking
-- 🔨 Sparse image creation
-- 🔨 vbmeta image creation
-- 🔄 Recovery porting between devices
-- 🎨 Dark-themed PyQt6 GUI
-- 🚀 Multi-threaded operations
-- 📡 Remote file support (HTTP, S3, GCS)
+### v1.0-1.1 - Foundation
+- 📦 Payload extraction and repacking
+- 🖼️ Image extraction (boot, super, vbmeta, sparse, etc.)
+- 🔨 Image repacking
+- 🔄 Recovery porter
+- 🔌 Plugin system with ADB/Fastboot toolkits
 
 ---
 
@@ -843,19 +930,9 @@ MIT License - See [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  <b>Ⓐ Break the chains. Free your images. Ⓐ</b>
+  <b>Ⓐ Break the chains. Free your images. Join the rebellion. Ⓐ</b>
 </p>
 
 <p align="center">
   Made with ☕ and rebellion
 </p>
-
-
-
-
-
-
-
-
-
-
