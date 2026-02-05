@@ -491,9 +491,11 @@ Complete bootloader operations with 8 specialized tabs:
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk5.png?raw=true" alt="MTK Tools" width="700">
 </p>
 <p align="center">
-  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/v2.0/mtkclient.png?raw=true" alt="MTK Client Console" width="700">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk6.png?raw=true" alt="MTK Unlock" width="700">
 </p>
-
+<p align="center">
+  <img src="https://github.com/vehoelite/image-anarchy/blob/main/screenshots/mtk7.png?raw=true" alt="MTK Meta" width="700">
+</p>
 ### 📺 Scrcpy Toolkit
 Real-time screen mirroring and capture for Android devices:
 
@@ -1031,6 +1033,7 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
 
 
 
