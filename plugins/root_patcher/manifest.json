@@ -1,0 +1,28 @@
+{
+    "id": "root_patcher",
+    "name": "Root Patcher",
+    "version": "1.3.0",
+    "description": "Fully automated boot.img patching with Magisk - extracts magiskboot and patches on device without manual interaction. Also supports KernelSU and APatch (semi-automated). Includes bundled platform-tools and latest APKs.",
+    "author": "Image Anarchy Team",
+    "icon": "🔓",
+    "license_type": "free",
+    "website": "https://github.com/vehoelite/image-anarchy",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "2.0",
+    "git_clone": null,
+    "requirements": [],
+    "bundled_binaries": [
+        "https://imageanarchy.com/platform-tools/adb.exe",
+        "https://imageanarchy.com/platform-tools/fastboot.exe",
+        "https://imageanarchy.com/platform-tools/AdbWinApi.dll",
+        "https://imageanarchy.com/platform-tools/AdbWinUsbApi.dll",
+        "https://imageanarchy.com/platform-tools/libwinpthread-1.dll",
+        "https://imageanarchy.com/Magisk-v30.6.apk",
+        "https://imageanarchy.com/APatch_11142_166daa0_on_HEAD-release-signed.apk",
+        "https://imageanarchy.com/KernelSU_v3.0.0_32179-release.apk",
+        "https://imageanarchy.com/Magisk-v25.2.apk"
+    ],
+    "setup_commands": [],
+    "enabled": true,
+    "remote_capable": true
+}

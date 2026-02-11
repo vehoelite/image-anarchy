@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1 {
+            color: #4fc3f7;
+            border-bottom: 2px solid #c62828;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #81d4fa;
+            margin-top: 25px;
+        }
+        .feature {
+            background: #252540;
+            border-left: 4px solid #4fc3f7;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 0 8px 8px 0;
+        }
+        .warning {
+            background: #3d2020;
+            border-left: 4px solid #c62828;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 0 8px 8px 0;
+        }
+        .method {
+            display: inline-block;
+            padding: 5px 15px;
+            margin: 5px;
+            border-radius: 20px;
+            font-weight: bold;
+        }
+        .magisk { background: #1b5e20; }
+        .apatch { background: #0d47a1; }
+        .kernelsu { background: #4a148c; }
+        .gsi { background: #bf360c; }
+        code {
+            background: #0d1117;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        li {
+            margin: 8px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔓 Root Patcher</h1>
+    
+    <p>Analyze boot images and get guidance for patching with popular Android rooting solutions.</p>
+    
+    <h2>Supported Methods</h2>
+    <p>
+        <span class="method magisk">Magisk</span>
+        <span class="method apatch">APatch</span>
+        <span class="method kernelsu">KernelSU</span>
+        <span class="method gsi">Phh GSI</span>
+    </p>
+    
+    <div class="feature">
+        <h3>🎯 Magisk (Recommended)</h3>
+        <ul>
+            <li><strong>Compatibility:</strong> Works on virtually ALL Android devices</li>
+            <li><strong>Features:</strong> MagiskHide, Zygisk, Modules support</li>
+            <li><strong>How it works:</strong> Patches the ramdisk in boot.img</li>
+            <li><strong>Best for:</strong> Everyone, especially beginners</li>
+        </ul>
+    </div>
+    
+    <div class="feature">
+        <h3>🔧 APatch</h3>
+        <ul>
+            <li><strong>Compatibility:</strong> Android 11+ with supported kernels</li>
+            <li><strong>Features:</strong> KernelPatch-based, good root hiding</li>
+            <li><strong>How it works:</strong> Patches kernel directly</li>
+            <li><strong>Best for:</strong> Users who need better root hiding</li>
+        </ul>
+    </div>
+    
+    <div class="feature">
+        <h3>⚡ KernelSU</h3>
+        <ul>
+            <li><strong>Compatibility:</strong> <strong>GKI kernels ONLY</strong> (Android 12+ with 5.10/5.15/6.1 kernels)</li>
+            <li><strong>Features:</strong> Kernel-level root, excellent hiding</li>
+            <li><strong>How it works:</strong> Requires GKI kernel with kprobes</li>
+            <li><strong>Best for:</strong> Pixel and select flagship devices with GKI</li>
+        </ul>
+    </div>
+    
+    <div class="feature">
+        <h3>🌐 Phh GSI (Fallback Option)</h3>
+        <ul>
+            <li><strong>Compatibility:</strong> Any device with Project Treble support (Android 8+)</li>
+            <li><strong>Features:</strong> Built-in su, Phh Treble Settings</li>
+            <li><strong>How it works:</strong> Replaces your entire system partition with a Generic System Image</li>
+            <li><strong>Best for:</strong> Devices where other methods fail, testing, or when you can't get firmware</li>
+        </ul>
+        <p style="color: #fa0;">⚠️ <strong>Warning:</strong> This replaces your system partition! Best used temporarily or for testing.</p>
+    </div>
+    
+    <div class="warning">
+        <h3>⚠️ Important Notes</h3>
+        <ul>
+            <li><strong>MediaTek devices:</strong> Most MTK devices do NOT have GKI kernels. Use Magisk!</li>
+            <li><strong>vbmeta:</strong> You may need to disable vbmeta verification (or use mtkclient to bypass)</li>
+            <li><strong>Backup:</strong> Always keep a copy of your original boot.img</li>
+            <li><strong>Patching:</strong> Actual patching is done through each solution's app on an Android device</li>
+        </ul>
+    </div>
+    
+    <h2>📱 Device Mode (NEW!)</h2>
+    <p>Connect your phone directly via USB and let the plugin handle everything automatically:</p>
+    
+    <div class="feature">
+        <h3>🚀 Automated Root Process</h3>
+        <ol>
+            <li><strong>Scan Devices</strong> - Detects phones connected via ADB or Fastboot</li>
+            <li><strong>Extract boot.img</strong> - Pulls boot image directly from device (requires root)</li>
+            <li><strong>Patch on Device</strong> - Uses Magisk app on phone to patch the boot image</li>
+            <li><strong>Flash Back</strong> - Flashes patched boot via fastboot automatically</li>
+        </ol>
+    </div>
+    
+    <div class="feature">
+        <h3>📋 Requirements for Device Mode</h3>
+        <ul>
+            <li><strong>USB Debugging</strong> enabled on your device</li>
+            <li><strong>Platform Tools</strong> (ADB/Fastboot) installed</li>
+            <li><strong>Root access</strong> on device (to extract boot.img) - OR provide boot.img manually</li>
+            <li><strong>Magisk app</strong> installed (for patching)</li>
+            <li><strong>Unlocked bootloader</strong> (for flashing)</li>
+        </ul>
+    </div>
+    
+    <h2>📄 File Mode</h2>
+    <p>Traditional mode - analyze boot images and get patching instructions:</p>
+    <ol>
+        <li>Select your <code>boot.img</code> file</li>
+        <li>Click <strong>Analyze</strong> to check compatibility</li>
+        <li>Review the compatibility results</li>
+        <li>Select your preferred rooting method</li>
+        <li>Follow the provided instructions to patch</li>
+        <li>Flash the patched boot image using fastboot or mtkclient</li>
+    </ol>
+    
+    <h2>Compatibility Check</h2>
+    <p>The plugin analyzes your boot image to determine:</p>
+    <ul>
+        <li>Android version (from OS version field)</li>
+        <li>Kernel version and type</li>
+        <li>GKI kernel detection</li>
+        <li>Kprobes support (needed for KernelSU)</li>
+    </ul>
+    
+    <p style="text-align: center; margin-top: 30px; color: #888;">
+        Made with ☕ and rebellion • Image Anarchy
+    </p>
+</body>
+</html>
