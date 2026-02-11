@@ -1,0 +1,23 @@
+{
+    "id": "iaabs",
+    "name": "IAABS - Android Backup Solution",
+    "version": "1.0.0",
+    "description": "Image Anarchy Android Backup Solution - Live root filesystem backup and restore via ADB. First tool to backup rooted Android devices while running!",
+    "author": "Image Anarchy Team",
+    "icon": "💾",
+    "license_type": "free",
+    "website": "https://imageanarchy.com",
+    "support_url": "https://forum.imageanarchy.com",
+    "min_version": "1.0",
+    "git_clone": null,
+    "requirements": [],
+    "bundled_binaries": [
+        "https://imageanarchy.com/platform-tools/adb.exe",
+        "https://imageanarchy.com/platform-tools/AdbWinApi.dll",
+        "https://imageanarchy.com/platform-tools/AdbWinUsbApi.dll",
+        "https://imageanarchy.com/platform-tools/libwinpthread-1.dll"
+    ],
+    "setup_commands": [],
+    "enabled": true,
+    "remote_capable": true
+}
