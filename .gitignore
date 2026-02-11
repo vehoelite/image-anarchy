@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Python build / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
 # Virtual environments
 .venv/
 venv/
@@ -47,3 +53,15 @@ desktop.ini
 # Temporary files
 *.tmp
 *.temp
+node_modules
+
+# Bundled tooling (not needed for pip install)
+python_embedded/
+PortableGit/
+platform-tools/
+mtkclient-2.1.2/
+plugin_packages/
+drivers/
+
+# Secrets
+plugin_store_auth.json
