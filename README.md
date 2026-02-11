@@ -896,7 +896,7 @@ This tool is provided for **educational and development purposes**.
 
 If you find Image Anarchy useful, consider supporting development:
 
-**Bitcoin:** `bc1qx5kp5sx67qe2fd32h6ne7jvw6xpzy2xhnph0rs`
+**Bitcoin:** `bc1qula4hmlv0qqpf9wwpzwwa0m8w3z00appn9rrq3`
 
 Or star ⭐ the repository to show your appreciation!
 
@@ -923,3 +923,4 @@ MIT License - See [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ☕ and rebellion
 </p>
+
