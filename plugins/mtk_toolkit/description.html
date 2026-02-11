@@ -1,8 +1,9 @@
-<h2>🔥 MTK Toolkit - MediaTek Device Liberation</h2>
+<h2>🔥 MTK Toolkit v2.3 - Total MediaTek Device Ownership</h2>
+<p><strong>Powered by mtkclient 2.1.2</strong></p>
 
-<p><strong>Break free from manufacturer restrictions.</strong> Your device. Your rules.</p>
+<p><strong>Complete control over YOUR device.</strong> You bought it. You own it. Now CONTROL it.</p>
 
-<h3>⚡ Features</h3>
+<h3>⚡ Core Features</h3>
 <ul>
   <li>🔓 <strong>Unlock Bootloader</strong> - Break the chains, no unlock codes needed</li>
   <li>📦 <strong>Read Partitions</strong> - Extract boot, recovery, vbmeta, and more</li>
@@ -13,21 +14,91 @@
   <li>📋 <strong>GPT Management</strong> - View and manage partition tables</li>
 </ul>
 
+<h3>🆕 NEW in v2.3 - mtkclient 2.1.2 Integration</h3>
+<ul>
+  <li>📡 <strong>META Mode Switching</strong> - Full BROM → META/Preloader transitions</li>
+  <li>🚀 <strong>Advanced META Mode</strong> - ADVEMETA for factory-level device access</li>
+  <li>⚡ <strong>FASTBOOT Mode</strong> - Direct boot to fastboot from BROM</li>
+  <li>🏭 <strong>Factory Modes</strong> - FACTFACT, FACTORYM, AT+NBOOT support</li>
+  <li>🔐 <strong>SLA Authentication</strong> - Infinix/Tecno/itel device unlock support</li>
+  <li>⏱️ <strong>Watchdog Reset</strong> - Reliable mode switching via hardware watchdog</li>
+  <li>🔧 <strong>BROM Register Access</strong> - Low-level CMD 0xDA for META flag control</li>
+</ul>
+
+<h3>🔄 Mode Switching (NEW!)</h3>
+<ul>
+  <li><strong>FASTBOOT</strong> - Boot directly to fastboot mode</li>
+  <li><strong>METAMETA</strong> - Standard META mode for SP Flash Tool compatibility</li>
+  <li><strong>ADVEMETA</strong> - Advanced META with extended capabilities</li>
+  <li><strong>FACTFACT</strong> - Factory menu mode</li>
+  <li><strong>FACTORYM</strong> - ATE Signaling Test mode</li>
+  <li><strong>AT+NBOOT</strong> - AT command boot mode</li>
+</ul>
+
+<h3>✨ v2.2 Features</h3>
+<ul>
+  <li>✍️ <strong>IMEI Write</strong> - Restore YOUR device identity (read AND write!)</li>
+  <li>📡 <strong>Modem Patching</strong> - Unlock IMEI operations on restricted devices</li>
+  <li>🔐 <strong>Full RPMB Control</strong> - Read, Write, Erase, and Authenticate RPMB</li>
+  <li>⚡ <strong>VBMeta Patching</strong> - Disable Android Verified Boot with one click</li>
+  <li>📱 <strong>IMEI Read</strong> - Decrypt and display device IMEI values</li>
+  <li>🔐 <strong>eFuse Dump</strong> - Expose the OEM's deepest secrets</li>
+  <li>🧠 <strong>Memory Dump</strong> - Extract BROM, DRAM, SRAM, and eFuses</li>
+  <li>🔍 <strong>Security Analysis</strong> - Check SBC, SLA, DAA status</li>
+  <li>📡 <strong>IoT Device Support</strong> - MT6261/MT2301 compatibility</li>
+</ul>
+
 <h3>🏴 Anarchy Mode</h3>
 <ul>
   <li>Persistent connection - no reconnecting between operations</li>
   <li>Auto-detects A/B partition slots</li>
   <li>Supports BROM and Preloader modes</li>
   <li>Rebellious terminal with real-time logging</li>
+  <li>PyQt6 compatibility with PySide6 shim layer</li>
 </ul>
 
 <h3>📱 Supported Devices</h3>
 <p>Works with MediaTek (MTK) devices including Helio, Dimensity, and legacy chipsets.</p>
+<table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; margin: 10px 0;">
+  <tr style="background: #333;">
+    <th>Protocol</th>
+    <th>Chipsets</th>
+  </tr>
+  <tr>
+    <td><strong>V6 (Latest)</strong></td>
+    <td>MT6781, MT6789, MT6855, MT6886, MT6895, MT6983, MT8985</td>
+  </tr>
+  <tr>
+    <td><strong>XFLASH</strong></td>
+    <td>MT6765, MT6768, MT6771, MT6785, MT6833, MT6853, MT6873, MT6877</td>
+  </tr>
+  <tr>
+    <td><strong>Legacy</strong></td>
+    <td>MT6572, MT6580, MT6582, MT6592, MT6735, MT6737, MT6739, MT6750</td>
+  </tr>
+  <tr>
+    <td><strong>IoT</strong></td>
+    <td>MT6261, MT2301, MT2503, MT2625</td>
+  </tr>
+</table>
+
+<h3>🔌 USB Device IDs</h3>
+<ul>
+  <li><strong>0x0E8D:0x0003</strong> - BROM mode (connect while holding Vol Down)</li>
+  <li><strong>0x0E8D:0x2000</strong> - Preloader VCOM / META mode</li>
+  <li><strong>0x0E8D:0x2001</strong> - Preloader VCOM (alternate)</li>
+  <li><strong>0x0E8D:0x1887</strong> - Special META mode (no READY handshake)</li>
+</ul>
 
 <h3>⚠️ Requirements</h3>
 <ul>
   <li>Windows with USB drivers installed</li>
   <li>Device in BROM/Preloader mode (hold volume buttons while connecting)</li>
+  <li>MediaTek Preloader VCOM drivers for META mode operations</li>
 </ul>
 
-<p><em>You bought it. You own it. Now <strong>control</strong> it.</em> 🏴</p>
+<h3>⚠️ IMEI & RPMB Warning</h3>
+<p><strong>IMEI modification may be illegal in some jurisdictions.</strong> Use only for device recovery and legitimate repair.
+<br><strong>RPMB operations are DANGEROUS.</strong> Writing incorrect data can permanently brick your device. You've been warned!</p>
+
+<p><em>You bought it. You own it. Now <strong>TRULY control</strong> it.</em> 🏴</p>
