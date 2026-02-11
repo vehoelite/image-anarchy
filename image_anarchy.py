@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
-Version: 2.1
+Version: 3.2
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -134,6 +134,10 @@ def _setup_plugin_site_packages():
         # Running from source
         base_dir = os.path.dirname(os.path.abspath(__file__))
     
+    # Add base_dir to sys.path so visual_plugin_maker_v2.py can be found
+    if base_dir not in sys.path:
+        sys.path.insert(0, base_dir)
+    
     # Local site-packages for plugin dependencies
     local_site_packages = os.path.join(base_dir, 'plugin_packages')
     
@@ -152,6 +156,68 @@ def _setup_plugin_site_packages():
 
 # Initialize plugin site-packages path
 _PLUGIN_PACKAGES_DIR = _setup_plugin_site_packages()
+
+# =============================================================================
+# ADMIN ELEVATION (Windows) - Required for USB device access
+# =============================================================================
+
+def is_admin():
+    """Check if the current process has administrator privileges."""
+    if sys.platform != 'win32':
+        return True  # Not needed on Linux/Mac (use sudo if needed)
+    
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+def run_as_admin():
+    """Re-launch the current script with administrator privileges.
+    
+    Returns True if elevation was requested (and script should exit),
+    False if already admin or elevation not needed.
+    """
+    if sys.platform != 'win32':
+        return False  # Not Windows
+    
+    if is_admin():
+        return False  # Already admin
+    
+    try:
+        import ctypes
+        
+        # Get the script/exe path
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller exe
+            script = sys.executable
+            params = ' '.join(sys.argv[1:])
+        else:
+            # Running as Python script
+            script = sys.executable
+            params = f'"{os.path.abspath(sys.argv[0])}"'
+            if len(sys.argv) > 1:
+                params += ' ' + ' '.join(f'"{arg}"' for arg in sys.argv[1:])
+        
+        # Request UAC elevation
+        # SW_SHOWNORMAL = 1
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None,           # hwnd
+            "runas",        # lpOperation (run as admin)
+            script,         # lpFile
+            params,         # lpParameters
+            None,           # lpDirectory
+            1               # nShowCmd (SW_SHOWNORMAL)
+        )
+        
+        # ShellExecuteW returns > 32 on success
+        if ret > 32:
+            return True  # Elevation requested, caller should exit
+        else:
+            return False  # Elevation failed or was cancelled
+            
+    except Exception:
+        return False
 
 # Third-party imports
 import brotli
@@ -188,8 +254,8 @@ def _get_visual_plugin_maker_v2():
     return _VisualPluginMakerV2
 
 # Application version - used for update checking
-APP_VERSION = "2.5.0"
-APP_VERSION_CODE = 250  # Numeric version for comparison (2.5.0 = 250)
+APP_VERSION = "3.2"
+APP_VERSION_CODE = 320  # Numeric version for comparison (3.2 = 320)
 
 
 def get_app_dir() -> str:
@@ -213,8 +279,13 @@ def _extract_bundled_resources():
     """Extract bundled resources from PyInstaller _MEIPASS to app directory.
     
     When running as a frozen exe, PyInstaller extracts files to a temp directory.
-    This function copies necessary resources (drivers, platform-tools, etc.) to
-    the app's directory so they persist and can be used by plugins.
+    This function copies necessary resources (drivers, etc.) to the app's directory
+    so they persist and can be used by plugins.
+    
+    NOTE: platform-tools (ADB/Fastboot) are NOT bundled with the main exe.
+    Plugins that need them should declare them in their manifest.json using
+    bundled_binaries with download URLs. This keeps the exe smaller and follows
+    the plugin dependency system.
     """
     if not getattr(sys, 'frozen', False):
         return  # Not running as frozen exe
@@ -227,14 +298,18 @@ def _extract_bundled_resources():
     # App directory (where exe is located)
     app_dir = os.path.dirname(sys.executable)
     
+    # First run marker file
+    first_run_marker = os.path.join(app_dir, '.first_run_complete')
+    is_first_run = not os.path.exists(first_run_marker)
+    
     # Resources to extract if they don't exist
     # These are bundled in the exe via ImageAnarchy.spec and extracted on first run
-    # - drivers: Android USB drivers for device connections
-    # - platform-tools: ADB and fastboot binaries
+    # - drivers: Android USB drivers + VC++ Redistributable for device connections
     # - PortableGit: Git for Windows (used by plugins that need git clone)
     # - plugins: Plugin system with built-in and user-installed plugins
     # - tools: CLI utilities (EROFS tools, Allwinner imgRePacker, Rockchip imgRePackerRK)
-    resources = ['drivers', 'platform-tools', 'PortableGit', 'plugins', 'tools']
+    # - python_embedded: Embedded Python for plugin pip installs (no system Python needed)
+    resources = ['drivers', 'PortableGit', 'plugins', 'tools', 'python_embedded']
     
     for resource in resources:
         src = os.path.join(meipass, resource)
@@ -248,6 +323,39 @@ def _extract_bundled_resources():
                     shutil.copy2(src, dst)
             except Exception:
                 pass  # Silently continue if extraction fails
+    
+    # Install VC++ Redistributable on first run (required for PyQt6/Qt6 DLLs)
+    if is_first_run:
+        _install_vc_redist(app_dir)
+        # Create first run marker
+        try:
+            with open(first_run_marker, 'w') as f:
+                f.write('1')
+        except:
+            pass
+
+
+def _install_vc_redist(app_dir: str):
+    """Install Visual C++ Redistributable silently on first run.
+    
+    The VC++ Redist is required for PyQt6/Qt6 DLLs to work properly.
+    It's bundled in drivers/VC_redist.x64.exe and runs silently with /quiet.
+    """
+    vc_redist = os.path.join(app_dir, 'drivers', 'VC_redist.x64.exe')
+    
+    if not os.path.exists(vc_redist):
+        return  # Not found, skip
+    
+    try:
+        # Run silently with /quiet /norestart flags
+        # This won't show any UI and won't require restart
+        subprocess.run(
+            [vc_redist, '/quiet', '/norestart'],
+            capture_output=True,
+            timeout=120  # 2 minute timeout
+        )
+    except Exception:
+        pass  # Silently continue if install fails - user may already have it
 
 
 # Extract bundled resources on import (runs once on first launch)
@@ -260,13 +368,95 @@ def _get_python_executable() -> Optional[str]:
     When running as a PyInstaller frozen exe, sys.executable points to the exe,
     not Python. This function finds the actual Python interpreter.
     
+    Priority:
+    1. Bundled python_embedded (extracted next to exe)
+    2. System Python in PATH
+    
     Returns:
         Path to Python interpreter, or None if not found when frozen.
     """
     if getattr(sys, 'frozen', False):
-        # Running as frozen exe - find Python in PATH
-        return shutil.which('python') or shutil.which('python3') or shutil.which('py')
+        # Running as frozen exe
+        # First check for bundled python_embedded
+        base_dir = os.path.dirname(sys.executable)
+        embedded_python = os.path.join(base_dir, 'python_embedded', 'python.exe')
+        
+        # Check if embedded Python exists and is valid
+        if os.path.isfile(embedded_python):
+            # Verify it's actually executable by checking file size
+            try:
+                if os.path.getsize(embedded_python) > 0:
+                    return embedded_python
+            except Exception:
+                pass
+        
+        # Try to extract it if it doesn't exist (may have been deleted)
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            src_python_embedded = os.path.join(meipass, 'python_embedded')
+            dst_python_embedded = os.path.join(base_dir, 'python_embedded')
+            if os.path.exists(src_python_embedded) and not os.path.exists(dst_python_embedded):
+                try:
+                    shutil.copytree(src_python_embedded, dst_python_embedded)
+                    if os.path.isfile(embedded_python):
+                        return embedded_python
+                except Exception:
+                    pass
+        
+        # Fallback to system Python in PATH (only if embedded not found)
+        # This is a last resort - prefer embedded Python for consistency
+        fallback = shutil.which('python') or shutil.which('python3')
+        # Avoid 'py' launcher as it may return different Python versions
+        if not fallback:
+            fallback = shutil.which('py')
+        return fallback
     return sys.executable
+
+
+def _get_clean_python_env() -> dict:
+    """Get a clean environment for running embedded Python.
+    
+    When running as a frozen exe, we need to ensure the embedded Python
+    doesn't get confused by the user's system Python installation.
+    This removes Python-related environment variables that could interfere.
+    
+    Returns:
+        dict: Clean environment dictionary for subprocess calls
+    """
+    env = os.environ.copy()
+    
+    if not getattr(sys, 'frozen', False):
+        return env  # Not frozen, use normal env
+    
+    # Remove variables that could make embedded Python use wrong paths
+    python_vars_to_remove = [
+        'PYTHONPATH',
+        'PYTHONHOME', 
+        'PYTHONSTARTUP',
+        'PYTHONUSERBASE',
+        'VIRTUAL_ENV',
+        'CONDA_PREFIX',
+        'CONDA_DEFAULT_ENV',
+    ]
+    
+    for var in python_vars_to_remove:
+        env.pop(var, None)
+    
+    # Set PYTHONNOUSERSITE to prevent loading user site-packages
+    env['PYTHONNOUSERSITE'] = '1'
+    
+    # Ensure embedded Python's directory is at the front of PATH
+    base_dir = os.path.dirname(sys.executable)
+    embedded_dir = os.path.join(base_dir, 'python_embedded')
+    embedded_scripts = os.path.join(embedded_dir, 'Scripts')
+    
+    if os.path.exists(embedded_dir):
+        # Prepend embedded Python paths to PATH
+        current_path = env.get('PATH', '')
+        new_path = f"{embedded_dir};{embedded_scripts};{current_path}"
+        env['PATH'] = new_path
+    
+    return env
 
 
 try:
@@ -867,7 +1057,8 @@ SPARSE_HEADER_MAGIC = 0xED26FF3A
 BOOT_MAGIC = b'ANDROID!'
 BOOT_MAGIC_V3 = b'ANDROID!'
 VENDOR_BOOT_MAGIC = b'VNDRBOOT'
-LP_METADATA_MAGIC = 0x414C5030  # "0PLA" - Android Logical Partition
+LP_METADATA_MAGIC = 0x414C5030  # "0PLA" - Android Logical Partition metadata header
+LP_GEOMETRY_MAGIC = 0x616c4467  # "gDla" - Android Logical Partition geometry
 EROFS_MAGIC = 0xE0F5E1E2
 EXT4_MAGIC = 0xEF53
 FAT_BOOT_SIG = 0xAA55  # FAT boot signature at offset 0x1FE
@@ -948,12 +1139,16 @@ def detect_image_type(file_path: str) -> str:
     if header[:8] == VENDOR_BOOT_MAGIC:
         return 'vendor_boot'
     
-    # Check for super partition (LP metadata at offset 4096)
+    # Check for super partition (LP geometry at offset 4096)
     with open(file_path, 'rb') as f:
         f.seek(4096)  # LP_METADATA_GEOMETRY_OFFSET
         lp_header = f.read(4)
         if len(lp_header) >= 4:
             lp_magic = struct.unpack('<I', lp_header)[0]
+            # Check for geometry magic "gDla" (0x616c4467)
+            if lp_magic == LP_GEOMETRY_MAGIC:
+                return 'super'
+            # Also check for metadata magic "0PLA" (0x414C5030) as fallback
             if lp_magic == LP_METADATA_MAGIC:
                 return 'super'
     
@@ -1062,6 +1257,11 @@ def detect_image_type(file_path: str) -> str:
     filename = Path(file_path).stem.lower()
     if 'abl' in filename or filename in ['bl1', 'bl2', 'bl31']:
         return 'abl'
+    
+    # Check for NVRAM (MTK proprietary format) - return special type
+    # NVRAM contains calibration data, IMEI keys, WiFi/BT MAC, etc.
+    if 'nvram' in filename or 'nvdata' in filename or 'nvcfg' in filename or 'protect' in filename:
+        return 'nvram'
     
     return 'raw'
 
@@ -4041,7 +4241,8 @@ class VbmetaPatcher:
     def patch(self, output_path: str, disable_verity: bool = False, 
               disable_verification: bool = False,
               reset_flags: bool = False,
-              signer: Optional['AvbSigner'] = None) -> bool:
+              signer: Optional['AvbSigner'] = None,
+              force_chained: bool = False) -> tuple[bool, str]:
         """Patch vbmeta and optionally re-sign with custom key.
         
         Args:
@@ -4050,17 +4251,41 @@ class VbmetaPatcher:
             disable_verification: Set the VERIFICATION_DISABLED flag
             reset_flags: Reset ALL flags to 0 (restore stock behavior)
             signer: Optional AvbSigner for re-signing with custom key
+            force_chained: Force patching even if this is a chained vbmeta (DANGEROUS)
             
         Returns:
-            True if successful, False otherwise
+            (success: bool, message: str)
+            Message explains what happened or why it was skipped
         """
         if not disable_verity and not disable_verification and not reset_flags and not signer:
             # Nothing to do, just copy
             import shutil
             shutil.copy2(self.input_path, output_path)
-            return True
+            return True, ""
         
         try:
+            # Check if this is a chained vbmeta (vbmeta_system, vbmeta_vendor)
+            is_main, chain_parts = self.is_main_vbmeta(str(self.input_path))
+            filename = self.input_path.name.lower()
+            
+            if not is_main and (disable_verity or disable_verification):
+                # This is a chained vbmeta - DO NOT PATCH IT
+                # Patching chained vbmetas causes boot loops on many devices
+                if not force_chained:
+                    msg = (
+                        f"⏭️ SKIPPED: '{self.input_path.name}' is a chained vbmeta.\n"
+                        "   Patching chained vbmetas (vbmeta_system, vbmeta_vendor) causes\n"
+                        "   BOOT LOOPS on many devices. Only the main vbmeta.img needs patching.\n"
+                        "   The main vbmeta controls verification for all chained images."
+                    )
+                    logger.info(f"Skipped chained vbmeta: {filename} (would cause boot loop)")
+                    return False, msg
+                else:
+                    logger.warning(f"Force-patching chained vbmeta: {filename} (user override)")
+            elif is_main and chain_parts:
+                # This is the main vbmeta with chain partitions - good to patch
+                logger.info(f"Main vbmeta detected - chains to: {', '.join(chain_parts)}")
+            
             # Read original vbmeta
             with open(self.input_path, 'rb') as f:
                 data = bytearray(f.read())
@@ -4095,7 +4320,7 @@ class VbmetaPatcher:
             if signer:
                 data = self._resign_vbmeta(data, signer)
                 if data is None:
-                    return False
+                    return False, "Failed to re-sign vbmeta"
                 changes.append("re-signed with custom key")
             
             # Save patched vbmeta
@@ -4105,11 +4330,11 @@ class VbmetaPatcher:
             logger.info(f"Patched vbmeta: {', '.join(changes)}")
             logger.info(f"Original flags: 0x{current_flags:08X} -> New flags: 0x{new_flags:08X}")
             
-            return True
+            return True, ""
             
         except Exception as e:
             logger.error(f"Failed to patch vbmeta: {e}")
-            return False
+            return False, str(e)
     
     def _resign_vbmeta(self, data: bytearray, signer: 'AvbSigner') -> Optional[bytearray]:
         """Re-sign vbmeta with custom key.
@@ -4226,6 +4451,62 @@ class VbmetaPatcher:
                 }
         except Exception as e:
             return {'error': str(e)}
+    
+    @staticmethod
+    def is_main_vbmeta(input_path: str) -> tuple[bool, list[str]]:
+        """Check if this is the main vbmeta (has CHAIN descriptors) vs a chained vbmeta.
+        
+        The main vbmeta.img contains CHAIN_PARTITION descriptors pointing to
+        vbmeta_system, vbmeta_vendor, boot, etc.
+        
+        Chained vbmetas (vbmeta_system.img, vbmeta_vendor.img) only have 
+        PROPERTY and HASHTREE descriptors.
+        
+        Returns:
+            (is_main: bool, chain_partitions: list[str])
+            
+        Note: Only the main vbmeta.img should be patched with VERIFICATION_DISABLED.
+        Patching chained vbmetas invalidates their signatures but the bootloader
+        may still verify them, causing boot loops on some devices.
+        """
+        try:
+            with open(input_path, 'rb') as f:
+                data = f.read(8192)  # Read enough for header + descriptors
+            
+            if data[:4] != AVB_MAGIC:
+                return False, []
+            
+            auth_size = struct.unpack('>Q', data[12:20])[0]
+            aux_size = struct.unpack('>Q', data[20:28])[0]
+            aux_start = 256 + auth_size
+            
+            chain_partitions = []
+            pos = aux_start
+            
+            while pos < aux_start + aux_size and pos + 16 <= len(data):
+                tag = struct.unpack('>Q', data[pos:pos+8])[0]
+                size = struct.unpack('>Q', data[pos+8:pos+16])[0]
+                
+                if size == 0 or size > 50000:
+                    break
+                
+                if tag == 4:  # CHAIN_PARTITION descriptor
+                    desc_data = data[pos+16:pos+16+min(size, 200)]
+                    if len(desc_data) >= 80:
+                        name_len = struct.unpack('>I', desc_data[4:8])[0]
+                        # Partition name at offset 76 (12 bytes header + 64 bytes reserved)
+                        if name_len > 0 and len(desc_data) >= 76 + name_len:
+                            name = desc_data[76:76+name_len].decode('utf-8', errors='replace').rstrip('\x00')
+                            if name:
+                                chain_partitions.append(name)
+                
+                pos += 16 + ((size + 7) & ~7)
+            
+            return len(chain_partitions) > 0, chain_partitions
+            
+        except Exception as e:
+            logger.debug(f"Error checking vbmeta type: {e}")
+            return False, []
 
 
 # =============================================================================
@@ -7146,7 +7427,11 @@ class ErofsImageExtractor:
 
 
 class SuperImageExtractor:
-    """Extract partitions from Android super (dynamic partitions) image."""
+    """Extract partitions from Android super (dynamic partitions) image.
+    
+    Supports both raw and sparse super images. Sparse images are automatically
+    converted to raw format before processing.
+    """
     
     LP_METADATA_GEOMETRY_MAGIC = 0x616c4467  # "gDla"
     LP_METADATA_HEADER_MAGIC = 0x414c5030   # "0PLA"
@@ -7155,62 +7440,190 @@ class SuperImageExtractor:
     
     def __init__(self, progress_callback: Optional[Callable] = None):
         self.progress_callback = progress_callback
+        self._temp_file = None
+    
+    def _is_sparse(self, input_path: str) -> bool:
+        """Check if the file is a sparse image."""
+        with open(input_path, 'rb') as f:
+            magic = f.read(4)
+            if len(magic) >= 4:
+                return struct.unpack('<I', magic)[0] == SPARSE_HEADER_MAGIC
+        return False
+    
+    def _get_raw_file(self, input_path: str) -> str:
+        """Get path to raw file, converting from sparse if needed."""
+        if not self._is_sparse(input_path):
+            return input_path
+        
+        # Convert sparse to raw in temp file
+        import tempfile
+        
+        if self.progress_callback:
+            self.progress_callback(0, 100, "Converting sparse super image...")
+        
+        # Create temp file for raw image
+        self._temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.raw')
+        temp_path = self._temp_file.name
+        self._temp_file.close()
+        
+        # Convert sparse to raw
+        converter = SparseImageConverter(self.progress_callback)
+        converter.convert(input_path, temp_path)
+        
+        return temp_path
+    
+    def _cleanup_temp(self):
+        """Clean up temporary file if created."""
+        if self._temp_file:
+            try:
+                import os
+                os.unlink(self._temp_file.name)
+            except:
+                pass
+            self._temp_file = None
     
     def list_partitions(self, input_path: str) -> list[LpMetadataPartition]:
         """List all partitions in a super image."""
-        with open(input_path, 'rb') as f:
-            return self._read_metadata(f)
+        try:
+            raw_path = self._get_raw_file(input_path)
+            with open(raw_path, 'rb') as f:
+                return self._read_metadata(f)
+        finally:
+            self._cleanup_temp()
     
     def extract(self, input_path: str, output_dir: str, 
                 partition_names: Optional[list[str]] = None) -> dict:
-        """Extract partitions from super image."""
+        """Extract partitions from super image.
+        
+        Handles non-contiguous extents properly by reading each extent
+        and concatenating them in order. Automatically handles sparse images.
+        """
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         
-        with open(input_path, 'rb') as f:
-            partitions = self._read_metadata(f)
+        try:
+            raw_path = self._get_raw_file(input_path)
             
-            if partition_names:
-                partitions = [p for p in partitions if p.name in partition_names]
+            with open(raw_path, 'rb') as f:
+                # Read geometry and metadata to get extent info
+                f.seek(4096)
+                geometry = self._read_geometry(f)
             
-            extracted = {}
-            total = len(partitions)
-            
-            for idx, part in enumerate(partitions):
-                if part.size == 0:
-                    logger.info(f"  Skipping empty partition: {part.name}")
-                    continue
+                f.seek(geometry['metadata_offset'])
+                header = self._read_metadata_header(f)
                 
-                logger.info(f"  Extracting {part.name}: {part.size / (1024*1024):.2f} MB")
+                tables_start = geometry['metadata_offset'] + header['header_size']
                 
-                output_path = Path(output_dir) / f"{part.name}.img"
+                # Read all partition entries
+                partition_entries = []
+                f.seek(tables_start + header['partitions_offset'])
+                for _ in range(header['partitions_count']):
+                    part_data = f.read(header['partitions_entry_size'])
+                    if len(part_data) < 52:
+                        break
+                    name = part_data[:36].rstrip(b'\x00').decode('utf-8', errors='ignore')
+                    attrs, first_extent_idx, num_extents, group_idx = struct.unpack(
+                        '<IIII', part_data[36:52]
+                    )
+                    partition_entries.append({
+                        'name': name,
+                        'attrs': attrs,
+                        'first_extent_idx': first_extent_idx,
+                        'num_extents': num_extents
+                    })
                 
-                # Calculate actual offset (sectors are 512 bytes)
-                offset = part.first_sector * 512
+                # Read all extents
+                extents = []
+                f.seek(tables_start + header['extents_offset'])
+                for _ in range(header['extents_count']):
+                    extent_data = f.read(header['extents_entry_size'])
+                    if len(extent_data) >= 24:
+                        num_sectors, target_type, target_data, target_source = struct.unpack(
+                            '<QIIQ', extent_data[:24]
+                        )
+                        extents.append({
+                            'num_sectors': num_sectors,
+                            'target_type': target_type,
+                            'target_data': target_data,
+                            'target_source': target_source
+                        })
                 
-                f.seek(offset)
+                # Filter partitions if specific names requested
+                if partition_names:
+                    partition_entries = [p for p in partition_entries if p['name'] in partition_names]
                 
-                # Extract in chunks
-                remaining = part.size
-                chunk_size = 64 * 1024 * 1024  # 64MB chunks
+                extracted = {}
+                total = len(partition_entries)
                 
-                with open(output_path, 'wb') as f_out:
-                    while remaining > 0:
-                        to_read = min(chunk_size, remaining)
-                        data = f.read(to_read)
-                        if not data:
-                            break
-                        f_out.write(data)
-                        remaining -= len(data)
+                for idx, part in enumerate(partition_entries):
+                    if part['num_extents'] == 0:
+                        logger.info(f"  Skipping empty partition: {part['name']}")
+                        continue
+                    
+                    # Calculate total size
+                    total_size = 0
+                    for i in range(part['num_extents']):
+                        ext_idx = part['first_extent_idx'] + i
+                        if ext_idx < len(extents):
+                            total_size += extents[ext_idx]['num_sectors'] * 512
+                    
+                    logger.info(f"  Extracting {part['name']}: {total_size / (1024*1024):.2f} MB ({part['num_extents']} extents)")
+                    
+                    output_path = Path(output_dir) / f"{part['name']}.img"
+                    
+                    with open(output_path, 'wb') as f_out:
+                        # Process each extent
+                        for i in range(part['num_extents']):
+                            ext_idx = part['first_extent_idx'] + i
+                            if ext_idx >= len(extents):
+                                break
+                            
+                            ext = extents[ext_idx]
+                            
+                            if ext['target_type'] == 0:  # Linear extent
+                                # Read from physical sector
+                                offset = ext['target_data'] * 512
+                                size = ext['num_sectors'] * 512
+                                
+                                f.seek(offset)
+                                remaining = size
+                                chunk_size = 64 * 1024 * 1024  # 64MB chunks
+                                
+                                while remaining > 0:
+                                    to_read = min(chunk_size, remaining)
+                                    data = f.read(to_read)
+                                    if not data:
+                                        break
+                                    f_out.write(data)
+                                    remaining -= len(data)
+                            
+                            elif ext['target_type'] == 1:  # Zero extent
+                                # Write zeros
+                                size = ext['num_sectors'] * 512
+                                zero_chunk = b'\x00' * min(64 * 1024 * 1024, size)
+                                remaining = size
+                                while remaining > 0:
+                                    to_write = min(len(zero_chunk), remaining)
+                                    f_out.write(zero_chunk[:to_write])
+                                    remaining -= to_write
+                    
+                    extracted[part['name']] = str(output_path)
+                    
+                    if self.progress_callback:
+                        self.progress_callback(idx + 1, total, f"Extracted {part['name']}")
                 
-                extracted[part.name] = str(output_path)
-                
-                if self.progress_callback:
-                    self.progress_callback(idx + 1, total, f"Extracted {part.name}")
-            
-            return extracted
+                return extracted
+        finally:
+            self._cleanup_temp()
     
     def _read_metadata(self, f: BinaryIO) -> list[LpMetadataPartition]:
-        """Read LP metadata and return partition list."""
+        """Read LP metadata and return partition list.
+        
+        Super partition layout:
+        - Metadata starts at offset 12288 (0x3000)
+        - First comes the header (usually 128 bytes)
+        - Then comes the tables (partitions, extents, groups, block_devices)
+        - The offsets in table_descriptors are relative to the start of tables
+        """
         # Read geometry at offset 4096
         f.seek(4096)
         geometry = self._read_geometry(f)
@@ -7219,12 +7632,14 @@ class SuperImageExtractor:
         f.seek(geometry['metadata_offset'])
         header = self._read_metadata_header(f)
         
-        # Read partition table
+        # Tables start right after the header
+        tables_start = geometry['metadata_offset'] + header['header_size']
+        
+        # Read all partitions first
         partitions = []
+        partition_entries = []
         
-        # Seek to partitions table
-        f.seek(geometry['metadata_offset'] + header['partitions_offset'])
-        
+        f.seek(tables_start + header['partitions_offset'])
         for _ in range(header['partitions_count']):
             part_data = f.read(header['partitions_entry_size'])
             if len(part_data) < 52:
@@ -7234,57 +7649,121 @@ class SuperImageExtractor:
             attrs, first_extent_idx, num_extents, group_idx = struct.unpack(
                 '<IIII', part_data[36:52]
             )
-            
-            # Read extent info to get actual size and offset
-            if num_extents > 0:
-                # Save position
-                pos = f.tell()
+            partition_entries.append({
+                'name': name,
+                'attrs': attrs,
+                'first_extent_idx': first_extent_idx,
+                'num_extents': num_extents,
+                'group_idx': group_idx
+            })
+        
+        # Read all extents
+        extents = []
+        f.seek(tables_start + header['extents_offset'])
+        for _ in range(header['extents_count']):
+            extent_data = f.read(header['extents_entry_size'])
+            if len(extent_data) >= 24:
+                num_sectors, target_type, target_data, target_source = struct.unpack(
+                    '<QIIQ', extent_data[:24]
+                )
+                extents.append({
+                    'num_sectors': num_sectors,
+                    'target_type': target_type,  # 0 = linear, 1 = zero
+                    'target_data': target_data,  # physical sector for linear, unused for zero
+                    'target_source': target_source  # device index
+                })
+        
+        # Build partition list with total size from all extents
+        for part in partition_entries:
+            if part['num_extents'] > 0:
+                total_size = 0
+                first_sector = None
                 
-                # Read extent
-                extent_offset = geometry['metadata_offset'] + header['extents_offset'] + \
-                               first_extent_idx * header['extents_entry_size']
-                f.seek(extent_offset)
-                extent_data = f.read(header['extents_entry_size'])
+                for i in range(part['num_extents']):
+                    ext_idx = part['first_extent_idx'] + i
+                    if ext_idx < len(extents):
+                        ext = extents[ext_idx]
+                        total_size += ext['num_sectors'] * 512
+                        # Use the first linear extent's sector as the start
+                        if first_sector is None and ext['target_type'] == 0:
+                            first_sector = ext['target_data']
                 
-                if len(extent_data) >= 24:
-                    num_sectors, target_type, target_data, target_source = struct.unpack(
-                        '<QIIQ', extent_data[:24]
-                    )
-                    
+                if first_sector is not None:
                     partitions.append(LpMetadataPartition(
-                        name=name,
+                        name=part['name'],
                         group_name="",
-                        first_sector=target_data,
-                        size=num_sectors * 512,
-                        attributes=attrs
+                        first_sector=first_sector,
+                        size=total_size,
+                        attributes=part['attrs']
                     ))
-                
-                # Restore position
-                f.seek(pos)
+        
+        return partitions
         
         return partitions
     
     def _read_geometry(self, f: BinaryIO) -> dict:
-        """Read LP metadata geometry."""
+        """Read LP metadata geometry.
+        
+        Super partition layout:
+        - Offset 0x0000-0x0FFF (0-4095): Reserved/empty
+        - Offset 0x1000-0x1FFF (4096-8191): Primary geometry (LP_METADATA_GEOMETRY_SIZE = 4096)
+        - Offset 0x2000-0x2FFF (8192-12287): Backup geometry (LP_METADATA_GEOMETRY_SIZE = 4096)
+        - Offset 0x3000+ (12288+): Metadata slots
+        
+        LpMetadataGeometry structure:
+        - 0-3: magic (4 bytes) - 0x616c4467 "gDla"
+        - 4-7: struct_size (4 bytes)
+        - 8-39: checksum (32 bytes SHA-256)
+        - 40-43: metadata_max_size (4 bytes)
+        - 44-47: metadata_slot_count (4 bytes)
+        - 48-51: logical_block_size (4 bytes)
+        """
         data = f.read(4096)
         
         magic = struct.unpack('<I', data[:4])[0]
         if magic != self.LP_METADATA_GEOMETRY_MAGIC:
             raise PayloadError(f"Invalid LP geometry magic: {hex(magic)}")
         
-        struct_size, checksum = struct.unpack('<II', data[4:12])
-        metadata_max_size, metadata_slot_count = struct.unpack('<II', data[12:20])
-        logical_block_size = struct.unpack('<I', data[20:24])[0]
+        struct_size = struct.unpack('<I', data[4:8])[0]
+        # checksum is 32 bytes at offset 8-39
+        metadata_max_size = struct.unpack('<I', data[40:44])[0]
+        metadata_slot_count = struct.unpack('<I', data[44:48])[0]
+        logical_block_size = struct.unpack('<I', data[48:52])[0]
         
+        # Metadata starts after: primary geometry (4096) + backup geometry (4096) = offset 12288
+        # But we're already at offset 8192 after reading primary geometry
+        # So metadata is at: 4096 (start of geo) + 4096 (primary geo) + 4096 (backup geo) = 12288
         return {
             'metadata_max_size': metadata_max_size,
             'metadata_slot_count': metadata_slot_count,
             'logical_block_size': logical_block_size,
-            'metadata_offset': 4096 + 4096  # After geometry
+            'metadata_offset': 4096 + 4096 + 4096  # 12288 - after primary + backup geometry
         }
     
     def _read_metadata_header(self, f: BinaryIO) -> dict:
-        """Read LP metadata header."""
+        """Read LP metadata header.
+        
+        LpMetadataHeader structure:
+        - 0-3: magic (4 bytes) - 0x414C5030 "0PLA"
+        - 4-5: major_version (2 bytes)
+        - 6-7: minor_version (2 bytes)  
+        - 8-11: header_size (4 bytes)
+        - 12-43: header_checksum (32 bytes SHA-256)
+        - 44-47: tables_size (4 bytes)
+        - 48-79: tables_checksum (32 bytes SHA-256)
+        - 80-83: partitions.offset (4 bytes)
+        - 84-87: partitions.num_entries (4 bytes)
+        - 88-91: partitions.entry_size (4 bytes)
+        - 92-95: extents.offset (4 bytes)
+        - 96-99: extents.num_entries (4 bytes)
+        - 100-103: extents.entry_size (4 bytes)
+        - 104-107: groups.offset (4 bytes)
+        - 108-111: groups.num_entries (4 bytes)
+        - 112-115: groups.entry_size (4 bytes)
+        - 116-119: block_devices.offset (4 bytes)
+        - 120-123: block_devices.num_entries (4 bytes)
+        - 124-127: block_devices.entry_size (4 bytes)
+        """
         data = f.read(256)
         
         magic = struct.unpack('<I', data[:4])[0]
@@ -7292,17 +7771,20 @@ class SuperImageExtractor:
             raise PayloadError(f"Invalid LP metadata magic: {hex(magic)}")
         
         major, minor = struct.unpack('<HH', data[4:8])
-        header_size, header_checksum = struct.unpack('<II', data[8:16])
-        tables_size, tables_checksum = struct.unpack('<II', data[16:24])
+        header_size = struct.unpack('<I', data[8:12])[0]
+        # header_checksum is 32 bytes at offset 12-43
+        tables_size = struct.unpack('<I', data[44:48])[0]
+        # tables_checksum is 32 bytes at offset 48-79
         
+        # Table descriptors start at offset 80
         partitions_offset, partitions_count, partitions_entry_size = struct.unpack(
-            '<III', data[24:36]
+            '<III', data[80:92]
         )
         extents_offset, extents_count, extents_entry_size = struct.unpack(
-            '<III', data[36:48]
+            '<III', data[92:104]
         )
         groups_offset, groups_count, groups_entry_size = struct.unpack(
-            '<III', data[48:60]
+            '<III', data[104:116]
         )
         
         return {
@@ -7310,10 +7792,10 @@ class SuperImageExtractor:
             'minor': minor,
             'header_size': header_size,
             'tables_size': tables_size,
-            'partitions_offset': header_size,
+            'partitions_offset': partitions_offset,
             'partitions_count': partitions_count,
             'partitions_entry_size': partitions_entry_size,
-            'extents_offset': header_size + partitions_count * partitions_entry_size,
+            'extents_offset': extents_offset,
             'extents_count': extents_count,
             'extents_entry_size': extents_entry_size,
             'groups_offset': groups_offset,
@@ -8049,6 +8531,100 @@ def run_image_extract(args) -> None:
 # PLUGIN SYSTEM
 # =============================================================================
 
+# Required manifest.json fields in exact order
+MANIFEST_REQUIRED_FIELDS = [
+    "id",
+    "name", 
+    "version",
+    "description",
+    "author",
+    "icon",
+    "license_type",
+    "website",
+    "support_url",
+    "min_version",
+    "git_clone",
+    "requirements",
+    "bundled_binaries",
+    "setup_commands",
+    "enabled"
+]
+
+def validate_plugin_manifest(data: dict, plugin_id: str) -> tuple:
+    """Validate plugin manifest.json against required schema.
+    
+    Args:
+        data: The parsed manifest JSON data
+        plugin_id: The plugin folder name (should match manifest id)
+    
+    Returns:
+        tuple: (is_valid: bool, errors: list[str])
+    """
+    errors = []
+    
+    # Check for missing required fields
+    for field in MANIFEST_REQUIRED_FIELDS:
+        if field not in data:
+            errors.append(f"Missing required field: '{field}'")
+    
+    # Validate specific fields
+    if 'id' in data:
+        manifest_id = data['id']
+        if not isinstance(manifest_id, str) or not manifest_id:
+            errors.append("Field 'id' must be a non-empty string")
+        elif manifest_id != plugin_id:
+            errors.append(f"Manifest 'id' ({manifest_id}) must match plugin folder name ({plugin_id})")
+        elif not manifest_id[0].islower() or not all(c.islower() or c.isdigit() or c == '_' for c in manifest_id):
+            errors.append("Field 'id' must start with lowercase letter and contain only lowercase letters, numbers, underscores")
+    
+    if 'name' in data and (not isinstance(data['name'], str) or not data['name']):
+        errors.append("Field 'name' must be a non-empty string")
+    
+    if 'version' in data:
+        import re
+        if not isinstance(data['version'], str) or not re.match(r'^\d+\.\d+(\.\d+)?$', data['version']):
+            errors.append("Field 'version' must be in format X.Y or X.Y.Z (e.g., '1.0' or '1.0.0')")
+    
+    if 'description' in data and not isinstance(data['description'], str):
+        errors.append("Field 'description' must be a string")
+    
+    if 'author' in data and not isinstance(data['author'], str):
+        errors.append("Field 'author' must be a string")
+    
+    if 'icon' in data and not isinstance(data['icon'], str):
+        errors.append("Field 'icon' must be a string (emoji)")
+    
+    if 'license_type' in data:
+        valid_licenses = ['free', 'paid', 'donation']
+        if data['license_type'] not in valid_licenses:
+            errors.append(f"Field 'license_type' must be one of: {valid_licenses}")
+    
+    if 'website' in data and not isinstance(data['website'], str):
+        errors.append("Field 'website' must be a string (URL)")
+    
+    if 'support_url' in data and not isinstance(data['support_url'], str):
+        errors.append("Field 'support_url' must be a string (URL)")
+    
+    if 'min_version' in data and not isinstance(data['min_version'], str):
+        errors.append("Field 'min_version' must be a string (version)")
+    
+    if 'git_clone' in data and data['git_clone'] is not None and not isinstance(data['git_clone'], dict):
+        errors.append("Field 'git_clone' must be null or an object with 'repo' key")
+    
+    if 'requirements' in data and not isinstance(data['requirements'], list):
+        errors.append("Field 'requirements' must be an array of pip package names")
+    
+    if 'bundled_binaries' in data and not isinstance(data['bundled_binaries'], list):
+        errors.append("Field 'bundled_binaries' must be an array")
+    
+    if 'setup_commands' in data and not isinstance(data['setup_commands'], list):
+        errors.append("Field 'setup_commands' must be an array of command strings")
+    
+    if 'enabled' in data and not isinstance(data['enabled'], bool):
+        errors.append("Field 'enabled' must be a boolean (true/false)")
+    
+    return len(errors) == 0, errors
+
 @dataclass
 class PluginManifest:
     """Plugin metadata from manifest.json."""
@@ -8077,6 +8653,8 @@ class PluginManifest:
     # Setup commands to run after git clone and pip install (bash-compatible)
     setup_commands: List[str] = None
     post_install: List[Dict[str, Any]] = None  # Post-install steps [{"type": "driver", "file": "..."}, {"type": "git_clone", "repo": "..."}]
+    # Remote control
+    remote_capable: bool = False  # Whether plugin supports remote Host/Professional control
     # State
     enabled: bool = True
     licensed: bool = False  # For paid plugins
@@ -8114,6 +8692,7 @@ class PluginManifest:
             bundled_binaries=data.get('bundled_binaries', []),
             setup_commands=data.get('setup_commands', []),
             post_install=data.get('post_install', []),
+            remote_capable=data.get('remote_capable', False),
             enabled=data.get('enabled', True),
             licensed=data.get('licensed', False)
         )
@@ -8196,6 +8775,58 @@ class PluginBase:
         # Default: accept any non-empty key
         return bool(license_key and len(license_key) > 0)
 
+    # ── Remote Control (Host/Professional) ──────────────────────────────
+    # Override these in your plugin to support the Remote Play system.
+    # When a Host shares their device, the system calls these to discover
+    # what a Professional can do remotely.
+
+    def get_remote_operations(self) -> list:
+        """Return operations available for remote control by a Professional.
+        
+        Each operation is a dict with:
+            id:          str - operation identifier (e.g. 'read_imei')
+            name:        str - human-readable name (e.g. 'Read IMEI')
+            risk:        str - 'READ', 'MODIFY', or 'DANGER'
+            description: str - what this operation does
+            params:      list - required parameter names (empty if none)
+        
+        This is called dynamically - return only operations available RIGHT NOW
+        (e.g. based on device connection state, current mode, etc.).
+        
+        Returns:
+            list[dict]: Available operations, or empty list if none
+        """
+        return []
+
+    def get_command_prefixes(self) -> list:
+        """Return command prefixes this plugin handles in the master console.
+        
+        The Professional's master console auto-routes raw commands to the
+        correct plugin based on the first word. For example:
+            'adb devices'     → adb_toolkit handles it
+            'fastboot getvar' → fastboot_toolkit handles it  
+            'mtk read_imei'   → mtk_toolkit handles it
+        
+        Returns:
+            list[str]: Command prefixes (e.g. ['adb'], ['fastboot'], ['mtk'])
+        """
+        return []
+
+    def execute_raw_command(self, command: str, log_callback=None) -> dict:
+        """Execute a raw command string from the Professional's master console.
+        
+        The command string has the prefix already included (e.g. 'adb devices').
+        Stream output via log_callback(line: str) for real-time display.
+        
+        Args:
+            command:      The full command string typed by the Professional
+            log_callback: Optional callback(str) for streaming output lines
+        
+        Returns:
+            dict: {'success': bool, 'output': str, 'error': str or None}
+        """
+        return {'success': False, 'output': '', 'error': 'Raw commands not supported by this plugin'}
+
 
 class PluginManager:
     """Manages plugin discovery, loading, and lifecycle."""
@@ -8249,7 +8880,11 @@ class PluginManager:
             logger.warning(f"Failed to save plugin config: {e}")
     
     def discover_plugins(self) -> List[PluginManifest]:
-        """Discover all plugins in the plugins directory."""
+        """Discover all plugins in the plugins directory.
+        
+        Validates each manifest.json against the required schema.
+        Plugins with invalid manifests are skipped with a warning.
+        """
         plugins_dir = self._get_plugins_dir()
         discovered = []
         
@@ -8265,6 +8900,14 @@ class PluginManager:
                     with open(manifest_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
                     
+                    # Validate manifest against required schema
+                    is_valid, errors = validate_plugin_manifest(data, item)
+                    if not is_valid:
+                        logger.warning(f"Invalid manifest for plugin '{item}':")
+                        for error in errors:
+                            logger.warning(f"  - {error}")
+                        continue
+                    
                     manifest = PluginManifest.from_dict(data, item)
                     
                     # Apply saved config
@@ -8275,6 +8918,8 @@ class PluginManager:
                     self.manifests[item] = manifest
                     discovered.append(manifest)
                     
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid JSON in manifest for plugin '{item}': {e}")
                 except Exception as e:
                     logger.warning(f"Failed to load plugin manifest {item}: {e}")
         
@@ -8433,26 +9078,32 @@ class PluginManager:
                 # Ensure target directory exists
                 os.makedirs(target_dir, exist_ok=True)
                 
-                # Find Python interpreter
-                python_cmd = shutil.which('python') or shutil.which('python3') or shutil.which('py')
+                # Find Python interpreter - use embedded Python if available
+                python_cmd = _get_python_executable()
                 if not python_cmd:
                     return False, (
-                        "Python interpreter not found in PATH.\n\n"
-                        "Please install Python and ensure it's in your PATH, then try again.\n\n"
+                        "Python interpreter not found.\n\n"
+                        "The bundled Python was not found. Please reinstall Image Anarchy.\n\n"
                         f"You can try installing manually:\npip install --target \"{target_dir}\" {' '.join(requirements)}"
                     )
                 
                 # Install to local target directory so bundled Python can find them
-                cmd = [python_cmd, '-m', 'pip', 'install', '--target', target_dir, '--upgrade'] + requirements
+                # Use --no-cache-dir to avoid permission issues with pip cache
+                cmd = [python_cmd, '-m', 'pip', 'install', '--no-cache-dir', '--target', target_dir, '--upgrade'] + requirements
+                # Use clean environment to avoid interference from system Python
+                env = _get_clean_python_env()
             else:
                 # Running from source - install normally
-                cmd = [sys.executable, '-m', 'pip', 'install'] + requirements
+                # Use --no-cache-dir to avoid permission issues with pip cache
+                cmd = [sys.executable, '-m', 'pip', 'install', '--no-cache-dir'] + requirements
+                env = None  # Use default environment
             
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minute timeout
+                timeout=300,  # 5 minute timeout
+                env=env
             )
             
             if result.returncode == 0:
@@ -8659,8 +9310,9 @@ class PluginManager:
                             continue
                     
                     result = subprocess.run(
-                        [python_exe, '-m', 'pip', 'install', '-r', req_path],
-                        capture_output=True, text=True, timeout=600
+                        [python_exe, '-m', 'pip', 'install', '--no-cache-dir', '-r', req_path],
+                        capture_output=True, text=True, timeout=600,
+                        env=_get_clean_python_env()
                     )
                     
                     if result.returncode != 0:
@@ -8806,19 +9458,28 @@ class PluginManager:
         has_setup_commands = bool(manifest.setup_commands)
         has_post_install = bool(manifest.post_install)
         
+        # DEFERRED SETUP: setup_commands run on first plugin open, not during install
+        # This allows files to be fully extracted and paths to be validated
+        # Mark it as pending if there are setup_commands
+        if has_setup_commands:
+            if plugin_id not in self.config:
+                self.config[plugin_id] = {}
+            self.config[plugin_id]['setup_commands_pending'] = True
+            self._save_config()
+        
         # Calculate total phases and their weights for progress
         # Phase weights represent relative time/importance
+        # Note: setup_commands phase removed - runs on first open instead
         phases = []
         if has_git_clone:
-            phases.append(('git_clone', 25))
+            phases.append(('git_clone', 30))
         if has_binaries:
-            phases.append(('binaries', 15))
+            phases.append(('binaries', 20))
         if has_requirements:
-            phases.append(('pip_install', 30))
-        if has_setup_commands:
-            phases.append(('setup_commands', 25))
+            phases.append(('pip_install', 40))
+        # setup_commands deferred to first open
         if has_post_install:
-            phases.append(('post_install', 5))
+            phases.append(('post_install', 10))
         
         total_phases = len(phases)
         if total_phases == 0:
@@ -8990,73 +9651,13 @@ class PluginManager:
             phase_idx += 1
         
         # ═══════════════════════════════════════════════════════════════════════
-        # PHASE 4: Run setup commands (e.g., "pip install .")
+        # PHASE 4: Setup commands DEFERRED to first plugin open
+        # This allows git clone to complete fully and paths to be validated
+        # See run_deferred_setup_commands() which runs on _open_plugin()
         # ═══════════════════════════════════════════════════════════════════════
         if has_setup_commands:
-            phase_num += 1
-            phase_label = f"Step {phase_num}/{total_phases}: Running setup commands"
-            
-            for i, cmd in enumerate(manifest.setup_commands):
-                if not cmd or not isinstance(cmd, str):
-                    continue
-                
-                cmd_display = cmd[:40] + "..." if len(cmd) > 40 else cmd
-                sub_progress = i / len(manifest.setup_commands)
-                
-                if progress_callback:
-                    progress_callback(phase_label, f"Running: {cmd_display}", get_phase_progress(phase_idx, sub_progress))
-                
-                try:
-                    # Determine working directory
-                    run_cwd = plugin_dir
-                    if manifest.git_clone:
-                        target = manifest.git_clone.get('target', '')
-                        if target:
-                            potential_cwd = os.path.join(plugin_dir, target)
-                        else:
-                            repo = manifest.git_clone.get('repo', '')
-                            repo_name = repo.rstrip('/').split('/')[-1].replace('.git', '')
-                            potential_cwd = os.path.join(plugin_dir, repo_name)
-                        if os.path.exists(potential_cwd):
-                            run_cwd = potential_cwd
-                    
-                    # Handle pip install specially
-                    if os.name == 'nt' and 'pip install' in cmd.lower():
-                        python_exe = _get_python_executable()
-                        if python_exe and 'pip install .' in cmd:
-                            if getattr(sys, 'frozen', False):
-                                base_dir = os.path.dirname(sys.executable)
-                                target_dir = os.path.join(base_dir, 'plugin_packages')
-                                os.makedirs(target_dir, exist_ok=True)
-                                win_cmd = f'"{python_exe}" -m pip install --target "{target_dir}" .'
-                            else:
-                                win_cmd = f'"{python_exe}" -m pip install .'
-                        else:
-                            win_cmd = cmd
-                        
-                        result = subprocess.run(
-                            win_cmd, shell=True, capture_output=True, text=True,
-                            timeout=600, cwd=run_cwd
-                        )
-                    else:
-                        result = subprocess.run(
-                            cmd, shell=True, capture_output=True, text=True,
-                            timeout=300, cwd=run_cwd
-                        )
-                    
-                    if result.returncode != 0:
-                        stderr = result.stderr[:300] if result.stderr else "Unknown error"
-                        errors.append(f"Setup command failed: {cmd_display}\n{stderr}")
-                        
-                except subprocess.TimeoutExpired:
-                    errors.append(f"Setup command timed out: {cmd_display}")
-                except Exception as e:
-                    errors.append(f"Setup command error: {cmd_display}\n{str(e)}")
-            
             if progress_callback:
-                progress_callback(phase_label, "Setup commands complete ✓", get_phase_progress(phase_idx, 1.0))
-            
-            phase_idx += 1
+                progress_callback("Setup commands", "Deferred to first plugin launch ✓", get_phase_progress(phase_idx, 1.0))
         
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 5: Post-install (drivers, etc.) - runs last
@@ -9123,6 +9724,152 @@ class PluginManager:
             return True
         
         return False
+    
+    def has_pending_setup_commands(self, plugin_id: str) -> bool:
+        """Check if a plugin has deferred setup_commands that need to run."""
+        plugin_config = self.config.get(plugin_id, {})
+        return plugin_config.get('setup_commands_pending', False)
+    
+    def run_deferred_setup_commands(self, plugin_id: str, progress_callback=None) -> Tuple[bool, str]:
+        """Run deferred setup_commands for a plugin.
+        
+        This is called on first plugin open, after git clone and pip install have completed.
+        The deferred approach ensures all files are extracted and paths are validated.
+        
+        Args:
+            plugin_id: The plugin ID
+            progress_callback: Optional callback(step_name, status, progress_pct)
+            
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        plugins_dir = self._get_plugins_dir()
+        plugin_dir = os.path.join(plugins_dir, plugin_id)
+        
+        # Load manifest
+        manifest = self.manifests.get(plugin_id)
+        if not manifest:
+            manifest_path = os.path.join(plugin_dir, 'manifest.json')
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    manifest = PluginManifest.from_dict(data, plugin_id)
+                except Exception as e:
+                    return False, f"Failed to read manifest: {e}"
+            else:
+                return False, "manifest.json not found"
+        
+        if not manifest.setup_commands:
+            # No setup commands - mark as done
+            if plugin_id not in self.config:
+                self.config[plugin_id] = {}
+            self.config[plugin_id]['setup_commands_pending'] = False
+            self._save_config()
+            return True, "No setup commands to run"
+        
+        errors = []
+        total_cmds = len(manifest.setup_commands)
+        
+        for i, cmd in enumerate(manifest.setup_commands):
+            if not cmd or not isinstance(cmd, str):
+                continue
+            
+            cmd_display = cmd[:50] + "..." if len(cmd) > 50 else cmd
+            progress_pct = int((i / total_cmds) * 100)
+            
+            if progress_callback:
+                progress_callback(f"Setup ({i+1}/{total_cmds})", f"Running: {cmd_display}", progress_pct)
+            
+            try:
+                # Determine working directory - MUST be in git clone target for "pip install ."
+                run_cwd = plugin_dir
+                if manifest.git_clone:
+                    target = manifest.git_clone.get('target', '')
+                    if target:
+                        potential_cwd = os.path.join(plugin_dir, target)
+                    else:
+                        repo = manifest.git_clone.get('repo', '')
+                        repo_name = repo.rstrip('/').split('/')[-1].replace('.git', '')
+                        potential_cwd = os.path.join(plugin_dir, repo_name)
+                    
+                    # Verify the directory exists and has setup.py or pyproject.toml
+                    if os.path.exists(potential_cwd):
+                        run_cwd = potential_cwd
+                        # Log for debugging
+                        logger.info(f"Setup command cwd: {run_cwd}")
+                
+                # Handle pip commands specially
+                if 'pip install' in cmd.lower() or 'pip ' in cmd.lower():
+                    python_exe = _get_python_executable()
+                    if not python_exe:
+                        errors.append(f"Setup command failed: {cmd_display}\nBundled Python not found.")
+                        continue
+                    
+                    # Log the Python being used
+                    logger.info(f"Using Python: {python_exe}")
+                    
+                    if 'pip install .' in cmd.lower():
+                        # Verify we're in a directory with setup.py or pyproject.toml
+                        has_setup = os.path.exists(os.path.join(run_cwd, 'setup.py'))
+                        has_pyproject = os.path.exists(os.path.join(run_cwd, 'pyproject.toml'))
+                        
+                        if not has_setup and not has_pyproject:
+                            errors.append(f"Setup command failed: {cmd_display}\n"
+                                         f"No setup.py or pyproject.toml found in {run_cwd}")
+                            continue
+                        
+                        if getattr(sys, 'frozen', False):
+                            base_dir = os.path.dirname(sys.executable)
+                            target_dir = os.path.join(base_dir, 'plugin_packages')
+                            os.makedirs(target_dir, exist_ok=True)
+                            win_cmd = f'"{python_exe}" -m pip install --no-cache-dir --target "{target_dir}" .'
+                        else:
+                            win_cmd = f'"{python_exe}" -m pip install --no-cache-dir .'
+                    elif 'pip install' in cmd.lower():
+                        pip_args = cmd.lower().split('pip install', 1)[1].strip()
+                        win_cmd = f'"{python_exe}" -m pip install --no-cache-dir {pip_args}'
+                    else:
+                        pip_args = cmd.lower().split('pip ', 1)[1].strip()
+                        win_cmd = f'"{python_exe}" -m pip {pip_args}'
+                    
+                    logger.info(f"Running: {win_cmd} in {run_cwd}")
+                    
+                    result = subprocess.run(
+                        win_cmd, shell=True, capture_output=True, text=True,
+                        timeout=600, cwd=run_cwd,
+                        env=_get_clean_python_env()
+                    )
+                else:
+                    result = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True,
+                        timeout=300, cwd=run_cwd
+                    )
+                
+                if result.returncode != 0:
+                    stderr = result.stderr[:500] if result.stderr else "Unknown error"
+                    errors.append(f"Setup command failed: {cmd_display}\n{stderr}")
+                    logger.error(f"Setup command failed: {result.stderr}")
+                else:
+                    logger.info(f"Setup command succeeded: {cmd_display}")
+                    
+            except subprocess.TimeoutExpired:
+                errors.append(f"Setup command timed out: {cmd_display}")
+            except Exception as e:
+                errors.append(f"Setup command error: {cmd_display}\n{str(e)}")
+        
+        # Mark setup commands as completed
+        if plugin_id not in self.config:
+            self.config[plugin_id] = {}
+        self.config[plugin_id]['setup_commands_pending'] = False
+        self._save_config()
+        
+        if progress_callback:
+            progress_callback("Setup Complete", "All commands finished", 100)
+        
+        if errors:
+            return False, "\n".join(errors)
+        return True, "Setup commands completed successfully"
     
     def create_example_plugin(self):
         """Create a developer guide plugin to show how to create plugins."""
@@ -9433,6 +10180,15 @@ plugin_manager = PluginManager()
 def create_gui_app():
     """Create and return the GUI application. Imports PyQt6 only when needed."""
     
+    # IMPORTANT: Import QtWebEngineWidgets BEFORE QApplication is created
+    # This is required for QWebEngineView to work properly
+    try:
+        from PyQt6.QtWebEngineWidgets import QWebEngineView as _QWebEngineView
+        _webengine_available = True
+    except ImportError:
+        _QWebEngineView = None
+        _webengine_available = False
+    
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QLineEdit, QPushButton, QFileDialog, QListWidget,
@@ -9443,7 +10199,7 @@ def create_gui_app():
         QGridLayout, QDialog, QInputDialog, QSystemTrayIcon, QGraphicsOpacityEffect,
         QPlainTextEdit, QStackedWidget, QButtonGroup, QSizePolicy
     )
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QPoint, QEasingCurve, QMimeData
+    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QPoint, QEasingCurve, QMimeData, QUrl, QObject, QEvent
     from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor, QAction, QIcon, QPixmap, QPainter, QDrag
 
     # =========================================================================
@@ -9536,12 +10292,25 @@ def create_gui_app():
             self.setMinimumSize(650, 550)
             self.setModal(True)
             
+            # Flag to track if dialog is still open (prevents timer callbacks after close)
+            self._is_open = True
+            
             # Get app directory for drivers (handles frozen exe correctly)
             self.app_dir = Path(get_app_dir())
             self.drivers_dir = self.app_dir / "drivers"
             
             self._setup_ui()
             self._check_environment()
+        
+        def closeEvent(self, event):
+            """Handle dialog close - prevents timer callbacks from running."""
+            self._is_open = False
+            super().closeEvent(event)
+        
+        def done(self, result):
+            """Handle dialog done (accept/reject) - prevents timer callbacks."""
+            self._is_open = False
+            super().done(result)
         
         def _setup_ui(self):
             layout = QVBoxLayout(self)
@@ -9713,6 +10482,9 @@ def create_gui_app():
         
         def _check_windows_signing(self):
             """Check Windows BCD settings for driver signing."""
+            # Guard against callback after dialog is closed
+            if not self._is_open:
+                return
             try:
                 # Run bcdedit to get current settings
                 result = subprocess.run(
@@ -9772,8 +10544,11 @@ def create_gui_app():
                     # Use PowerShell Start-Process with -Verb RunAs for elevation
                     ps_command = f'Start-Process cmd -ArgumentList "/c {command}" -Verb RunAs -Wait'
                     subprocess.run(['powershell', '-Command', ps_command], check=False)
-                    # Refresh status after command
-                    QTimer.singleShot(1000, self._check_windows_signing)
+                    # Refresh status after command (only if dialog is still open)
+                    def delayed_check():
+                        if self._is_open:
+                            self._check_windows_signing()
+                    QTimer.singleShot(1000, delayed_check)
                     QMessageBox.information(self, "Command Executed", 
                         f"Command executed. A reboot may be required for changes to take effect.\n\n{command}")
             except Exception as e:
@@ -9791,7 +10566,11 @@ def create_gui_app():
                     combined = " && ".join(commands)
                     ps_command = f'Start-Process cmd -ArgumentList "/c {combined}" -Verb RunAs -Wait'
                     subprocess.run(['powershell', '-Command', ps_command], check=False)
-                    QTimer.singleShot(1000, self._check_windows_signing)
+                    # Refresh status after commands (only if dialog is still open)
+                    def delayed_check():
+                        if self._is_open:
+                            self._check_windows_signing()
+                    QTimer.singleShot(1000, delayed_check)
                     QMessageBox.information(self, "Commands Executed",
                         "All commands executed. A reboot is required for changes to take effect.")
             except Exception as e:
@@ -10116,11 +10895,52 @@ def create_gui_app():
     CF_ACCESS_CLIENT_SECRET = '408d77ac1dbffc080f79e88bbca96f983b88990c95a145321057e674283efa44'
 
     def get_cf_headers() -> dict:
-        """Get Cloudflare Zero Trust headers for API requests."""
+        """Get Cloudflare Zero Trust headers for API requests.
+        
+        Includes:
+        - CF-Access headers for Zero Trust authentication
+        - User-Agent header that passes Cloudflare WAF rules
+        """
         return {
             'CF-Access-Client-Id': CF_ACCESS_CLIENT_ID,
-            'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET
+            'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET,
+            'User-Agent': f'ImageAnarchy/{APP_VERSION}'
         }
+
+    # ── Remote Device Control Server ────────────────────────────────────────
+    # Separate CF tunnel for the remote control relay (Socket.IO on port 6001)
+    REMOTE_CTL_URL = os.environ.get('REMOTE_CTL_URL', 'https://remote.ctl.imageanarchy.com')
+    RC_CF_ACCESS_CLIENT_ID = '3f0cf6be40764d4c2824ab8797a10043.access'
+    RC_CF_ACCESS_CLIENT_SECRET = '6dc136a90dd50670cc2d39858f1b07145671207e0e67ee33c2bbedc6bf670dcc'
+
+    def get_rc_cf_headers() -> dict:
+        """Get Cloudflare headers for remote control server requests."""
+        return {
+            'CF-Access-Client-Id': RC_CF_ACCESS_CLIENT_ID,
+            'CF-Access-Client-Secret': RC_CF_ACCESS_CLIENT_SECRET,
+            'User-Agent': f'ImageAnarchy/{APP_VERSION}'
+        }
+
+    def get_http_requests():
+        """Get HTTP session with Cloudflare bypass support.
+        
+        Returns a Session with impersonate='chrome' for curl_cffi
+        (bypasses CF TLS fingerprinting), or a plain requests.Session
+        as fallback.
+        
+        Returns:
+            Session object with .get()/.post()/.delete()/.put() methods,
+            or None if neither library is available
+        """
+        try:
+            from curl_cffi import requests as curl_requests
+            return curl_requests.Session(impersonate='chrome')
+        except ImportError:
+            try:
+                import requests
+                return requests.Session()
+            except ImportError:
+                return None
 
     class UpdateChecker(QThread):
         """Background thread to check for application updates."""
@@ -10130,8 +10950,9 @@ def create_gui_app():
         download_complete = pyqtSignal(str)  # Emits path to downloaded file
         download_failed = pyqtSignal(str)  # Emits error message
 
-        def __init__(self, parent=None, download_path: str = None):
-            super().__init__(parent)
+        def __init__(self, download_path: str = None):
+            # IMPORTANT: Don't pass parent to QThread - causes threading errors
+            super().__init__()
             self.download_path = download_path
             self._download_mode = False
             self._download_version = None
@@ -10146,23 +10967,19 @@ def create_gui_app():
         def _check_for_update(self):
             """Check server for available updates."""
             try:
-                import urllib.request
-                import ssl
-
-                # Create SSL context that accepts certificates
-                ctx = ssl.create_default_context()
+                from curl_cffi import requests as cffi_requests
 
                 url = f"{PLUGIN_STORE_URL}/api/updates/check?current_version={APP_VERSION}&platform=windows"
-                headers = {'User-Agent': 'ImageAnarchy/' + APP_VERSION}
-                headers.update(get_cf_headers())  # Add Cloudflare Zero Trust headers
-                req = urllib.request.Request(url, headers=headers)
+                headers = get_cf_headers()
 
-                with urllib.request.urlopen(req, timeout=10, context=ctx) as response:
-                    data = json.loads(response.read().decode('utf-8'))
+                session = cffi_requests.Session(impersonate='chrome')
+                resp = session.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
 
-                    if data.get('update_available'):
-                        self.update_available.emit(data)
-                    # If no update, signal nothing (silent check)
+                if data.get('update_available'):
+                    self.update_available.emit(data)
+                # If no update, signal nothing (silent check)
 
             except Exception as e:
                 # Silent failure for update checks - don't bother user
@@ -10178,31 +10995,28 @@ def create_gui_app():
         def _download_update(self):
             """Download the update file with progress reporting."""
             try:
-                import urllib.request
-                import ssl
-
-                ctx = ssl.create_default_context()
+                from curl_cffi import requests as cffi_requests
 
                 url = f"{PLUGIN_STORE_URL}/api/updates/download/{self._download_version}"
-                headers = {'User-Agent': 'ImageAnarchy/' + APP_VERSION}
-                headers.update(get_cf_headers())  # Add Cloudflare Zero Trust headers
-                req = urllib.request.Request(url, headers=headers)
+                headers = get_cf_headers()
 
-                with urllib.request.urlopen(req, timeout=300, context=ctx) as response:
-                    total_size = int(response.headers.get('content-length', 0))
-                    downloaded = 0
-                    chunk_size = 65536  # 64KB chunks
+                session = cffi_requests.Session(impersonate='chrome')
+                # Stream the download for progress reporting
+                resp = session.get(url, headers=headers, timeout=300, stream=True)
+                resp.raise_for_status()
 
-                    with open(self.download_path, 'wb') as f:
-                        while True:
-                            chunk = response.read(chunk_size)
-                            if not chunk:
-                                break
+                total_size = int(resp.headers.get('content-length', 0))
+                downloaded = 0
+                chunk_size = 65536  # 64KB chunks
+
+                with open(self.download_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
                             self.download_progress.emit(downloaded, total_size)
 
-                    self.download_complete.emit(self.download_path)
+                self.download_complete.emit(self.download_path)
 
             except Exception as e:
                 self.download_failed.emit(str(e))
@@ -10565,14 +11379,21 @@ def create_gui_app():
             self._setup_system_tray()
             self._setup_drag_drop()
 
-            # Check for updates on startup (non-blocking)
-            self._check_for_updates()
+            # Check for updates on startup (non-blocking, deferred to allow window to fully initialize)
+            QTimer.singleShot(500, self._check_for_updates)
 
         def _check_for_updates(self):
             """Check for application updates in background."""
-            self.update_checker = UpdateChecker(self)
+            self.update_checker = UpdateChecker()
             self.update_checker.update_available.connect(self._on_update_available)
+            self.update_checker.finished.connect(self._on_update_check_finished)
             self.update_checker.start()
+
+        def _on_update_check_finished(self):
+            """Clean up update checker thread when finished."""
+            if self.update_checker:
+                self.update_checker.deleteLater()
+                self.update_checker = None
 
         def _on_update_available(self, update_info: dict):
             """Show update dialog when update is available."""
@@ -10762,8 +11583,8 @@ def create_gui_app():
         
         def _setup_ui(self):
             self.setWindowTitle(f"Image Anarchy {APP_VERSION} - Android Image Swiss Army Knife")
-            self.setMinimumSize(1100, 800)
-            self.resize(1200, 900)
+            self.setMinimumSize(1280, 900)
+            self.resize(1400, 1000)
             
             central = QWidget()
             self.setCentralWidget(central)
@@ -11317,7 +12138,17 @@ def create_gui_app():
             # TAB 4: IMAGE REPACK
             # =============================================================
             repack_img_tab = QWidget()
-            repack_img_layout = QVBoxLayout(repack_img_tab)
+            repack_img_outer_layout = QVBoxLayout(repack_img_tab)
+            repack_img_outer_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Wrap in scroll area for 1080p compatibility
+            repack_scroll = QScrollArea()
+            repack_scroll.setWidgetResizable(True)
+            repack_scroll.setStyleSheet("QScrollArea { border: none; }")
+            
+            repack_scroll_content = QWidget()
+            repack_img_layout = QVBoxLayout(repack_scroll_content)
+            repack_img_layout.setContentsMargins(10, 10, 10, 10)
             
             # Repack type selector
             repack_type_group = QGroupBox("Image Type to Create")
@@ -11797,6 +12628,10 @@ def create_gui_app():
             self.repack_img_btn.clicked.connect(self._start_image_repack)
             repack_action_layout.addWidget(self.repack_img_btn)
             repack_img_layout.addLayout(repack_action_layout)
+            
+            # Finalize scroll area
+            repack_scroll.setWidget(repack_scroll_content)
+            repack_img_outer_layout.addWidget(repack_scroll)
             
             self.tab_widget.addTab(repack_img_tab, "🔨 Image Repack")
             
@@ -14961,6 +15796,46 @@ def create_gui_app():
             except Exception as e:
                 self.finished.emit({'error': str(e)})
 
+    class StoreRefreshThread(QThread):
+        """Thread for refreshing store plugins without blocking the UI."""
+        
+        finished = pyqtSignal(list)  # Emits plugin list
+        error = pyqtSignal(str)      # Emits error message
+        
+        def __init__(self, api):
+            super().__init__()
+            self.api = api
+        
+        def run(self):
+            try:
+                plugins = self.api.get_plugins()
+                self.finished.emit(plugins if plugins else [])
+            except Exception as e:
+                self.error.emit(str(e))
+
+    class AdminApiThread(QThread):
+        """Thread for admin API calls without blocking the UI."""
+        
+        finished = pyqtSignal(dict)  # Emits result dict
+        
+        def __init__(self, api, method: str, *args):
+            super().__init__()
+            self.api = api
+            self.method = method
+            self.args = args
+        
+        def run(self):
+            try:
+                # Call the appropriate API method
+                api_method = getattr(self.api, self.method, None)
+                if api_method:
+                    result = api_method(*self.args)
+                    self.finished.emit(result)
+                else:
+                    self.finished.emit({'error': f'Unknown API method: {self.method}'})
+            except Exception as e:
+                self.finished.emit({'error': str(e)})
+
     class ImageExtractThread(QThread):
         """Thread for extracting Android images without blocking the UI."""
         
@@ -14976,7 +15851,7 @@ def create_gui_app():
                      signing_options: Optional[dict] = None):
             super().__init__()
             self.image_path = image_path
-            self.output_dir = output_dir
+            self.base_output_dir = output_dir
             self.image_info = image_info
             self.selected_items = selected_items
             self.convert_sparse = convert_sparse
@@ -14986,6 +15861,10 @@ def create_gui_app():
             self.reset_flags = reset_flags
             self.signing_options = signing_options
             self._cancelled = False
+            
+            # Create image-specific subfolder (e.g., extracted_images/boot/ for boot.img)
+            image_name = Path(image_path).stem  # Get filename without extension
+            self.output_dir = str(Path(output_dir) / image_name)
         
         def cancel(self):
             self._cancelled = True
@@ -14994,9 +15873,10 @@ def create_gui_app():
             try:
                 Path(self.output_dir).mkdir(parents=True, exist_ok=True)
                 image_type = self.image_info.get('type', 'raw')
-                total = len(self.selected_items)
+                image_name = Path(self.image_path).name
                 
-                self.log.emit(f"Extracting {total} item(s) from {image_type} image...")
+                self.log.emit(f"Extracting {image_name} ({image_type} image)...")
+                self.log.emit(f"Output folder: {self.output_dir}")
                 
                 if image_type == 'sparse':
                     self._extract_sparse()
@@ -15018,6 +15898,8 @@ def create_gui_app():
                     self._extract_vbmeta()
                 elif image_type == 'bootloader':
                     self._extract_bootloader()
+                elif image_type == 'nvram':
+                    self._copy_nvram()
                 else:
                     self._copy_raw()
                 
@@ -15372,13 +16254,24 @@ def create_gui_app():
                         output_name = Path(self.image_path).stem + "_patched.img"
                         output_path = Path(self.output_dir) / output_name
                         
-                        patch_success = patcher.patch(
+                        patch_result = patcher.patch(
                             str(output_path),
                             disable_verity=self.disable_verity,
                             disable_verification=self.disable_verification,
                             reset_flags=self.reset_flags,
                             signer=signer
                         )
+                        
+                        # Handle tuple return (success, message)
+                        if isinstance(patch_result, tuple):
+                            patch_success, patch_message = patch_result
+                        else:
+                            # Backward compatibility
+                            patch_success = patch_result
+                            patch_message = ""
+                        
+                        if patch_message:
+                            self.log.emit(f"\n{patch_message}")
                         
                         if patch_success:
                             self.log.emit(f"\n✅ Patched vbmeta saved to: {output_name}")
@@ -15408,7 +16301,8 @@ def create_gui_app():
                             else:
                                 self.log.emit("\n⚠️ Warning: The patched vbmeta signature is now invalid.")
                                 self.log.emit("   Your bootloader must be UNLOCKED to use this image.")
-                        else:
+                        elif not patch_message:
+                            # Only show generic failure if no specific message was provided
                             self.log.emit("❌ Failed to patch vbmeta")
                 else:
                     self.log.emit("Failed to parse vbmeta")
@@ -15468,28 +16362,645 @@ def create_gui_app():
                 self.log.emit(f"  Error: {e}")
                 raise
         
-        def _copy_raw(self):
+        def _copy_nvram(self):
+            """Parse and extract NVRAM/calibration partition with deep analysis."""
             import shutil
+            import re
             
             src_path = Path(self.image_path).resolve()
-            dst_path = (Path(self.output_dir) / Path(self.image_path).name).resolve()
             
-            # Check if source and destination are the same
-            if src_path == dst_path:
-                self.log.emit(f"Image is already in output directory: {src_path}")
-                self.log.emit("No extraction needed - this appears to be a raw/proprietary image format.")
-                self.progress.emit(1, 1, "Complete (no action needed)")
-                return
+            self.progress.emit(0, 100, "Analyzing NVRAM partition...")
+            self.log.emit("📱 NVRAM/Calibration Partition Analysis")
+            self.log.emit("━" * 50)
             
-            self.progress.emit(0, 1, "Copying raw image...")
-            self.log.emit(f"Raw/proprietary image format detected.")
-            self.log.emit(f"This image type cannot be further extracted (modem, firmware, etc.)")
-            self.log.emit(f"Copying to output directory...")
+            # Get file size
+            file_size = os.path.getsize(self.image_path)
+            self.log.emit(f"📦 Size: {file_size:,} bytes ({file_size / 1024:.1f} KB)")
             
-            shutil.copy2(self.image_path, dst_path)
+            # Read the entire file for analysis
+            with open(self.image_path, 'rb') as f:
+                data = f.read()
             
-            self.log.emit(f"Copied to: {dst_path}")
-            self.progress.emit(1, 1, "Copy complete")
+            self.progress.emit(10, 100, "Extracting strings...")
+            
+            # Create output directory structure
+            output_base = Path(self.output_dir)
+            output_base.mkdir(parents=True, exist_ok=True)
+            
+            extracted_items = []
+            
+            # ===== 1. EXTRACT READABLE STRINGS =====
+            self.log.emit("\n🔤 Extracting readable strings...")
+            strings_found = []
+            
+            # Find ASCII strings (4+ chars)
+            ascii_pattern = rb'[\x20-\x7e]{4,}'
+            for match in re.finditer(ascii_pattern, data):
+                s = match.group().decode('ascii', errors='ignore')
+                if len(s) >= 4:
+                    strings_found.append((match.start(), s))
+            
+            # Save strings to file
+            if strings_found:
+                strings_file = output_base / "strings.txt"
+                with open(strings_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# Strings extracted from {Path(self.image_path).name}\n")
+                    f.write(f"# Total: {len(strings_found)} strings\n\n")
+                    for offset, s in strings_found:
+                        f.write(f"0x{offset:08X}: {s}\n")
+                self.log.emit(f"  ✓ Found {len(strings_found)} strings → strings.txt")
+                extracted_items.append(("strings.txt", len(strings_found)))
+            
+            self.progress.emit(25, 100, "Scanning for MAC addresses...")
+            
+            # ===== 2. FIND MAC ADDRESSES =====
+            self.log.emit("\n📡 Scanning for MAC addresses...")
+            mac_addresses = []
+            
+            # Look for 6-byte sequences that could be MACs
+            for i in range(len(data) - 6):
+                # Check if it looks like a valid MAC (not all zeros or all FF)
+                mac_bytes = data[i:i+6]
+                if mac_bytes != b'\x00\x00\x00\x00\x00\x00' and mac_bytes != b'\xff\xff\xff\xff\xff\xff':
+                    # Check if first byte indicates a known vendor or has proper structure
+                    # MAC first byte LSB=0 for unicast, bit1 indicates local/global
+                    first_byte = mac_bytes[0]
+                    # Skip obviously invalid (like ASCII text)
+                    if not all(32 <= b <= 126 for b in mac_bytes):
+                        # Check for common patterns (MediaTek, Qualcomm, etc.)
+                        mac_str = ':'.join(f'{b:02X}' for b in mac_bytes)
+                        # Look for context clues nearby
+                        context_start = max(0, i - 20)
+                        context = data[context_start:i+26].lower()
+                        if b'wifi' in context or b'wlan' in context or b'bt' in context or b'bluetooth' in context or b'mac' in context:
+                            mac_addresses.append((i, mac_str, "contextual"))
+                        # Also check for known OUI prefixes
+                        elif mac_bytes[:3] in [b'\x00\x0c\xe7', b'\x94\x65\x2d', b'\xf8\x0f\x6f',  # MTK
+                                                b'\x00\x26\x08', b'\xc0\xee\xfb',  # Samsung
+                                                b'\x00\x1e\x3d', b'\x40\x4e\x36']:  # Common
+                            mac_addresses.append((i, mac_str, "known OUI"))
+            
+            if mac_addresses:
+                macs_file = output_base / "mac_addresses.txt"
+                with open(macs_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# Potential MAC addresses from {Path(self.image_path).name}\n\n")
+                    for offset, mac, reason in mac_addresses[:50]:  # Limit to 50
+                        f.write(f"0x{offset:08X}: {mac} ({reason})\n")
+                self.log.emit(f"  ✓ Found {len(mac_addresses)} potential MACs → mac_addresses.txt")
+                extracted_items.append(("mac_addresses.txt", len(mac_addresses)))
+            
+            self.progress.emit(40, 100, "Looking for IMEI patterns...")
+            
+            # ===== 3. FIND IMEI PATTERNS =====
+            self.log.emit("\n📱 Scanning for IMEI patterns...")
+            imei_patterns = []
+            
+            # IMEI is 15 digits, often stored as ASCII or BCD
+            # ASCII IMEI pattern
+            imei_ascii = re.findall(rb'[0-9]{15}', data)
+            for imei in imei_ascii:
+                imei_str = imei.decode('ascii')
+                # Validate with Luhn checksum
+                if self._validate_imei(imei_str):
+                    offset = data.find(imei)
+                    imei_patterns.append((offset, imei_str, "ASCII (valid Luhn)"))
+            
+            # BCD encoded IMEI (common in NVRAM)
+            for i in range(len(data) - 8):
+                bcd_bytes = data[i:i+8]
+                # Try to decode as BCD
+                try:
+                    imei_str = ''.join(f'{b:02X}' for b in bcd_bytes)[:15]
+                    if imei_str.isdigit() and self._validate_imei(imei_str):
+                        imei_patterns.append((i, imei_str, "BCD encoded"))
+                except:
+                    pass
+            
+            if imei_patterns:
+                imei_file = output_base / "imei_candidates.txt"
+                with open(imei_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# Potential IMEI numbers from {Path(self.image_path).name}\n")
+                    f.write("# ⚠️ These are candidates - verify manually\n\n")
+                    seen = set()
+                    for offset, imei, method in imei_patterns:
+                        if imei not in seen:
+                            f.write(f"0x{offset:08X}: {imei} ({method})\n")
+                            seen.add(imei)
+                self.log.emit(f"  ✓ Found {len(set(p[1] for p in imei_patterns))} IMEI candidates → imei_candidates.txt")
+                extracted_items.append(("imei_candidates.txt", len(imei_patterns)))
+            
+            self.progress.emit(55, 100, "Parsing MTK NVRAM structure...")
+            
+            # ===== 4. PARSE MTK NVRAM STRUCTURE =====
+            self.log.emit("\n🔧 Parsing MTK NVRAM structure...")
+            nvram_items = self._parse_mtk_nvram(data, output_base)
+            if nvram_items:
+                self.log.emit(f"  ✓ Extracted {len(nvram_items)} NVRAM items")
+                extracted_items.extend(nvram_items)
+            
+            self.progress.emit(70, 100, "Creating hex dump...")
+            
+            # ===== 5. HEX DUMP =====
+            self.log.emit("\n📋 Creating hex dump...")
+            hex_file = output_base / "hexdump.txt"
+            with open(hex_file, 'w', encoding='utf-8') as f:
+                f.write(f"# Hex dump of {Path(self.image_path).name}\n")
+                f.write(f"# Size: {file_size:,} bytes\n\n")
+                
+                # Dump first 4KB in detail
+                for i in range(0, min(4096, len(data)), 16):
+                    hex_part = ' '.join(f'{b:02X}' for b in data[i:i+16])
+                    ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+                    f.write(f"{i:08X}  {hex_part:<48}  |{ascii_part}|\n")
+                
+                if len(data) > 4096:
+                    f.write(f"\n... ({len(data) - 4096} more bytes) ...\n")
+                    f.write(f"\n# Last 1KB:\n")
+                    start = len(data) - 1024
+                    for i in range(start, len(data), 16):
+                        hex_part = ' '.join(f'{b:02X}' for b in data[i:i+16])
+                        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+                        f.write(f"{i:08X}  {hex_part:<48}  |{ascii_part}|\n")
+            
+            self.log.emit(f"  ✓ Created hex dump → hexdump.txt")
+            extracted_items.append(("hexdump.txt", 1))
+            
+            self.progress.emit(85, 100, "Copying original...")
+            
+            # ===== 6. COPY ORIGINAL =====
+            dst_path = output_base / Path(self.image_path).name
+            if src_path != dst_path:
+                shutil.copy2(self.image_path, dst_path)
+                self.log.emit(f"\n📦 Original saved → {dst_path.name}")
+            
+            self.progress.emit(95, 100, "Generating report...")
+            
+            # ===== 7. SUMMARY REPORT =====
+            report_file = output_base / "analysis_report.txt"
+            with open(report_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 60 + "\n")
+                f.write("NVRAM PARTITION ANALYSIS REPORT\n")
+                f.write("=" * 60 + "\n\n")
+                f.write(f"Source: {self.image_path}\n")
+                f.write(f"Size: {file_size:,} bytes\n")
+                f.write(f"Extracted items: {len(extracted_items)}\n\n")
+                
+                f.write("Files created:\n")
+                for name, count in extracted_items:
+                    f.write(f"  • {name}: {count} items\n")
+                
+                f.write("\n" + "=" * 60 + "\n")
+                f.write("NOTES:\n")
+                f.write("=" * 60 + "\n")
+                f.write("• NVRAM contains device-specific calibration data\n")
+                f.write("• MAC addresses and IMEI are often encrypted/encoded\n")
+                f.write("• Use mtkclient for proper NVRAM read/write operations\n")
+                f.write("• Backup is crucial - NVRAM corruption can brick device\n")
+            
+            self.log.emit(f"\n📊 Analysis report → analysis_report.txt")
+            
+            # Final summary
+            self.log.emit("\n" + "━" * 50)
+            self.log.emit(f"✅ Extracted {len(extracted_items)} items to {output_base}")
+            self.log.emit("━" * 50)
+            
+            self.progress.emit(100, 100, "NVRAM analysis complete")
+        
+        def _validate_imei(self, imei: str) -> bool:
+            """Validate IMEI using Luhn checksum."""
+            if len(imei) != 15 or not imei.isdigit():
+                return False
+            
+            total = 0
+            for i, digit in enumerate(imei[:-1]):
+                d = int(digit)
+                if i % 2 == 1:
+                    d *= 2
+                    if d > 9:
+                        d -= 9
+                total += d
+            
+            check = (10 - (total % 10)) % 10
+            return check == int(imei[-1])
+        
+        def _parse_mtk_nvram(self, data: bytes, output_dir: Path) -> list:
+            """Parse MediaTek NVRAM binary structure."""
+            items = []
+            nvram_dir = output_dir / "nvram_items"
+            
+            try:
+                # MTK NVRAM has various structures depending on chip/version
+                # Common patterns to look for:
+                
+                # 1. Look for file list markers (FILELIST)
+                filelist_offset = data.find(b'FILELIST')
+                if filelist_offset >= 0:
+                    nvram_dir.mkdir(parents=True, exist_ok=True)
+                    # Extract the file list region
+                    filelist_data = data[filelist_offset:filelist_offset+4096]
+                    fl_file = nvram_dir / "FILELIST.bin"
+                    with open(fl_file, 'wb') as f:
+                        f.write(filelist_data)
+                    items.append(("nvram_items/FILELIST.bin", 1))
+                    self.log.emit(f"    Found FILELIST at 0x{filelist_offset:X}")
+                
+                # 2. Look for NVD (NV Data) markers
+                nvd_markers = [b'NVD_IMEI', b'NVD_DATA', b'CALIBRAT', b'APCFG']
+                for marker in nvd_markers:
+                    offset = 0
+                    while True:
+                        pos = data.find(marker, offset)
+                        if pos < 0:
+                            break
+                        
+                        nvram_dir.mkdir(parents=True, exist_ok=True)
+                        # Extract region around marker
+                        region_start = pos
+                        region_end = min(pos + 512, len(data))
+                        region_data = data[region_start:region_end]
+                        
+                        marker_name = marker.decode('ascii', errors='ignore')
+                        region_file = nvram_dir / f"{marker_name}_0x{pos:X}.bin"
+                        with open(region_file, 'wb') as f:
+                            f.write(region_data)
+                        items.append((f"nvram_items/{region_file.name}", 1))
+                        self.log.emit(f"    Found {marker_name} at 0x{pos:X}")
+                        
+                        offset = pos + len(marker)
+                
+                # 3. Look for common MTK partition headers
+                # MTK uses 4-byte magic + size + data pattern in some cases
+                i = 0
+                chunk_count = 0
+                while i < len(data) - 8 and chunk_count < 100:
+                    # Check for potential header pattern
+                    # Many MTK NVRAM items have: [2-byte ID][2-byte size][data]
+                    if i + 4 < len(data):
+                        potential_size = struct.unpack('<H', data[i+2:i+4])[0]
+                        # Valid if size is reasonable (1 to 64KB) and doesn't overflow
+                        if 1 < potential_size < 65536 and i + 4 + potential_size <= len(data):
+                            item_id = struct.unpack('<H', data[i:i+2])[0]
+                            # Check if this looks like a valid item (not all zeros/FF)
+                            item_data = data[i+4:i+4+potential_size]
+                            if item_data and item_data != b'\x00' * potential_size and item_data != b'\xff' * potential_size:
+                                # Check if it contains any non-null data
+                                if any(b != 0 and b != 0xff for b in item_data[:min(32, len(item_data))]):
+                                    nvram_dir.mkdir(parents=True, exist_ok=True)
+                                    item_file = nvram_dir / f"item_{item_id:04X}_0x{i:X}.bin"
+                                    with open(item_file, 'wb') as f:
+                                        f.write(item_data)
+                                    items.append((f"nvram_items/{item_file.name}", potential_size))
+                                    chunk_count += 1
+                                    i += 4 + potential_size
+                                    continue
+                    i += 1
+                
+                if chunk_count > 0:
+                    self.log.emit(f"    Extracted {chunk_count} data chunks")
+                    
+            except Exception as e:
+                self.log.emit(f"    Warning: MTK parse error: {e}")
+            
+            return items
+        
+        def _copy_raw(self):
+            """Analyze and extract data from raw/proprietary partition images."""
+            import shutil
+            import re
+            
+            src_path = Path(self.image_path).resolve()
+            partition_name = Path(self.image_path).stem
+            
+            self.progress.emit(0, 100, "Analyzing raw partition...")
+            self.log.emit(f"🔍 Raw Partition Analysis: {partition_name}")
+            self.log.emit("━" * 50)
+            
+            # Get file size
+            file_size = os.path.getsize(self.image_path)
+            self.log.emit(f"📦 Size: {file_size:,} bytes ({file_size / 1024 / 1024:.2f} MB)")
+            
+            # Read file for analysis (limit to 100MB for memory safety)
+            max_read = min(file_size, 100 * 1024 * 1024)
+            with open(self.image_path, 'rb') as f:
+                data = f.read(max_read)
+            
+            # Create output directory
+            output_base = Path(self.output_dir)
+            output_base.mkdir(parents=True, exist_ok=True)
+            
+            extracted_items = []
+            
+            # ===== 1. MAGIC BYTE ANALYSIS =====
+            self.progress.emit(5, 100, "Detecting structure...")
+            self.log.emit("\n🔬 Header Analysis:")
+            
+            header = data[:64]
+            magic_hex = ' '.join(f'{b:02X}' for b in header[:16])
+            self.log.emit(f"  First 16 bytes: {magic_hex}")
+            
+            # Try to identify known structures
+            detected_type = self._detect_raw_structure(data[:4096])
+            if detected_type:
+                self.log.emit(f"  Detected: {detected_type}")
+            
+            # ===== 2. ENTROPY ANALYSIS =====
+            self.progress.emit(10, 100, "Analyzing entropy...")
+            entropy = self._calculate_entropy(data[:65536] if len(data) > 65536 else data)
+            self.log.emit(f"\n📊 Entropy: {entropy:.2f}/8.00")
+            if entropy > 7.5:
+                self.log.emit("  ⚠️ High entropy - likely encrypted or compressed")
+            elif entropy > 6.0:
+                self.log.emit("  📦 Moderate entropy - may be compressed data")
+            else:
+                self.log.emit("  📝 Low entropy - likely contains readable data")
+            
+            # ===== 3. STRING EXTRACTION =====
+            self.progress.emit(20, 100, "Extracting strings...")
+            self.log.emit("\n🔤 Extracting strings...")
+            
+            strings_found = []
+            ascii_pattern = rb'[\x20-\x7e]{4,}'
+            for match in re.finditer(ascii_pattern, data):
+                s = match.group().decode('ascii', errors='ignore')
+                if len(s) >= 4:
+                    strings_found.append((match.start(), s))
+            
+            if strings_found:
+                strings_file = output_base / "strings.txt"
+                with open(strings_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# Strings from {partition_name}\n")
+                    f.write(f"# Total: {len(strings_found)}\n\n")
+                    for offset, s in strings_found:
+                        f.write(f"0x{offset:08X}: {s}\n")
+                self.log.emit(f"  ✓ {len(strings_found)} strings → strings.txt")
+                extracted_items.append(("strings.txt", len(strings_found)))
+                
+                # Show interesting strings
+                interesting = [s for _, s in strings_found if any(kw in s.lower() for kw in 
+                    ['version', 'build', 'android', 'linux', 'qualcomm', 'mtk', 'error', 'copyright'])]
+                if interesting[:5]:
+                    self.log.emit("  Interesting strings found:")
+                    for s in interesting[:5]:
+                        self.log.emit(f"    • {s[:60]}{'...' if len(s) > 60 else ''}")
+            
+            # ===== 4. PATTERN SCANNING =====
+            self.progress.emit(40, 100, "Scanning for patterns...")
+            self.log.emit("\n🎯 Pattern scanning...")
+            
+            # Look for embedded files by magic
+            embedded = self._find_embedded_files(data, output_base)
+            if embedded:
+                for name, count in embedded:
+                    extracted_items.append((name, count))
+            
+            # ===== 5. DATA SECTIONS =====
+            self.progress.emit(60, 100, "Finding data sections...")
+            self.log.emit("\n📁 Data sections:")
+            
+            sections = self._find_data_sections(data)
+            if sections:
+                sections_file = output_base / "sections.txt"
+                with open(sections_file, 'w', encoding='utf-8') as f:
+                    f.write(f"# Data sections in {partition_name}\n\n")
+                    for sec_type, start, end, desc in sections:
+                        f.write(f"0x{start:08X} - 0x{end:08X}: {sec_type} ({desc})\n")
+                        self.log.emit(f"  • 0x{start:08X}: {sec_type} - {desc}")
+                extracted_items.append(("sections.txt", len(sections)))
+            else:
+                self.log.emit("  No distinct sections found")
+            
+            # ===== 6. HEX DUMP =====
+            self.progress.emit(75, 100, "Creating hex dump...")
+            self.log.emit("\n📋 Creating hex dump...")
+            
+            hex_file = output_base / "hexdump.txt"
+            with open(hex_file, 'w', encoding='utf-8') as f:
+                f.write(f"# Hex dump: {partition_name}\n")
+                f.write(f"# Size: {file_size:,} bytes\n\n")
+                
+                # First 8KB
+                dump_size = min(8192, len(data))
+                for i in range(0, dump_size, 16):
+                    hex_part = ' '.join(f'{b:02X}' for b in data[i:i+16])
+                    ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+                    f.write(f"{i:08X}  {hex_part:<48}  |{ascii_part}|\n")
+                
+                if len(data) > 8192:
+                    f.write(f"\n... middle omitted ...\n\n")
+                    # Last 2KB
+                    start = len(data) - 2048
+                    for i in range(start, len(data), 16):
+                        hex_part = ' '.join(f'{b:02X}' for b in data[i:i+16])
+                        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+                        f.write(f"{i:08X}  {hex_part:<48}  |{ascii_part}|\n")
+            
+            self.log.emit(f"  ✓ hexdump.txt")
+            extracted_items.append(("hexdump.txt", 1))
+            
+            # ===== 7. COPY ORIGINAL =====
+            self.progress.emit(90, 100, "Copying original...")
+            dst_path = output_base / Path(self.image_path).name
+            if src_path != dst_path:
+                shutil.copy2(self.image_path, dst_path)
+                self.log.emit(f"\n📦 Original saved → {dst_path.name}")
+            
+            # ===== 8. REPORT =====
+            self.progress.emit(95, 100, "Generating report...")
+            report_file = output_base / "analysis_report.txt"
+            with open(report_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 60 + "\n")
+                f.write(f"RAW PARTITION ANALYSIS: {partition_name}\n")
+                f.write("=" * 60 + "\n\n")
+                f.write(f"Source: {self.image_path}\n")
+                f.write(f"Size: {file_size:,} bytes\n")
+                f.write(f"Entropy: {entropy:.2f}/8.00\n")
+                if detected_type:
+                    f.write(f"Detected type: {detected_type}\n")
+                f.write(f"\nExtracted items: {len(extracted_items)}\n")
+                for name, count in extracted_items:
+                    f.write(f"  • {name}\n")
+            
+            # Final summary
+            self.log.emit("\n" + "━" * 50)
+            self.log.emit(f"✅ Analysis complete: {len(extracted_items)} items extracted")
+            self.log.emit("━" * 50)
+            
+            self.progress.emit(100, 100, "Analysis complete")
+        
+        def _detect_raw_structure(self, header: bytes) -> str:
+            """Try to detect the structure type from header."""
+            detections = []
+            
+            # ELF executable
+            if header[:4] == b'\x7fELF':
+                return "ELF executable"
+            
+            # Android sparse
+            if header[:4] == b'\x3a\xff\x26\xed':
+                return "Android sparse image"
+            
+            # gzip
+            if header[:2] == b'\x1f\x8b':
+                return "gzip compressed"
+            
+            # LZ4
+            if header[:4] == b'\x02\x21\x4c\x18':
+                return "LZ4 compressed"
+            
+            # XZ
+            if header[:6] == b'\xfd7zXZ\x00':
+                return "XZ compressed"
+            
+            # ZIP
+            if header[:4] == b'PK\x03\x04':
+                return "ZIP archive"
+            
+            # PE executable
+            if header[:2] == b'MZ':
+                return "PE executable (Windows/UEFI)"
+            
+            # Qualcomm SBL
+            if header[:4] == b'\xd1\xdc\x4b\x84':
+                return "Qualcomm SBL image"
+            
+            # MTK bootloader
+            if b'MTK_BLOADER' in header or header[:8] == b'BFBF\x01\x00\x00\x00':
+                return "MTK bootloader"
+            
+            # Android boot
+            if header[:8] == b'ANDROID!':
+                return "Android boot image"
+            
+            # Check for mostly zeros/padding
+            null_count = header[:256].count(0)
+            ff_count = header[:256].count(0xff)
+            if null_count > 240:
+                return "Mostly empty (zeros)"
+            if ff_count > 240:
+                return "Erased/empty (0xFF)"
+            
+            return None
+        
+        def _calculate_entropy(self, data: bytes) -> float:
+            """Calculate Shannon entropy of data."""
+            import math
+            if not data:
+                return 0.0
+            
+            freq = {}
+            for byte in data:
+                freq[byte] = freq.get(byte, 0) + 1
+            
+            entropy = 0.0
+            data_len = len(data)
+            for count in freq.values():
+                if count > 0:
+                    p = count / data_len
+                    entropy -= p * math.log2(p)
+            
+            return entropy
+        
+        def _find_embedded_files(self, data: bytes, output_dir: Path) -> list:
+            """Find and extract embedded files by magic signatures."""
+            items = []
+            embedded_dir = output_dir / "embedded"
+            
+            # Magic signatures to look for
+            signatures = [
+                (b'\x89PNG\r\n\x1a\n', 'png', 'PNG image'),
+                (b'\xff\xd8\xff', 'jpg', 'JPEG image'),
+                (b'GIF89a', 'gif', 'GIF image'),
+                (b'GIF87a', 'gif', 'GIF image'),
+                (b'PK\x03\x04', 'zip', 'ZIP archive'),
+                (b'\x1f\x8b', 'gz', 'gzip compressed'),
+                (b'RIFF', 'wav', 'RIFF/WAV audio'),
+                (b'\x7fELF', 'elf', 'ELF executable'),
+                (b'dex\n', 'dex', 'Dalvik executable'),
+                (b'<?xml', 'xml', 'XML document'),
+            ]
+            
+            found_count = 0
+            for magic, ext, desc in signatures:
+                offset = 0
+                while True:
+                    pos = data.find(magic, offset)
+                    if pos < 0 or pos > len(data) - 16:
+                        break
+                    
+                    # Found embedded file
+                    if found_count == 0:
+                        embedded_dir.mkdir(parents=True, exist_ok=True)
+                        self.log.emit(f"  Found embedded files:")
+                    
+                    # Extract a reasonable chunk (up to 1MB)
+                    chunk_end = min(pos + 1024 * 1024, len(data))
+                    chunk = data[pos:chunk_end]
+                    
+                    out_file = embedded_dir / f"embedded_{pos:08X}.{ext}"
+                    with open(out_file, 'wb') as f:
+                        f.write(chunk)
+                    
+                    self.log.emit(f"    • 0x{pos:08X}: {desc}")
+                    items.append((f"embedded/{out_file.name}", 1))
+                    found_count += 1
+                    
+                    offset = pos + len(magic)
+                    if found_count >= 50:  # Limit
+                        break
+                
+                if found_count >= 50:
+                    break
+            
+            if found_count > 0:
+                self.log.emit(f"  ✓ Extracted {found_count} embedded files")
+            else:
+                self.log.emit("  No embedded files found")
+            
+            return items
+        
+        def _find_data_sections(self, data: bytes) -> list:
+            """Identify distinct data sections in the binary."""
+            sections = []
+            
+            # Look for transitions between data types
+            window_size = 4096
+            prev_type = None
+            section_start = 0
+            
+            for i in range(0, min(len(data), 1024*1024), window_size):
+                window = data[i:i+window_size]
+                if not window:
+                    break
+                
+                # Classify window
+                null_pct = window.count(0) / len(window)
+                ff_pct = window.count(0xff) / len(window)
+                printable = sum(1 for b in window if 32 <= b < 127) / len(window)
+                
+                if null_pct > 0.95:
+                    curr_type = "padding_null"
+                    desc = "Null padding"
+                elif ff_pct > 0.95:
+                    curr_type = "padding_ff"
+                    desc = "Erased/empty"
+                elif printable > 0.8:
+                    curr_type = "text"
+                    desc = "Text/ASCII data"
+                else:
+                    curr_type = "binary"
+                    desc = "Binary data"
+                
+                if prev_type and curr_type != prev_type:
+                    sections.append((prev_type, section_start, i, f"{(i-section_start)/1024:.1f} KB"))
+                    section_start = i
+                
+                prev_type = curr_type
+            
+            # Add final section
+            if prev_type:
+                sections.append((prev_type, section_start, len(data), f"{(len(data)-section_start)/1024:.1f} KB"))
+            
+            return sections
 
     # =========================================================================
     # PLUGIN STORE API CLIENT
@@ -15547,7 +17058,8 @@ def create_gui_app():
             }
 
             # Add Cloudflare Zero Trust headers
-            headers.update(get_cf_headers())
+            cf_headers = get_cf_headers()
+            headers.update(cf_headers)
 
             # Add request signature for security
             timestamp = str(int(time.time() * 1000))
@@ -15596,8 +17108,20 @@ def create_gui_app():
                         headers.pop('Content-Type', None)
                     req = urllib.request.Request(url, headers=headers, method=method)
                 
-                # Use longer timeout for uploads (files present), shorter for regular API calls
-                request_timeout = 300 if files else 30  # 5 minutes for uploads, 30s otherwise
+                # Use longer timeout for uploads and admin operations
+                # 10 minutes for approval (virus scanning can be slow with many binaries)
+                # 5 minutes for uploads
+                # 2 minutes for other admin operations
+                # 30 seconds for normal API calls
+                if '/admin/approve' in endpoint:
+                    request_timeout = 600  # 10 minutes for approval with virus scanning
+                elif files:
+                    request_timeout = 300  # 5 minutes for uploads
+                elif '/admin/' in endpoint:
+                    request_timeout = 120  # 2 minutes for admin operations
+                else:
+                    request_timeout = 30   # 30 seconds for normal API calls
+                    
                 with urllib.request.urlopen(req, timeout=request_timeout) as response:
                     return json.loads(response.read().decode('utf-8'))
                     
@@ -15797,6 +17321,10 @@ def create_gui_app():
             """Approve a pending plugin (admin only)."""
             return self._request('POST', f'/api/admin/approve/{plugin_id}')
         
+        def get_approve_progress(self, plugin_id: str) -> dict:
+            """Get approval progress for a plugin (admin only)."""
+            return self._request('GET', f'/api/admin/approve-progress/{plugin_id}')
+        
         def reject_plugin(self, plugin_id: str, reason: str = "") -> dict:
             """Reject a pending plugin (admin only)."""
             return self._request('POST', f'/api/admin/reject/{plugin_id}', {'reason': reason})
@@ -15808,6 +17336,192 @@ def create_gui_app():
         def get_plugin_review_details(self, plugin_id: str) -> dict:
             """Get detailed plugin info for admin review (admin only)."""
             return self._request('GET', f'/api/admin/review/{plugin_id}')
+        
+        # =====================================================================
+        # Security Admin API Methods
+        # =====================================================================
+        
+        def get_security_logs(self, limit: int = 100, offset: int = 0, event_type: str = None) -> dict:
+            """Get security event logs (admin only)."""
+            endpoint = f'/api/admin/security/logs?limit={limit}&offset={offset}'
+            if event_type:
+                endpoint += f'&type={event_type}'
+            return self._request('GET', endpoint)
+        
+        def get_security_scans(self, limit: int = 100, threats_only: bool = False) -> dict:
+            """Get scan results (admin only)."""
+            endpoint = f'/api/admin/security/scans?limit={limit}'
+            if threats_only:
+                endpoint += '&threats=true'
+            return self._request('GET', endpoint)
+        
+        def get_quarantine_files(self) -> dict:
+            """Get list of quarantined files (admin only)."""
+            return self._request('GET', '/api/admin/security/quarantine')
+        
+        def delete_quarantine_file(self, filename: str) -> dict:
+            """Delete a quarantined file (admin only)."""
+            return self._request('DELETE', f'/api/admin/security/quarantine/{filename}')
+        
+        def trigger_security_scan(self, plugin_id: str) -> dict:
+            """Manually trigger a security scan on a plugin (admin only)."""
+            return self._request('POST', f'/api/admin/security/scan/{plugin_id}')
+        
+        def get_security_status(self) -> dict:
+            """Get security configuration status (admin only)."""
+            return self._request('GET', '/api/admin/security/status')
+        
+        # =====================================================================
+        # IP Banning Admin API Methods
+        # =====================================================================
+        
+        def get_banned_ips(self) -> dict:
+            """Get list of banned and suspicious IPs (admin only)."""
+            return self._request('GET', '/api/admin/banned-ips')
+        
+        def ban_ip(self, ip: str, reason: str = "Banned by admin", permanent: bool = False) -> dict:
+            """Ban an IP address (admin only)."""
+            return self._request('POST', '/api/admin/ban-ip', {
+                'ip': ip,
+                'reason': reason,
+                'permanent': permanent
+            })
+        
+        def unban_ip(self, ip: str) -> dict:
+            """Unban an IP address (admin only)."""
+            return self._request('POST', '/api/admin/unban-ip', {'ip': ip})
+        
+        # =====================================================================
+        # App Updates Admin API Methods
+        # =====================================================================
+        
+        def get_app_versions(self) -> dict:
+            """Get list of published app versions (admin only)."""
+            return self._request('GET', '/api/admin/updates/list')
+        
+        def publish_app_update(self, version: str, changelog: str, file_data: bytes, 
+                               filename: str, is_critical: bool = False,
+                               progress_callback=None) -> dict:
+            """Publish a new app update (admin only) with chunked upload for large files.
+            
+            Due to Cloudflare Zero Trust limits (~100MB per request), files larger than 
+            45MB are uploaded in chunks and reassembled server-side.
+            """
+            import hashlib
+            
+            CHUNK_SIZE = 45 * 1024 * 1024  # 45MB chunks (under CF limit)
+            file_size = len(file_data)
+            
+            # If file is small enough, use single request
+            if file_size <= CHUNK_SIZE:
+                if progress_callback:
+                    progress_callback(50, "Uploading file...")
+                data = {
+                    'version': version,
+                    'changelog': changelog,
+                    'is_critical': is_critical
+                }
+                files = [('file', filename, file_data)]
+                result = self._request('POST', '/api/admin/updates/publish', data, files)
+                if progress_callback:
+                    progress_callback(100, "Complete")
+                return result
+            
+            # Large file: use chunked upload
+            total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+            
+            if progress_callback:
+                progress_callback(2, f"Initializing chunked upload ({total_chunks} chunks)...")
+            
+            # Step 1: Initialize upload session
+            init_result = self._request(
+                'POST',
+                '/api/admin/updates/upload/init',
+                data={
+                    'filename': filename,
+                    'fileSize': str(file_size),
+                    'totalChunks': str(total_chunks),
+                    'version': version,
+                    'changelog': changelog,
+                    'is_critical': 'true' if is_critical else 'false',
+                    'platform': 'windows'
+                }
+            )
+            
+            if 'error' in init_result:
+                return {'error': f"Init failed: {init_result['error']}"}
+            
+            upload_id = init_result.get('uploadId')
+            if not upload_id:
+                return {'error': 'Server did not return uploadId'}
+            
+            if progress_callback:
+                progress_callback(5, f"Upload session started: {upload_id[:8]}...")
+            
+            # Step 2: Upload each chunk
+            for chunk_num in range(total_chunks):
+                start = chunk_num * CHUNK_SIZE
+                end = min(start + CHUNK_SIZE, file_size)
+                chunk_data = file_data[start:end]
+                
+                if progress_callback:
+                    pct = 5 + int((chunk_num / total_chunks) * 85)  # 5-90%
+                    progress_callback(pct, f"Uploading chunk {chunk_num + 1}/{total_chunks}...")
+                
+                # Upload this chunk - server expects 'chunkIndex' (0-based) and 'uploadId'
+                chunk_result = self._request(
+                    'POST', 
+                    '/api/admin/updates/upload/chunk',
+                    data={
+                        'uploadId': upload_id,
+                        'chunkIndex': str(chunk_num)
+                    },
+                    files=[('chunk', f'chunk_{chunk_num}', chunk_data)]
+                )
+                
+                if 'error' in chunk_result:
+                    return {'error': f"Chunk {chunk_num + 1} failed: {chunk_result['error']}"}
+            
+            if progress_callback:
+                progress_callback(92, "Finalizing upload...")
+            
+            # Step 3: Complete - tell server to reassemble chunks and publish
+            complete_result = self._request(
+                'POST',
+                '/api/admin/updates/upload/complete',
+                data={
+                    'uploadId': upload_id
+                }
+            )
+            
+            if progress_callback:
+                progress_callback(100, "Complete")
+            
+            return complete_result
+        
+        def toggle_version_publish(self, version: str, publish: bool) -> dict:
+            """Toggle publish status of an app version (admin only)."""
+            action = 'publish' if publish else 'unpublish'
+            return self._request('POST', f'/api/admin/updates/{action}/{version}')
+        
+        def delete_app_version(self, version: str) -> dict:
+            """Delete an app version (admin only)."""
+            return self._request('DELETE', f'/api/admin/updates/{version}')
+        
+        def get_update_stats(self) -> dict:
+            """Get update statistics (admin only)."""
+            return self._request('GET', '/api/admin/updates/stats')
+        
+        def get_update_logs(self, limit: int = 100, event_type: str = None) -> dict:
+            """Get update logs (admin only)."""
+            endpoint = f'/api/admin/updates/logs?limit={limit}'
+            if event_type:
+                endpoint += f'&event_type={event_type}'
+            return self._request('GET', endpoint)
+        
+        def clear_old_logs(self, older_than_days: int) -> dict:
+            """Clear logs older than specified days (admin only)."""
+            return self._request('DELETE', f'/api/admin/updates/logs?older_than_days={older_than_days}')
     
     # Global plugin store API instance
     plugin_store_api = PluginStoreAPI()
@@ -17121,11 +18835,2761 @@ def create_gui_app():
                 self._add_field("Max Size:", "max_size", "1024")
 
 
+    # =========================================================================
+    # COMMUNITY CHAT WIDGET - Real-time Socket.IO Chat for Plugin Store
+    # =========================================================================
+    
+    class CommunityChatWidget(QWidget):
+        """Real-time community chat widget using Socket.IO.
+        
+        Server events (server -> client):
+            - user_joined: {user_id, username, is_admin}
+            - user_left: {user_id, username}
+            - online_users: {count, users: [{username, is_admin}]}
+            - online_count: {count}
+            - new_message: {id, user_id, username, is_admin, message, message_type, attachment_url, room_id, created_at}
+            - user_typing: {username, room_id}
+            - message_deleted: {id, deleted_by}
+            - invite_received: {invite_id, room_id, room_name, inviter}
+            - pending_invites: {invites: [...]}
+            - banned: {room_id, reason, expires_at}
+            - muted: {room_id, expires_at}
+            - kicked: {room_id}
+            - error: {message}
+            
+        Client events (client -> server):
+            - message: {message, room_id, message_type, attachment_url, attachment_name}
+            - typing: {room_id}
+            - join_room: {room_id}
+            - leave_room: {room_id}
+            - delete_message: {message_id}
+        """
+        
+        message_received = pyqtSignal(dict)  # message data
+        connection_changed = pyqtSignal(bool, str)  # connected, status_text
+        user_count_updated = pyqtSignal(int)  # online user count
+        invite_received = pyqtSignal(dict)  # invite data
+        message_deleted = pyqtSignal(int)  # message id
+        system_message = pyqtSignal(str)  # system message text - for thread-safe UI updates
+        rooms_loaded = pyqtSignal(list)  # rooms list - for thread-safe UI updates
+        invites_updated = pyqtSignal()  # signal to update invites badge
+        room_created = pyqtSignal(dict)  # room data - for thread-safe room creation callback
+        invite_accepted = pyqtSignal()  # signal when invite is accepted
+        undock_requested = pyqtSignal()  # signal to undock into floating window
+        dock_requested = pyqtSignal()  # signal to dock back into main window
+        
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.sio = None
+            self.connected = False
+            self.username = None
+            self.user_id = None
+            self.is_admin = False
+            self.token = None
+            self.reconnect_timer = None
+            self.current_room = 'general'
+            self.pending_invites = []
+            self._setup_ui()
+            self._setup_signals()
+            
+        def _setup_ui(self):
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(4)
+            
+            # Chat header
+            header = QHBoxLayout()
+            header.setSpacing(8)
+            
+            self.status_indicator = QLabel("●")
+            self.status_indicator.setStyleSheet("color: #666; font-size: 14px;")
+            header.addWidget(self.status_indicator)
+            
+            title = QLabel("Community Chat")
+            title.setStyleSheet("font-weight: bold; font-size: 13px;")
+            header.addWidget(title)
+            
+            header.addStretch()
+            
+            self.online_count = QLabel("• 0 online")
+            self.online_count.setStyleSheet("color: #4fc3f7; font-size: 11px;")
+            header.addWidget(self.online_count)
+            
+            self.connection_status = QLabel("Disconnected")
+            self.connection_status.setStyleSheet("color: #888; font-size: 10px;")
+            header.addWidget(self.connection_status)
+            
+            layout.addLayout(header)
+            
+            # Chat messages area
+            self.chat_area = QScrollArea()
+            self.chat_area.setWidgetResizable(True)
+            self.chat_area.setFrameShape(QFrame.Shape.NoFrame)
+            self.chat_area.setStyleSheet("""
+                QScrollArea {
+                    background-color: #1a1a2a;
+                    border: 1px solid #2a2a3a;
+                    border-radius: 8px;
+                }
+            """)
+            
+            self.messages_widget = QWidget()
+            self.messages_layout = QVBoxLayout(self.messages_widget)
+            self.messages_layout.setContentsMargins(8, 8, 8, 8)
+            self.messages_layout.setSpacing(4)
+            self.messages_layout.addStretch()
+            
+            self.chat_area.setWidget(self.messages_widget)
+            layout.addWidget(self.chat_area, 1)
+            
+            # Room selector and controls
+            room_layout = QHBoxLayout()
+            room_layout.setSpacing(4)
+            
+            self.room_selector = QComboBox()
+            self.room_selector.addItem("🌐 General", "general")
+            self.room_selector.setStyleSheet("""
+                QComboBox {
+                    background-color: #2a2a3a;
+                    border: 1px solid #3a3a4a;
+                    border-radius: 4px;
+                    padding: 4px 8px;
+                    color: #fff;
+                    min-width: 120px;
+                }
+            """)
+            self.room_selector.currentIndexChanged.connect(self._on_room_changed)
+            room_layout.addWidget(self.room_selector)
+            
+            self.create_room_btn = QPushButton("➕")
+            self.create_room_btn.setToolTip("Create Room")
+            self.create_room_btn.setFixedWidth(28)
+            self.create_room_btn.setStyleSheet("QPushButton { background: #333; border: 1px solid #555; border-radius: 4px; }")
+            self.create_room_btn.clicked.connect(self._show_create_room_dialog)
+            room_layout.addWidget(self.create_room_btn)
+            
+            self.invite_btn = QPushButton("📨")
+            self.invite_btn.setToolTip("Invite to Room")
+            self.invite_btn.setFixedWidth(28)
+            self.invite_btn.setStyleSheet("QPushButton { background: #333; border: 1px solid #555; border-radius: 4px; }")
+            self.invite_btn.clicked.connect(self._show_invite_dialog)
+            room_layout.addWidget(self.invite_btn)
+            
+            room_layout.addStretch()
+            
+            # Invites notification badge
+            self.invites_btn = QPushButton("🔔")
+            self.invites_btn.setToolTip("Pending Invites")
+            self.invites_btn.setFixedWidth(28)
+            self.invites_btn.setStyleSheet("QPushButton { background: #333; border: 1px solid #555; border-radius: 4px; }")
+            self.invites_btn.clicked.connect(self._show_invites_dialog)
+            self.invites_btn.setVisible(False)  # Hidden until invites arrive
+            room_layout.addWidget(self.invites_btn)
+            
+            layout.addLayout(room_layout)
+            
+            # Message input area
+            input_layout = QHBoxLayout()
+            input_layout.setSpacing(4)
+            
+            # Attachment button
+            self.attach_btn = QPushButton("📎")
+            self.attach_btn.setToolTip("Attach file/image")
+            self.attach_btn.setFixedWidth(32)
+            self.attach_btn.setEnabled(False)
+            self.attach_btn.setStyleSheet("""
+                QPushButton { background: #333; border: 1px solid #555; border-radius: 8px; font-size: 14px; }
+                QPushButton:hover { background: #444; }
+                QPushButton:disabled { color: #666; }
+            """)
+            self.attach_btn.clicked.connect(self._attach_file)
+            input_layout.addWidget(self.attach_btn)
+            
+            self.message_input = QLineEdit()
+            self.message_input.setPlaceholderText("Type a message... (Enter to send)")
+            self.message_input.setEnabled(False)
+            self.message_input.setStyleSheet("""
+                QLineEdit {
+                    background-color: #2a2a3a;
+                    border: 1px solid #3a3a4a;
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    color: #fff;
+                    font-size: 12px;
+                }
+                QLineEdit:focus {
+                    border-color: #4fc3f7;
+                }
+                QLineEdit:disabled {
+                    background-color: #1a1a2a;
+                    color: #666;
+                }
+            """)
+            self.message_input.returnPressed.connect(self._send_message)
+            input_layout.addWidget(self.message_input, 1)
+            
+            self.send_btn = QPushButton("Send")
+            self.send_btn.setEnabled(False)
+            self.send_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #4fc3f7;
+                    color: #000;
+                    font-weight: bold;
+                    padding: 8px 16px;
+                    border-radius: 8px;
+                    border: none;
+                }
+                QPushButton:hover {
+                    background-color: #81d4fa;
+                }
+                QPushButton:disabled {
+                    background-color: #3a3a4a;
+                    color: #666;
+                }
+            """)
+            self.send_btn.clicked.connect(self._send_message)
+            input_layout.addWidget(self.send_btn)
+            
+            layout.addLayout(input_layout)
+            
+        def _setup_signals(self):
+            self.message_received.connect(self._on_message_received)
+            self.connection_changed.connect(self._on_connection_changed)
+            self.user_count_updated.connect(self._on_user_count_updated)
+            self.system_message.connect(self._add_system_message)
+            self.rooms_loaded.connect(self._do_update_rooms_list)
+            self.invites_updated.connect(self._update_invites_badge)
+            self.room_created.connect(self._on_room_created)
+            self.message_deleted.connect(self._on_message_deleted_from_server)
+            self.invite_accepted.connect(self._on_invite_accepted)
+            self.invite_received.connect(self._on_invite_received_inline)
+            
+        def connect_chat(self, username: str):
+            """Connect to the chat server with JWT token authentication."""
+            if self.connected:
+                return
+                
+            self.username = username
+            
+            # Get the JWT token from the plugin store API
+            if not plugin_store_api.is_logged_in() or not plugin_store_api.token:
+                self._add_system_message("Login required to use chat")
+                return
+            
+            # Store token for API calls
+            self.token = plugin_store_api.token
+            
+            # Import socketio here to avoid issues if not installed
+            try:
+                import socketio
+            except ImportError:
+                self._add_system_message("Error: python-socketio not installed. Install with: pip install python-socketio[client]")
+                return
+            
+            # Try curl_cffi first (bypasses Cloudflare TLS fingerprinting), fall back to requests
+            http_session = None
+            try:
+                from curl_cffi.requests import Session as CurlSession
+                http_session = CurlSession()
+                http_session.headers.update({
+                    'User-Agent': f'ImageAnarchy/{APP_VERSION}',
+                    'CF-Access-Client-Id': CF_ACCESS_CLIENT_ID,
+                    'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET
+                })
+            except ImportError:
+                # Fall back to requests - may have issues with Cloudflare but often works
+                try:
+                    import requests
+                    http_session = requests.Session()
+                    http_session.headers.update({
+                        'User-Agent': f'ImageAnarchy/{APP_VERSION}',
+                        'CF-Access-Client-Id': CF_ACCESS_CLIENT_ID,
+                        'CF-Access-Client-Secret': CF_ACCESS_CLIENT_SECRET
+                    })
+                except ImportError:
+                    self._add_system_message("Error: No HTTP library available. Install: pip install curl_cffi")
+                    return
+            
+            # Create socket.io client with the pre-configured http session
+            # Using more aggressive reconnection settings for reliability with polling transport
+            self.sio = socketio.Client(
+                reconnection=True,
+                reconnection_attempts=0,  # 0 = infinite reconnection attempts
+                reconnection_delay=1,
+                reconnection_delay_max=10,
+                logger=False,  # Disable verbose logging
+                engineio_logger=False,  # Disable engine.io logging
+                http_session=http_session  # Use curl_cffi session to bypass CF fingerprinting
+            )
+            
+            # Reference to self for nested functions
+            chat_widget = self
+            
+            # Setup event handlers matching server.js
+            @self.sio.event
+            def connect():
+                logger.debug("[CHAT] Socket.IO connected event fired")
+                chat_widget.connected = True
+                chat_widget.connection_changed.emit(True, "Connected")
+                chat_widget._load_chat_history()
+                
+            @self.sio.event
+            def disconnect():
+                logger.debug("[CHAT] Socket.IO disconnected event fired")
+                chat_widget.connected = False
+                chat_widget.connection_changed.emit(False, "Disconnected")
+                
+            @self.sio.event
+            def connect_error(data):
+                logger.error(f"[CHAT] Socket.IO connect_error: {data}")
+                chat_widget.connected = False
+                error_msg = str(data) if data else "Connection failed"
+                chat_widget.connection_changed.emit(False, "Connection error")
+                chat_widget.system_message.emit(f"⚠️ {error_msg}")
+                
+            # Server event: new_message
+            @self.sio.on('new_message')
+            def on_new_message(data):
+                chat_widget.message_received.emit(data)
+                
+            # Server event: user_joined
+            @self.sio.on('user_joined')
+            def on_user_joined(data):
+                username = data.get('username', 'Someone')
+                # Store own user info if this is us
+                if data.get('is_self'):
+                    chat_widget.user_id = data.get('user_id')
+                    chat_widget.username = username
+                    chat_widget.is_admin = data.get('is_admin', False)
+                chat_widget.system_message.emit(f"• {username} joined the chat")
+                    
+            # Server event: user_left  
+            @self.sio.on('user_left')
+            def on_user_left(data):
+                username = data.get('username', 'Someone')
+                chat_widget.system_message.emit(f"• {username} left the chat")
+                    
+            # Server event: online_users (sent on connect)
+            @self.sio.on('online_users')
+            def on_online_users(data):
+                count = data.get('count', 0)
+                # Get own user info from the users list
+                users = data.get('users', [])
+                for user in users:
+                    if user.get('is_self'):
+                        chat_widget.user_id = user.get('user_id')
+                        chat_widget.username = user.get('username')
+                        chat_widget.is_admin = user.get('is_admin', False)
+                        break
+                chat_widget.user_count_updated.emit(count)
+                
+            # Server event: online_count (sent on user leave)
+            @self.sio.on('online_count')
+            def on_online_count(data):
+                count = data.get('count', 0)
+                chat_widget.user_count_updated.emit(count)
+                
+            # Server event: user_typing
+            @self.sio.on('user_typing')
+            def on_user_typing(data):
+                # Could show typing indicator, for now just ignore
+                pass
+                
+            # Server event: room_joined (confirmation from server)
+            @self.sio.on('room_joined')
+            def on_room_joined(data):
+                room_id = data.get('room_id')
+                room_name = data.get('room_name', 'Unknown')
+                if room_id and hasattr(chat_widget, '_pending_room_id') and chat_widget._pending_room_id == room_id:
+                    chat_widget.current_room = room_id
+                    chat_widget._pending_room_id = None
+                    chat_widget.system_message.emit(f"• Joined {room_name}")
+            
+            # Server event: error
+            @self.sio.on('error')
+            def on_error(data):
+                msg = data.get('message', 'Unknown error')
+                chat_widget.system_message.emit(f"⚠️ {msg}")
+                # If we had a pending room join that failed, revert selector
+                if hasattr(chat_widget, '_pending_room_id') and chat_widget._pending_room_id:
+                    chat_widget._pending_room_id = None
+                    # Revert to previous room in selector
+                    if chat_widget.current_room:
+                        idx = chat_widget.room_selector.findData(chat_widget.current_room)
+                        if idx >= 0:
+                            chat_widget.room_selector.blockSignals(True)
+                            chat_widget.room_selector.setCurrentIndex(idx)
+                            chat_widget.room_selector.blockSignals(False)
+                
+            # Server event: invite_received
+            @self.sio.on('invite_received')
+            def on_invite_received(data):
+                # Normalize real-time event keys to match DB row shape
+                # Server sends: invite_id, inviter — DB rows have: id, inviter_username
+                if 'invite_id' in data and 'id' not in data:
+                    data['id'] = data['invite_id']
+                if 'inviter' in data and 'inviter_username' not in data:
+                    data['inviter_username'] = data['inviter']
+                chat_widget.pending_invites.append(data)
+                chat_widget.invites_updated.emit()
+                # Show actionable inline notification in main thread
+                chat_widget.invite_received.emit(data)
+                    
+            # Server event: pending_invites (sent on connect)
+            @self.sio.on('pending_invites')
+            def on_pending_invites(data):
+                chat_widget.pending_invites = data.get('invites', [])
+                chat_widget.invites_updated.emit()
+                # Show inline notification for each pending invite
+                for inv in chat_widget.pending_invites:
+                    chat_widget.invite_received.emit(inv)
+                
+            # Server event: message_deleted
+            @self.sio.on('message_deleted')
+            def on_message_deleted(data):
+                msg_id = data.get('id')
+                # Only emit signal - UI update handled in main thread by _on_message_deleted_from_server
+                chat_widget.message_deleted.emit(msg_id)
+                            
+            # Server event: banned
+            @self.sio.on('banned')
+            def on_banned(data):
+                reason = data.get('reason', 'No reason given')
+                expires = data.get('expires_at')
+                msg = f"🚫 You have been banned"
+                if expires:
+                    msg += f" until {expires[:10]}"
+                msg += f" - {reason}"
+                chat_widget.system_message.emit(msg)
+                
+            # Server event: muted
+            @self.sio.on('muted')
+            def on_muted(data):
+                expires = data.get('expires_at', 'unknown')
+                chat_widget.system_message.emit(f"🔇 You have been muted until {expires[:16]}")
+                
+            # Server event: kicked
+            @self.sio.on('kicked')
+            def on_kicked(data):
+                room_id = data.get('room_id')
+                chat_widget.system_message.emit(f"👢 You have been kicked from the room")
+                # Switch back to general - emit signal to handle in main thread
+                if chat_widget.current_room == room_id:
+                    chat_widget.invite_accepted.emit()  # Reuse this signal to trigger room refresh
+            
+            # Connect in background thread with JWT auth
+            def do_connect():
+                try:
+                    # Chat connects to the main server URL (socket.io path)
+                    chat_url = PLUGIN_STORE_URL
+                    
+                    logger.debug(f"[CHAT] Connecting to {chat_url}")
+                    logger.debug(f"[CHAT] Token present: {bool(plugin_store_api.token)}")
+                    logger.debug(f"[CHAT] Token length: {len(plugin_store_api.token) if plugin_store_api.token else 0}")
+                    
+                    # Socket.IO auth - pass JWT token
+                    # Use polling transport only - websocket-client library has different
+                    # TLS fingerprint that gets blocked by Cloudflare. curl_cffi handles
+                    # the polling transport and bypasses Cloudflare's TLS fingerprinting.
+                    chat_widget.sio.connect(
+                        chat_url,
+                        auth={'token': plugin_store_api.token},
+                        headers=get_cf_headers(),
+                        transports=['polling']  # Polling only - bypasses CF fingerprinting
+                    )
+                    logger.debug(f"[CHAT] Connection successful")
+                except Exception as e:
+                    logger.error(f"[CHAT] Connection failed: {str(e)}")
+                    import traceback
+                    logger.error(f"[CHAT] Traceback: {traceback.format_exc()}")
+                    chat_widget.connection_changed.emit(False, "Failed to connect")
+                    chat_widget.system_message.emit(f"⚠️ Connection failed: {str(e)[:100]}")
+                    
+            import threading
+            thread = threading.Thread(target=do_connect, daemon=True)
+            thread.start()
+            
+        def _load_chat_history(self):
+            """Load recent chat history from REST API."""
+            def fetch_history():
+                try:
+                    import urllib.request
+                    import json
+                    
+                    url = f"{PLUGIN_STORE_URL}/api/chat/messages?limit=50"
+                    headers = {
+                        'User-Agent': f'ImageAnarchy/{APP_VERSION}',
+                        'Authorization': f'Bearer {plugin_store_api.token}'
+                    }
+                    headers.update(get_cf_headers())
+                    
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        data = json.loads(response.read().decode())
+                        messages = data.get('messages', [])
+                        
+                        # Add messages to chat (they come in chronological order)
+                        for msg in messages:
+                            self.message_received.emit(msg)
+                except Exception as e:
+                    pass  # Silently fail - history is optional
+                    
+            import threading
+            thread = threading.Thread(target=fetch_history, daemon=True)
+            thread.start()
+            
+        def disconnect_chat(self):
+            """Disconnect from the chat server."""
+            if self.sio and self.connected:
+                try:
+                    self.sio.disconnect()
+                except:
+                    pass
+            self.connected = False
+            self.username = None
+            self._on_connection_changed(False, "Disconnected")
+            
+        def _send_message(self):
+            """Send a chat message."""
+            if not self.connected or not self.sio:
+                return
+                
+            message = self.message_input.text().strip()
+            if not message:
+                return
+                
+            self.message_input.clear()
+            
+            # Send to server with room_id
+            try:
+                self.sio.emit('message', {
+                    'message': message,
+                    'room_id': self.current_room
+                })
+            except Exception as e:
+                self._add_system_message(f"⚠️ Failed to send message")
+                
+        def _on_message_received(self, data: dict):
+            """Handle received chat message from server.
+            
+            Server sends: {id, user_id, username, is_admin, message, created_at, message_type, attachment_url, attachment_name}
+            """
+            username = data.get('username', 'Anonymous')
+            message = data.get('message', '')
+            created_at = data.get('created_at', '')
+            is_admin = data.get('is_admin', False)
+            message_id = data.get('id')
+            sender_user_id = data.get('user_id')
+            message_type = data.get('message_type', 'text')
+            attachment_url = data.get('attachment_url')
+            attachment_name = data.get('attachment_name')
+            
+            # Show toast notification if chat is not visible or minimized
+            # Don't notify for own messages
+            if username != self.username:
+                # Check if chat panel is visible and app is focused
+                is_chat_visible = self.isVisible() and not self.isMinimized()
+                main_window = self.window()
+                is_app_focused = main_window.isActiveWindow() if main_window else False
+                
+                # Show toast if chat isn't visible or app isn't focused
+                if not is_chat_visible or not is_app_focused:
+                    # Find the main window to show toast
+                    if main_window and hasattr(main_window, '_show_toast'):
+                        toast_msg = f"💬 {username}: {message[:50]}{'...' if len(message) > 50 else ''}"
+                        main_window._show_toast(toast_msg, 'info')
+            
+            # Parse timestamp
+            timestamp = ''
+            if created_at:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    timestamp = dt.strftime('%H:%M')
+                except:
+                    timestamp = created_at[:5] if len(created_at) >= 5 else ''
+            
+            # Create message widget
+            msg_widget = QWidget()
+            msg_widget.setProperty('message_id', message_id)
+            msg_widget.setProperty('sender_user_id', sender_user_id)
+            msg_widget.setProperty('sender_username', username)
+            msg_layout = QVBoxLayout(msg_widget)
+            msg_layout.setContentsMargins(4, 2, 4, 2)
+            msg_layout.setSpacing(1)
+            
+            # Username and timestamp
+            header = QHBoxLayout()
+            header.setSpacing(6)
+            
+            name_label = QLabel(username)
+            name_color = "#ff9800" if is_admin else "#4fc3f7" if username == self.username else "#9c27b0"
+            name_label.setStyleSheet(f"color: {name_color}; font-weight: bold; font-size: 11px;")
+            header.addWidget(name_label)
+            
+            if is_admin:
+                admin_badge = QLabel("admin")
+                admin_badge.setStyleSheet("color: #fff; background-color: #ff9800; padding: 1px 4px; border-radius: 3px; font-size: 9px;")
+                header.addWidget(admin_badge)
+            
+            header.addStretch()
+            
+            if timestamp:
+                time_label = QLabel(timestamp)
+                time_label.setStyleSheet("color: #666; font-size: 9px;")
+                header.addWidget(time_label)
+            
+            msg_layout.addLayout(header)
+            
+            # Handle different message types
+            if message_type == 'image' and attachment_url:
+                # Show image thumbnail
+                img_label = QLabel(f"🖼️ {attachment_name or 'Image'}")
+                img_label.setStyleSheet("color: #4fc3f7; font-size: 12px; text-decoration: underline;")
+                img_label.setCursor(Qt.CursorShape.PointingHandCursor)
+                img_label.setProperty('url', attachment_url)
+                img_label.mousePressEvent = lambda e, url=attachment_url: self._open_attachment(url)
+                msg_layout.addWidget(img_label)
+            elif message_type == 'file' and attachment_url:
+                # Show file link
+                file_label = QLabel(f"📎 {attachment_name or 'File'}")
+                file_label.setStyleSheet("color: #81d4fa; font-size: 12px; text-decoration: underline;")
+                file_label.setCursor(Qt.CursorShape.PointingHandCursor)
+                file_label.mousePressEvent = lambda e, url=attachment_url: self._open_attachment(url)
+                msg_layout.addWidget(file_label)
+            else:
+                # Regular text message
+                msg_label = QLabel(message)
+                msg_label.setWordWrap(True)
+                msg_label.setStyleSheet("color: #ddd; font-size: 12px;")
+                msg_layout.addWidget(msg_label)
+            
+            # Enable context menu for message deletion
+            msg_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            msg_widget.customContextMenuRequested.connect(
+                lambda pos, w=msg_widget: self._show_message_context_menu(pos, w)
+            )
+            
+            # Insert before the stretch
+            self.messages_layout.insertWidget(self.messages_layout.count() - 1, msg_widget)
+            
+            # Auto-scroll to bottom
+            QTimer.singleShot(50, lambda: self.chat_area.verticalScrollBar().setValue(
+                self.chat_area.verticalScrollBar().maximum()
+            ))
+            
+        def _open_attachment(self, url: str):
+            """Open attachment URL in browser."""
+            import webbrowser
+            webbrowser.open(url)
+            
+        def _show_message_context_menu(self, pos, msg_widget: QWidget):
+            """Show context menu for a message."""
+            message_id = msg_widget.property('message_id')
+            sender_user_id = msg_widget.property('sender_user_id')
+            sender_username = msg_widget.property('sender_username')
+            
+            if not message_id:
+                return
+                
+            menu = QMenu(self)
+            menu.setStyleSheet("""
+                QMenu {
+                    background-color: #2a2a3a;
+                    border: 1px solid #444;
+                    padding: 4px;
+                }
+                QMenu::item {
+                    padding: 6px 20px;
+                    color: #ddd;
+                }
+                QMenu::item:selected {
+                    background-color: #3a3a4a;
+                }
+            """)
+            
+            # Delete option - only for own messages or admins
+            can_delete = (sender_user_id == self.user_id) or self.is_admin
+            if can_delete:
+                delete_action = menu.addAction("🗑️ Delete Message")
+                delete_action.triggered.connect(lambda: self._delete_message(message_id, msg_widget))
+                
+            # Admin moderation options
+            if self.is_admin and sender_user_id != self.user_id:
+                menu.addSeparator()
+                
+                mute_action = menu.addAction(f"🔇 Mute {sender_username}")
+                mute_action.triggered.connect(lambda: self._mute_user(sender_user_id, sender_username))
+                
+                kick_action = menu.addAction(f"👢 Kick {sender_username}")
+                kick_action.triggered.connect(lambda: self._kick_user(sender_user_id, sender_username))
+                
+                ban_action = menu.addAction(f"🚫 Ban {sender_username}")
+                ban_action.triggered.connect(lambda: self._ban_user(sender_user_id, sender_username))
+                
+            if menu.actions():
+                menu.exec(msg_widget.mapToGlobal(pos))
+                
+        def _delete_message(self, message_id: int, msg_widget: QWidget):
+            """Delete a chat message."""
+            if not self.token or not message_id:
+                return
+                
+            def do_delete():
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        self.system_message.emit("⚠️ HTTP library not available")
+                        return
+                    headers = {'Authorization': f'Bearer {self.token}'}
+                    headers.update(get_cf_headers())
+                    resp = http_requests.delete(
+                        f'{PLUGIN_STORE_URL}/api/chat/messages/{message_id}',
+                        headers=headers,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        self.message_deleted.emit(message_id)
+                    else:
+                        self.system_message.emit("⚠️ Failed to delete message")
+                except:
+                    self.system_message.emit("⚠️ Error deleting message")
+            
+            import threading
+            threading.Thread(target=do_delete, daemon=True).start()
+            
+        def _mute_user(self, user_id: int, username: str):
+            """Mute a user (admin only)."""
+            self._moderate_user('mute', user_id, username, "5 minutes")
+            
+        def _kick_user(self, user_id: int, username: str):
+            """Kick a user from the room (admin only)."""
+            self._moderate_user('kick', user_id, username)
+            
+        def _ban_user(self, user_id: int, username: str):
+            """Ban a user (admin only)."""
+            # Show duration dialog
+            duration, ok = QInputDialog.getItem(
+                self, "Ban Duration", f"Ban {username} for:",
+                ["1 hour", "24 hours", "7 days", "30 days", "Permanent"],
+                0, False
+            )
+            if ok and duration:
+                self._moderate_user('ban', user_id, username, duration)
+                
+        def _moderate_user(self, action: str, user_id: int, username: str, duration: str = None):
+            """Send moderation action to server."""
+            if not self.token or not self.is_admin:
+                return
+                
+            def do_moderate():
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        self.system_message.emit("⚠️ HTTP library not available")
+                        return
+                    import hashlib
+                    import time
+                    
+                    # Build headers with CF headers and app signature
+                    endpoint = f'/api/chat/{action}'
+                    timestamp = str(int(time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'Content-Type': 'application/json',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp
+                    }
+                    headers.update(get_cf_headers())
+                    data = {'user_id': user_id}
+                    if self.current_room and self.current_room != 'general':
+                        data['room_id'] = self.current_room
+                    if duration:
+                        data['duration'] = duration
+                        
+                    resp = http_requests.post(
+                        f'{PLUGIN_STORE_URL}{endpoint}',
+                        json=data,
+                        headers=headers,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        action_name = {'mute': 'muted', 'kick': 'kicked', 'ban': 'banned'}[action]
+                        self.system_message.emit(f"✅ {username} has been {action_name}")
+                    else:
+                        self.system_message.emit(f"⚠️ Failed to {action} user")
+                except:
+                    self.system_message.emit(f"⚠️ Error with moderation action")
+            
+            import threading
+            threading.Thread(target=do_moderate, daemon=True).start()
+            
+        def _add_system_message(self, text: str):
+            """Add a system message to the chat."""
+            label = QLabel(text)
+            label.setStyleSheet("color: #888; font-size: 11px; font-style: italic;")
+            label.setWordWrap(True)
+            self.messages_layout.insertWidget(self.messages_layout.count() - 1, label)
+            
+            # Auto-scroll
+            QTimer.singleShot(50, lambda: self.chat_area.verticalScrollBar().setValue(
+                self.chat_area.verticalScrollBar().maximum()
+            ))
+            
+        def _on_invite_received_inline(self, data: dict):
+            """Show an actionable inline invite notification in the chat area."""
+            invite_id = data.get('id')
+            inviter = data.get('inviter_username', 'Someone')
+            room_name = data.get('room_name', 'a room')
+            
+            # Don't duplicate — check if we already have an inline widget for this invite
+            for i in range(self.messages_layout.count()):
+                item = self.messages_layout.itemAt(i)
+                if item and item.widget() and item.widget().property('invite_id') == invite_id:
+                    return
+            
+            # Build the inline widget
+            container = QWidget()
+            container.setProperty('invite_id', invite_id)
+            container.setStyleSheet(
+                "QWidget { background: #1a2a1a; border: 1px solid #4CAF50; border-radius: 6px; margin: 2px 4px; }"
+            )
+            row = QHBoxLayout(container)
+            row.setContentsMargins(8, 6, 8, 6)
+            row.setSpacing(8)
+            
+            label = QLabel(f"📨 <b>{inviter}</b> invited you to <b>'{room_name}'</b>")
+            label.setStyleSheet("color: #ccc; font-size: 12px; border: none; background: transparent;")
+            label.setWordWrap(True)
+            row.addWidget(label, 1)
+            
+            accept_btn = QPushButton("✓ Accept")
+            accept_btn.setFixedHeight(26)
+            accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            accept_btn.setStyleSheet(
+                "QPushButton { background: #4CAF50; color: #fff; font-weight: bold; font-size: 11px;"
+                "  border-radius: 4px; padding: 2px 10px; border: none; }"
+                "QPushButton:hover { background: #66BB6A; }"
+            )
+            row.addWidget(accept_btn)
+            
+            decline_btn = QPushButton("✗")
+            decline_btn.setFixedWidth(28)
+            decline_btn.setFixedHeight(26)
+            decline_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            decline_btn.setStyleSheet(
+                "QPushButton { background: #555; color: #ccc; font-size: 11px;"
+                "  border-radius: 4px; border: none; }"
+                "QPushButton:hover { background: #f44336; color: #fff; }"
+            )
+            row.addWidget(decline_btn)
+            
+            def on_accept():
+                accept_btn.setEnabled(False)
+                decline_btn.setEnabled(False)
+                accept_btn.setText("Accepting...")
+                self._respond_to_invite_inline(invite_id, True, container)
+            
+            def on_decline():
+                accept_btn.setEnabled(False)
+                decline_btn.setEnabled(False)
+                self._respond_to_invite_inline(invite_id, False, container)
+            
+            accept_btn.clicked.connect(on_accept)
+            decline_btn.clicked.connect(on_decline)
+            
+            self.messages_layout.insertWidget(self.messages_layout.count() - 1, container)
+            QTimer.singleShot(50, lambda: self.chat_area.verticalScrollBar().setValue(
+                self.chat_area.verticalScrollBar().maximum()
+            ))
+        
+        def _respond_to_invite_inline(self, invite_id: str, accept: bool, widget: QWidget):
+            """Accept or decline an invite from the inline chat widget."""
+            if not self.token:
+                return
+            
+            def do_respond():
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        self.system_message.emit("⚠️ HTTP library not available")
+                        return
+                    import hashlib
+                    import time
+                    
+                    action = 'accept' if accept else 'decline'
+                    endpoint = f'/api/chat/invites/{invite_id}/{action}'
+                    timestamp = str(int(time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp
+                    }
+                    headers.update(get_cf_headers())
+                    
+                    resp = http_requests.post(
+                        f'{PLUGIN_STORE_URL}{endpoint}',
+                        headers=headers,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        self.pending_invites = [i for i in self.pending_invites if i.get('id') != invite_id]
+                        if accept:
+                            self.system_message.emit("✅ Invite accepted! Refreshing rooms...")
+                            self.invite_accepted.emit()
+                        else:
+                            self.system_message.emit("Invite declined")
+                        self.invites_updated.emit()
+                        # Remove the inline widget in main thread
+                        QTimer.singleShot(0, widget.deleteLater)
+                    else:
+                        try:
+                            err = resp.json().get('error', f'Failed ({resp.status_code})')
+                        except Exception:
+                            err = f'Server error ({resp.status_code})'
+                        self.system_message.emit(f"⚠️ {err}")
+                        # Re-enable buttons
+                        QTimer.singleShot(0, lambda: self._reenable_invite_widget(widget, accept))
+                except Exception as e:
+                    logger.error(f"[CHAT] Invite respond error: {e}")
+                    self.system_message.emit(f"⚠️ Error: {str(e)[:60]}")
+                    QTimer.singleShot(0, lambda: self._reenable_invite_widget(widget, accept))
+            
+            import threading
+            threading.Thread(target=do_respond, daemon=True).start()
+        
+        def _reenable_invite_widget(self, widget: QWidget, was_accept: bool):
+            """Re-enable buttons on an inline invite widget after failure."""
+            try:
+                layout = widget.layout()
+                if layout:
+                    for i in range(layout.count()):
+                        item = layout.itemAt(i)
+                        if item and item.widget() and isinstance(item.widget(), QPushButton):
+                            btn = item.widget()
+                            btn.setEnabled(True)
+                            if '✓' in btn.text() or 'Accept' in btn.text():
+                                btn.setText("✓ Accept")
+            except Exception:
+                pass
+        
+        def _remove_inline_invite(self, invite_id: str):
+            """Remove an inline invite widget by invite_id (called from dialog accept too)."""
+            try:
+                for i in range(self.messages_layout.count()):
+                    item = self.messages_layout.itemAt(i)
+                    if item and item.widget() and item.widget().property('invite_id') == invite_id:
+                        item.widget().deleteLater()
+                        break
+            except Exception:
+                pass
+        
+        def _on_message_deleted_from_server(self, message_id: int):
+            """Handle message deletion - find and remove the widget."""
+            for i in range(self.messages_layout.count()):
+                item = self.messages_layout.itemAt(i)
+                if item and item.widget():
+                    widget = item.widget()
+                    if widget.property('message_id') == message_id:
+                        widget.deleteLater()
+                        break
+                        
+        def _on_invite_accepted(self):
+            """Handle invite accepted - reload rooms."""
+            self._load_rooms()
+            
+        def _on_connection_changed(self, connected: bool, status: str):
+            """Handle connection status change."""
+            self.status_indicator.setStyleSheet(
+                f"color: {'#4CAF50' if connected else '#666'}; font-size: 14px;"
+            )
+            self.connection_status.setText(status)
+            self.message_input.setEnabled(connected)
+            self.send_btn.setEnabled(connected)
+            self.attach_btn.setEnabled(connected)
+            
+            if connected:
+                self._add_system_message("• Connected to chat")
+                self._load_rooms()  # Load available rooms
+            else:
+                self._add_system_message("• Disconnected from chat")
+                
+        def _on_user_count_updated(self, count: int):
+            """Update online user count."""
+            self.online_count.setText(f"• {count} online")
+            
+        def _on_room_changed(self, index: int):
+            """Handle room selection change."""
+            if index < 0 or not self.connected:
+                return
+                
+            room_id = self.room_selector.currentData()
+            if room_id and room_id != self.current_room:
+                meta = getattr(self, '_room_meta', {}).get(room_id, {})
+                
+                # Password-protected room the user hasn't joined yet
+                if meta.get('has_password') and not meta.get('is_member'):
+                    self._prompt_room_password(room_id)
+                else:
+                    self._join_room(room_id)
+        
+        def _prompt_room_password(self, room_id: str):
+            """Show password dialog for a locked room, then join via REST API."""
+            room_name = self.room_selector.currentText()
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle("🔒 Room Password Required")
+            dialog.setFixedWidth(320)
+            dialog.setStyleSheet(
+                "QDialog { background: #1e1e2e; }"
+                "QLabel { color: #ddd; font-size: 12px; }"
+            )
+            layout = QVBoxLayout(dialog)
+            layout.setSpacing(10)
+            
+            header = QLabel(f"Enter password for {room_name}:")
+            header.setStyleSheet("font-weight: bold; color: #4fc3f7; font-size: 13px;")
+            layout.addWidget(header)
+            
+            pw_input = QLineEdit()
+            pw_input.setEchoMode(QLineEdit.EchoMode.Password)
+            pw_input.setPlaceholderText("Room password")
+            pw_input.setStyleSheet(
+                "background: #2a2a3a; border: 1px solid #555; border-radius: 4px;"
+                "padding: 8px; color: #fff; font-size: 13px;"
+            )
+            layout.addWidget(pw_input)
+            
+            error_label = QLabel("")
+            error_label.setStyleSheet("color: #f44336; font-size: 11px;")
+            error_label.setVisible(False)
+            layout.addWidget(error_label)
+            
+            btn_layout = QHBoxLayout()
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.setAutoDefault(False)
+            cancel_btn.setDefault(False)
+            cancel_btn.setStyleSheet("padding: 6px 16px; background: #333; color: #ccc; border-radius: 4px;")
+            join_btn = QPushButton("Join")
+            join_btn.setAutoDefault(True)
+            join_btn.setDefault(True)
+            join_btn.setStyleSheet(
+                "padding: 6px 16px; background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                "stop:0 #e53935, stop:1 #ff5252); color: white; font-weight: bold; border-radius: 4px;"
+            )
+            btn_layout.addWidget(cancel_btn)
+            btn_layout.addWidget(join_btn)
+            layout.addLayout(btn_layout)
+            
+            def do_join():
+                password = pw_input.text()
+                if not password:
+                    error_label.setText("Password is required")
+                    error_label.setVisible(True)
+                    return
+                
+                join_btn.setEnabled(False)
+                join_btn.setText("Joining...")
+                error_label.setVisible(False)
+                QApplication.processEvents()
+                
+                # Synchronous call — dialog is modal so brief block is fine
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        raise Exception('No HTTP library available')
+                    
+                    import hashlib, time as _time
+                    endpoint = f'/api/chat/rooms/{room_id}/join'
+                    timestamp = str(int(_time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'Content-Type': 'application/json',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp,
+                    }
+                    headers.update(get_cf_headers())
+                    
+                    resp = http_requests.post(
+                        f'{PLUGIN_STORE_URL}{endpoint}',
+                        json={'password': password},
+                        headers=headers,
+                        timeout=10,
+                    )
+                    result = resp.json() if resp.status_code in (200, 401, 403, 429) else {'error': f'Server error {resp.status_code}'}
+                except Exception as e:
+                    result = {'error': str(e)}
+                
+                if result.get('success'):
+                    # Mark as member locally
+                    if hasattr(self, '_room_meta') and room_id in self._room_meta:
+                        self._room_meta[room_id]['is_member'] = True
+                    # Update icon in selector
+                    idx = self.room_selector.findData(room_id)
+                    if idx >= 0:
+                        name = self.room_selector.itemText(idx)
+                        self.room_selector.setItemText(idx, name.replace('🔒', '🔓', 1))
+                    dialog.accept()
+                    self._join_room(room_id)
+                else:
+                    error_msg = result.get('error', 'Failed to join room')
+                    error_label.setText(error_msg)
+                    error_label.setVisible(True)
+                    join_btn.setEnabled(True)
+                    join_btn.setText("Join")
+            
+            join_btn.clicked.connect(do_join)
+            pw_input.returnPressed.connect(do_join)
+            cancel_btn.clicked.connect(dialog.reject)
+            
+            if dialog.exec() == QDialog.DialogCode.Rejected:
+                # Revert selector to previous room
+                if self.current_room:
+                    idx = self.room_selector.findData(self.current_room)
+                    if idx >= 0:
+                        self.room_selector.blockSignals(True)
+                        self.room_selector.setCurrentIndex(idx)
+                        self.room_selector.blockSignals(False)
+                
+        def _join_room(self, room_id: str, password: str = None):
+            """Join a chat room via Socket.IO (must already be a member for private rooms)."""
+            if not self.sio:
+                return
+                
+            try:
+                # Leave current room first
+                if self.current_room:
+                    self.sio.emit('leave_room', {'room_id': self.current_room})
+                    
+                # Store pending join — confirmed when server sends 'room_joined'
+                self._pending_room_id = room_id
+                
+                # Join new room
+                data = {'room_id': room_id}
+                if password:
+                    data['password'] = password
+                self.sio.emit('join_room', data)
+                
+                # Clear messages and show connecting message
+                self._clear_messages()
+                self._add_system_message("• Connecting to room...")
+            except Exception as e:
+                self._add_system_message(f"⚠️ Failed to join room")
+                
+        def _clear_messages(self):
+            """Clear all messages from the chat area."""
+            while self.messages_layout.count() > 1:  # Keep the stretch
+                item = self.messages_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                    
+        def _load_rooms(self):
+            """Load available rooms from server."""
+            if not self.token:
+                return
+                
+            def fetch_rooms():
+                try:
+                    http_requests = get_http_requests()
+
+                    if not http_requests:
+
+                        return
+
+                    headers = {'Authorization': f'Bearer {self.token}'}
+                    headers.update(get_cf_headers())
+                    resp = http_requests.get(
+                        f'{PLUGIN_STORE_URL}/api/chat/rooms',
+                        headers=headers,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        return resp.json().get('rooms', [])
+                except:
+                    pass
+                return []
+            
+            def do_fetch():
+                rooms = fetch_rooms()
+                self.rooms_loaded.emit(rooms)
+                
+            # Run in background thread
+            import threading
+            thread = threading.Thread(target=do_fetch, daemon=True)
+            thread.start()
+            
+        def _do_update_rooms_list(self, rooms: list):
+            """Actually update the rooms list in UI thread."""
+            current = self.room_selector.currentData()
+            self.room_selector.blockSignals(True)
+            self.room_selector.clear()
+            self.room_selector.addItem("🌐 General", "general")
+            
+            # Store room metadata for password prompt logic
+            if not hasattr(self, '_room_meta'):
+                self._room_meta = {}
+            self._room_meta = {'general': {'has_password': False, 'is_member': True}}
+            
+            for room in rooms:
+                has_pw = bool(room.get('has_password'))
+                is_member = bool(room.get('is_member'))
+                room_id = room.get('id')
+                name = room.get('name', 'Unknown')
+                
+                # Icon: locked if password-protected and not a member yet
+                if has_pw and not is_member:
+                    icon = "🔒"
+                elif has_pw and is_member:
+                    icon = "🔓"  # Unlocked — already a member
+                elif room.get('is_private'):
+                    icon = "🔒"
+                else:
+                    icon = "💬"
+                
+                self.room_selector.addItem(f"{icon} {name}", room_id)
+                self._room_meta[room_id] = {'has_password': has_pw, 'is_member': is_member}
+                
+            # Restore selection if possible
+            if current:
+                idx = self.room_selector.findData(current)
+                if idx >= 0:
+                    self.room_selector.setCurrentIndex(idx)
+            self.room_selector.blockSignals(False)
+            
+        def _show_create_room_dialog(self):
+            """Show dialog to create a new room."""
+            if not self.connected:
+                return
+                
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Create Room")
+            dialog.setFixedWidth(300)
+            dialog.setStyleSheet("QDialog { background: #1e1e1e; } QLabel { color: #ddd; }")
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Room name
+            layout.addWidget(QLabel("Room Name:"))
+            name_input = QLineEdit()
+            name_input.setPlaceholderText("Enter room name")
+            name_input.setStyleSheet("background: #2a2a2a; border: 1px solid #444; padding: 6px; color: #fff;")
+            layout.addWidget(name_input)
+            
+            # Private checkbox
+            private_cb = QCheckBox("Private Room (password required)")
+            private_cb.setStyleSheet("color: #ddd;")
+            layout.addWidget(private_cb)
+            
+            # Password (shown when private is checked)
+            pw_label = QLabel("Password:")
+            pw_input = QLineEdit()
+            pw_input.setEchoMode(QLineEdit.EchoMode.Password)
+            pw_input.setPlaceholderText("Room password")
+            pw_input.setStyleSheet("background: #2a2a2a; border: 1px solid #444; padding: 6px; color: #fff;")
+            pw_label.setVisible(False)
+            pw_input.setVisible(False)
+            layout.addWidget(pw_label)
+            layout.addWidget(pw_input)
+            
+            private_cb.toggled.connect(lambda checked: (pw_label.setVisible(checked), pw_input.setVisible(checked)))
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            create_btn = QPushButton("Create")
+            create_btn.setStyleSheet("background: #4fc3f7; color: #000; font-weight: bold;")
+            btn_layout.addWidget(cancel_btn)
+            btn_layout.addWidget(create_btn)
+            layout.addLayout(btn_layout)
+            
+            def create_room():
+                name = name_input.text().strip()
+                if not name:
+                    return
+                password = pw_input.text() if private_cb.isChecked() else None
+                self._create_room(name, private_cb.isChecked(), password)
+                dialog.accept()
+                
+            create_btn.clicked.connect(create_room)
+            dialog.exec()
+            
+        def _create_room(self, name: str, is_private: bool, password: str = None):
+            """Create a new room on the server."""
+            if not self.token:
+                return
+                
+            def do_create():
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        return
+                    import hashlib
+                    import time
+                    
+                    # Build headers with CF headers and app signature
+                    endpoint = '/api/chat/rooms'
+                    timestamp = str(int(time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'Content-Type': 'application/json',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp
+                    }
+                    headers.update(get_cf_headers())
+                    data = {'name': name, 'is_private': is_private}
+                    if password:
+                        data['password'] = password
+                    resp = http_requests.post(
+                        f'{PLUGIN_STORE_URL}{endpoint}',
+                        json=data,
+                        headers=headers,
+                        timeout=10
+                    )
+                    # Server returns 200 with success:true, not 201
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        if result.get('success'):
+                            room = result.get('room', {})
+                            self.room_created.emit(room)
+                        else:
+                            error_msg = result.get('error', 'Failed to create room')
+                            self.system_message.emit(f"⚠️ {error_msg}")
+                    else:
+                        try:
+                            error_msg = resp.json().get('error', f'Server error {resp.status_code}')
+                        except:
+                            error_msg = f'Server error {resp.status_code}'
+                        self.system_message.emit(f"⚠️ {error_msg}")
+                except Exception as e:
+                    logger.error(f"[CHAT] Error creating room: {e}")
+                    self.system_message.emit(f"⚠️ Error: {str(e)[:80]}")
+            
+            import threading
+            threading.Thread(target=do_create, daemon=True).start()
+            
+        def _on_room_created(self, room: dict):
+            """Handle successful room creation."""
+            self._add_system_message(f"✅ Room '{room.get('name')}' created!")
+            self._load_rooms()
+            
+        def _show_invite_dialog(self):
+            """Show dialog to invite users to current room."""
+            if not self.connected or self.current_room == 'general':
+                self._add_system_message("⚠️ Select a room to invite users")
+                return
+                
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Invite to Room")
+            dialog.setFixedWidth(300)
+            dialog.setStyleSheet("QDialog { background: #1e1e1e; } QLabel { color: #ddd; }")
+            
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel("Enter username or email:"))
+            
+            invitee_input = QLineEdit()
+            invitee_input.setPlaceholderText("username or email@example.com")
+            invitee_input.setStyleSheet("background: #2a2a2a; border: 1px solid #444; padding: 6px; color: #fff;")
+            layout.addWidget(invitee_input)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            invite_btn = QPushButton("Send Invite")
+            invite_btn.setStyleSheet("background: #4fc3f7; color: #000; font-weight: bold;")
+            btn_layout.addWidget(cancel_btn)
+            btn_layout.addWidget(invite_btn)
+            layout.addLayout(btn_layout)
+            
+            def send_invite():
+                invitee = invitee_input.text().strip()
+                if not invitee:
+                    return
+                self._send_invite(invitee)
+                dialog.accept()
+                
+            invite_btn.clicked.connect(send_invite)
+            dialog.exec()
+            
+        def _send_invite(self, invitee: str):
+            """Send room invite to user."""
+            if not self.token or not self.current_room:
+                return
+                
+            def do_invite():
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        return
+                    import hashlib
+                    import time
+                    
+                    # Build headers with CF headers and app signature
+                    endpoint = '/api/chat/invites'
+                    timestamp = str(int(time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    logger.debug(f"[CHAT] Invite signature: {signature}, timestamp: {timestamp}")
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'Content-Type': 'application/json',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp
+                    }
+                    headers.update(get_cf_headers())
+                    
+                    # Check if it's an email or username
+                    is_email = '@' in invitee
+                    data = {
+                        'room_id': self.current_room,
+                        'email' if is_email else 'username': invitee
+                    }
+                    resp = http_requests.post(
+                        f'{PLUGIN_STORE_URL}{endpoint}',
+                        json=data,
+                        headers=headers,
+                        timeout=10
+                    )
+                    if resp.status_code in (200, 201):
+                        result = resp.json()
+                        if result.get('is_new_user'):
+                            self.system_message.emit(f"✅ Invite email sent to {invitee} (signup link included)")
+                        else:
+                            self.system_message.emit(f"✅ Invite sent to {invitee}")
+                    else:
+                        try:
+                            msg = resp.json().get('error', f'Failed ({resp.status_code})')
+                        except:
+                            msg = f'Server error ({resp.status_code})'
+                        self.system_message.emit(f"⚠️ {msg}")
+                except Exception as e:
+                    logger.error(f"[CHAT] Invite error: {e}")
+                    self.system_message.emit(f"⚠️ Invite error: {str(e)[:50]}")
+            
+            import threading
+            threading.Thread(target=do_invite, daemon=True).start()
+            
+        def _show_invites_dialog(self):
+            """Show pending invites dialog."""
+            if not self.pending_invites:
+                QMessageBox.information(self, "Room Invitations", "📨 No pending invitations.\n\nWhen someone invites you to a room, it will appear here and in the chat.")
+                return
+                
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Pending Invites")
+            dialog.setFixedWidth(350)
+            dialog.setStyleSheet("QDialog { background: #1e1e1e; } QLabel { color: #ddd; }")
+            
+            layout = QVBoxLayout(dialog)
+            
+            for invite in self.pending_invites:
+                invite_widget = QWidget()
+                invite_layout = QHBoxLayout(invite_widget)
+                
+                room_name = invite.get('room_name', 'Unknown Room')
+                inviter = invite.get('inviter_username', 'Someone')
+                invite_id = invite.get('id')
+                
+                label = QLabel(f"📨 {inviter} invited you to '{room_name}'")
+                label.setWordWrap(True)
+                invite_layout.addWidget(label, 1)
+                
+                accept_btn = QPushButton("✓")
+                accept_btn.setFixedWidth(30)
+                accept_btn.setStyleSheet("background: #4CAF50; color: #fff;")
+                accept_btn.clicked.connect(lambda _, iid=invite_id: self._respond_to_invite(iid, True, dialog))
+                invite_layout.addWidget(accept_btn)
+                
+                decline_btn = QPushButton("✗")
+                decline_btn.setFixedWidth(30)
+                decline_btn.setStyleSheet("background: #f44336; color: #fff;")
+                decline_btn.clicked.connect(lambda _, iid=invite_id: self._respond_to_invite(iid, False, dialog))
+                invite_layout.addWidget(decline_btn)
+                
+                layout.addWidget(invite_widget)
+                
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+            
+            dialog.exec()
+            
+        def _respond_to_invite(self, invite_id: str, accept: bool, dialog: QDialog):
+            """Accept or decline an invite."""
+            if not self.token:
+                return
+                
+            def do_respond():
+                try:
+                    http_requests = get_http_requests()
+                    if not http_requests:
+                        self.system_message.emit("⚠️ HTTP library not available")
+                        return
+                    import hashlib
+                    import time
+                    
+                    # Build headers with CF headers and app signature
+                    action = 'accept' if accept else 'decline'
+                    endpoint = f'/api/chat/invites/{invite_id}/{action}'
+                    timestamp = str(int(time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp
+                    }
+                    headers.update(get_cf_headers())
+                    
+                    resp = http_requests.post(
+                        f'{PLUGIN_STORE_URL}{endpoint}',
+                        headers=headers,
+                        timeout=10
+                    )
+                    if resp.status_code == 200:
+                        # Remove from pending
+                        self.pending_invites = [i for i in self.pending_invites if i.get('id') != invite_id]
+                        if accept:
+                            self.system_message.emit("✅ Invite accepted! Refreshing rooms...")
+                            self.invite_accepted.emit()
+                        else:
+                            self.system_message.emit("Invite declined")
+                        # Update badge
+                        self.invites_updated.emit()
+                        # Also remove any inline invite widget for this invite
+                        QTimer.singleShot(0, lambda: self._remove_inline_invite(invite_id))
+                    else:
+                        try:
+                            err = resp.json().get('error', f'Failed ({resp.status_code})')
+                        except Exception:
+                            err = f'Server error ({resp.status_code})'
+                        self.system_message.emit(f"⚠️ {err}")
+                except Exception as e:
+                    logger.error(f"[CHAT] Invite respond error: {e}")
+                    self.system_message.emit(f"⚠️ Error responding to invite: {str(e)[:50]}")
+            
+            import threading
+            threading.Thread(target=do_respond, daemon=True).start()
+            dialog.accept()
+            
+        def _update_invites_badge(self):
+            """Update the invites button visibility based on pending count."""
+            has_invites = len(self.pending_invites) > 0
+            self.invites_btn.setVisible(has_invites)
+            if has_invites:
+                self.invites_btn.setText(f"🔔 {len(self.pending_invites)}")
+                # Flash the button to draw attention
+                self.invites_btn.setStyleSheet(
+                    "QPushButton { background: #ff9800; border: 1px solid #ff9800; border-radius: 4px;"
+                    "  color: #000; font-weight: bold; }"
+                )
+                # Reset style after 2 seconds
+                QTimer.singleShot(2000, lambda: self.invites_btn.setStyleSheet(
+                    "QPushButton { background: #333; border: 1px solid #555; border-radius: 4px; }"
+                ) if self.invites_btn.isVisible() else None)
+            else:
+                self.invites_btn.setStyleSheet(
+                    "QPushButton { background: #333; border: 1px solid #555; border-radius: 4px; }"
+                )
+                
+        def _attach_file(self):
+            """Open file dialog to attach a file or image."""
+            if not self.connected or not self.token:
+                return
+                
+            file_filter = "Images & Files (*.png *.jpg *.jpeg *.gif *.webp *.zip *.txt *.log);;All Files (*.*)"
+            file_path, _ = QFileDialog.getOpenFileName(self, "Attach File", "", file_filter)
+            
+            if not file_path:
+                return
+                
+            # Check file size (10MB max)
+            import os
+            file_size = os.path.getsize(file_path)
+            if file_size > 10 * 1024 * 1024:
+                self._add_system_message("⚠️ File too large (max 10MB)")
+                return
+                
+            self._upload_file(file_path)
+            
+        def _upload_file(self, file_path: str):
+            """Upload file to server and send as message."""
+            self._add_system_message(f"📤 Uploading {os.path.basename(file_path)}...")
+            
+            def do_upload():
+                mp = None
+                try:
+                    import os
+                    import hashlib
+                    import time
+                    import mimetypes
+                    
+                    # Build headers with CF headers and app signature
+                    endpoint = '/api/chat/upload'
+                    timestamp = str(int(time.time() * 1000))
+                    app_secret = 'ImageAnarchy-Plugin-Store-2026'
+                    hourly_key = int(timestamp) // (60 * 60 * 1000)
+                    sig_data = f"{app_secret}:{hourly_key}:{endpoint}"
+                    signature = hashlib.sha256(sig_data.encode()).hexdigest()[:16]
+                    
+                    headers = {
+                        'Authorization': f'Bearer {self.token}',
+                        'X-App-Signature': signature,
+                        'X-App-Timestamp': timestamp
+                    }
+                    headers.update(get_cf_headers())
+                    
+                    filename = os.path.basename(file_path)
+                    content_type = mimetypes.guess_type(file_path)[0] or 'application/octet-stream'
+                    
+                    # Try curl_cffi first (better CF bypass), fall back to requests
+                    try:
+                        from curl_cffi import requests as curl_requests, CurlMime
+                        # Use CurlMime for multipart upload
+                        mp = CurlMime()
+                        mp.addpart(
+                            name="file",
+                            content_type=content_type,
+                            filename=filename,
+                            local_path=file_path
+                        )
+                        resp = curl_requests.post(
+                            f'{PLUGIN_STORE_URL}{endpoint}',
+                            multipart=mp,
+                            headers=headers,
+                            timeout=60
+                        )
+                    except ImportError:
+                        # Fall back to standard requests
+                        import requests
+                        with open(file_path, 'rb') as f:
+                            files = {'file': (filename, f, content_type)}
+                            resp = requests.post(
+                                f'{PLUGIN_STORE_URL}{endpoint}',
+                                files=files,
+                                headers=headers,
+                                timeout=60
+                            )
+                        
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        # Send message with attachment
+                        attachment_url = data.get('url')
+                        attachment_name = data.get('filename')
+                        message_type = 'image' if any(attachment_name.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']) else 'file'
+                        
+                        if self.sio:
+                            self.sio.emit('message', {
+                                'message': f"📎 {attachment_name}",
+                                'room_id': self.current_room,
+                                'message_type': message_type,
+                                'attachment_url': attachment_url,
+                                'attachment_name': attachment_name
+                            })
+                        self.system_message.emit("✅ File sent!")
+                    else:
+                        try:
+                            msg = resp.json().get('error', f'Upload failed ({resp.status_code})')
+                        except:
+                            msg = f'Upload failed ({resp.status_code})'
+                        logger.error(f"[CHAT] Upload failed: {msg}")
+                        self.system_message.emit(f"⚠️ {msg}")
+                except Exception as e:
+                    logger.error(f"[CHAT] Upload error: {e}")
+                    self.system_message.emit(f"⚠️ Upload error: {str(e)[:50]}")
+                finally:
+                    # Clean up CurlMime to free memory
+                    if mp:
+                        mp.close()
+            
+            import threading
+            threading.Thread(target=do_upload, daemon=True).start()
+
+
+    # =========================================================================
+    # REMOTE DEVICE CONTROL - Host/Professional System
+    # =========================================================================
+    # The Remote Play system has two roles:
+    #   HOST         = User with a device that needs repair/modification
+    #   PROFESSIONAL = Technician who connects and operates tools remotely
+    #
+    # The Host's installed plugins determine what the Professional can use.
+    # Each plugin declares its capabilities via get_remote_operations() and
+    # get_command_prefixes(). The Professional also has a Master Console
+    # where they can type raw commands (adb, fastboot, mtk, etc.) that
+    # auto-route to the correct plugin on the Host side.
+
+    # Global blocked operations — NEVER allowed remotely regardless of plugin
+    REMOTE_BLOCKED_OPS = {
+        'write_flash', 'write_full_flash', 'erase_rpmb',
+        'poke_memory', 'load_custom_payload',
+    }
+
+    class DeviceShareSession(QObject):
+        """Host-side remote device sharing session (generalized for all plugins).
+        
+        Connects to the remote control relay server via Socket.IO through
+        Cloudflare tunnel. Receives commands from Professionals, shows approval
+        dialogs, dispatches to the correct plugin handler, and streams results back.
+        
+        Supports:
+        - Plugin-specific operations (Professional clicks a button)
+        - Master console raw commands (Professional types raw adb/fastboot/mtk commands)
+        - Real-time log streaming during execution
+        - Trust mode (auto-approve READ operations)
+        
+        Lifecycle:
+            1. Host clicks "Share Device" → start_sharing()
+            2. System scans installed plugins → builds capabilities list
+            3. Server creates session, room members see device + capabilities
+            4. Professional sends command → server routes to Host
+            5. Host sees approval dialog (or auto-approves in trust mode)
+            6. Command dispatched to correct plugin handler
+            7. Log lines streamed back in real-time
+            8. Final result sent back to Professional
+            9. Host clicks "Stop Sharing" → stop_sharing()
+        """
+
+        # Signals for thread-safe UI updates
+        connected_changed = pyqtSignal(bool, str)   # connected, status
+        session_started = pyqtSignal(str)            # session_id
+        session_stopped = pyqtSignal()
+        command_received = pyqtSignal(dict)          # command data (for approval dialog)
+        command_executing = pyqtSignal(str, str)     # command_id, operation
+        command_completed = pyqtSignal(str, bool)    # command_id, success
+        log_message = pyqtSignal(str)                # status/info log
+        professional_joined_signal = pyqtSignal(str)  # professional_name
+        trust_changed = pyqtSignal(bool)             # trust_mode state
+        error_signal = pyqtSignal(str)               # error message
+        capabilities_changed = pyqtSignal(list)      # updated capabilities list
+        # Screen share signals
+        screen_share_requested = pyqtSignal(dict)    # {screen_session_id, professional_name}
+        screen_share_ended_signal = pyqtSignal(str)  # reason
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.sio = None
+            self.connected = False
+            self.session_id = None
+            self.room_id = None
+            self.trust_mode = False
+            self._executing_command = None      # Currently executing command_id
+            self._log_lines = []                # Captured log lines for current cmd
+            
+            # Plugin-agnostic: registered plugins and their handlers
+            self._plugins = {}                  # plugin_id → plugin instance
+            self._plugin_handlers = {}          # plugin_id → device handler (if applicable)
+            self._capabilities = []             # [{id, name, icon, version, operations, prefixes}]
+            self._prefix_map = {}               # command_prefix → plugin_id (for master console routing)
+            
+            # Screen share state (zero-persistence: all RAM-only)
+            self._screen_capture = None          # ScreenCaptureService instance
+            self._screen_session_id = None       # Active screen share session ID
+            self._screen_permissions = {}        # {view, touch, keyboard}
+
+        def register_plugin(self, plugin_id: str, plugin_instance, handler=None):
+            """Register a plugin for remote access.
+            
+            Args:
+                plugin_id:       Plugin identifier (e.g. 'adb_toolkit', 'mtk_toolkit')
+                plugin_instance: The Plugin class instance (has get_remote_operations, etc.)
+                handler:         Optional device handler (e.g. MtkDeviceHandler) for log capture
+            """
+            self._plugins[plugin_id] = plugin_instance
+            if handler:
+                self._plugin_handlers[plugin_id] = handler
+            
+            # Register command prefixes for master console routing
+            prefixes = []
+            if hasattr(plugin_instance, 'get_command_prefixes'):
+                prefixes = plugin_instance.get_command_prefixes()
+            for prefix in prefixes:
+                self._prefix_map[prefix.lower()] = plugin_id
+            
+            self.log_message.emit(f"🔌 Registered plugin: {plugin_id} (prefixes: {prefixes})")
+
+        def build_capabilities(self) -> list:
+            """Build capabilities list from all registered plugins.
+            
+            Returns list of dicts describing each plugin and what it can do,
+            sent to the relay server for the Professional to see.
+            """
+            self._capabilities = []
+            for plugin_id, plugin in self._plugins.items():
+                manifest = getattr(plugin, 'manifest', None)
+                operations = []
+                prefixes = []
+                
+                if hasattr(plugin, 'get_remote_operations'):
+                    try:
+                        operations = plugin.get_remote_operations()
+                    except Exception:
+                        operations = []
+                
+                if hasattr(plugin, 'get_command_prefixes'):
+                    try:
+                        prefixes = plugin.get_command_prefixes()
+                    except Exception:
+                        prefixes = []
+                
+                cap = {
+                    'id': plugin_id,
+                    'name': manifest.name if manifest else plugin_id,
+                    'icon': manifest.icon if manifest else '🔌',
+                    'version': manifest.version if manifest else '?',
+                    'operations': operations,
+                    'prefixes': prefixes,
+                }
+                self._capabilities.append(cap)
+            
+            self.capabilities_changed.emit(self._capabilities)
+            return self._capabilities
+
+        def start_sharing(self, room_id: str, device_info: dict):
+            """Connect to remote control server and start sharing device."""
+            if self.connected and self.session_id:
+                self.log_message.emit("⚠️ Already sharing device")
+                return
+
+            self.room_id = room_id
+            
+            # Build capabilities from registered plugins
+            capabilities = self.build_capabilities()
+
+            try:
+                import socketio
+            except ImportError:
+                self.error_signal.emit("python-socketio not installed")
+                return
+
+            # Build HTTP session with CF auth (curl_cffi for Cloudflare bypass)
+            http_session = None
+            try:
+                from curl_cffi.requests import Session as CurlSession
+                http_session = CurlSession()
+                http_session.headers.update(get_rc_cf_headers())
+            except ImportError:
+                try:
+                    import requests
+                    http_session = requests.Session()
+                    http_session.headers.update(get_rc_cf_headers())
+                except ImportError:
+                    self.error_signal.emit("No HTTP library (need curl_cffi or requests)")
+                    return
+
+            self.sio = socketio.Client(
+                reconnection=True,
+                reconnection_attempts=10,
+                reconnection_delay=2,
+                reconnection_delay_max=15,
+                logger=False,
+                engineio_logger=False,
+                http_session=http_session,
+            )
+
+            session = self  # Reference for closures
+
+            @self.sio.event
+            def connect():
+                session.connected = True
+                session.connected_changed.emit(True, "Connected to relay")
+                session.log_message.emit("🔗 Connected to remote control server")
+                # Join room and start sharing with capabilities
+                session.sio.emit('join_room', {'room_id': session.room_id})
+                session.sio.emit('device_share_start', {
+                    'room_id': session.room_id,
+                    'device_info': device_info,
+                    'capabilities': capabilities,
+                })
+
+            @self.sio.event
+            def disconnect():
+                session.connected = False
+                session.session_id = None
+                session.connected_changed.emit(False, "Disconnected")
+                session.log_message.emit("🔌 Disconnected from relay")
+                session.session_stopped.emit()
+
+            @self.sio.event
+            def connect_error(data):
+                session.connected = False
+                session.error_signal.emit(f"Connection error: {data}")
+
+            @self.sio.on('device_share_started')
+            def on_share_started(data):
+                session.session_id = data.get('session_id')
+                session.log_message.emit(f"📡 Device shared! Session: {session.session_id[:8]}...")
+                session.session_started.emit(session.session_id)
+
+            @self.sio.on('device_command_approval_request')
+            def on_approval_request(data):
+                """Professional wants to run a command - needs Host approval."""
+                session.command_received.emit(data)
+
+            @self.sio.on('device_execute_command')
+            def on_execute_command(data):
+                """Command approved (or auto-approved) - execute it now."""
+                cmd_type = data.get('type', 'operation')
+                if cmd_type == 'raw_command':
+                    session._execute_raw_command(data)
+                else:
+                    session._execute_operation(data)
+
+            @self.sio.on('device_trust_changed')
+            def on_trust_changed(data):
+                session.trust_mode = data.get('trust_mode', False)
+                session.trust_changed.emit(session.trust_mode)
+
+            @self.sio.on('professional_joined')
+            def on_pro_joined(data):
+                pro_name = data.get('professional_name', 'Unknown')
+                session.log_message.emit(f"👤 Professional '{pro_name}' connected to your session")
+                session.professional_joined_signal.emit(pro_name)
+
+            # ── Screen Share handlers (Host receives from relay) ────────
+            @self.sio.on('screen_share_request')
+            def on_screen_share_request(data):
+                """Professional wants to see our screen."""
+                session.screen_share_requested.emit(data)
+
+            @self.sio.on('screen_input')
+            def on_screen_input(data):
+                """Professional sent touch/key input — inject via ADB."""
+                session._inject_screen_input(data)
+
+            @self.sio.on('screen_share_ended')
+            def on_screen_share_ended(data):
+                """Relay says screen session ended."""
+                reason = data.get('reason', 'Session ended')
+                session._stop_screen_capture()
+                session.screen_share_ended_signal.emit(reason)
+
+            @self.sio.on('error')
+            def on_error(data):
+                session.error_signal.emit(data.get('message', 'Unknown error'))
+
+            # Get JWT token from plugin store API (same auth system)
+            token = getattr(plugin_store_api, 'token', None)
+            if not token:
+                self.error_signal.emit("Login required - sign in via Plugin Store first")
+                return
+
+            def do_connect():
+                try:
+                    session.sio.connect(
+                        REMOTE_CTL_URL,
+                        auth={'token': token},
+                        headers=get_rc_cf_headers(),
+                        transports=['polling'],
+                    )
+                except Exception as e:
+                    session.error_signal.emit(f"Failed to connect: {str(e)[:100]}")
+
+            import threading
+            threading.Thread(target=do_connect, daemon=True).start()
+
+        def stop_sharing(self):
+            """Stop sharing and disconnect."""
+            self._stop_screen_capture()  # Clean up screen share first
+            if self.sio and self.connected:
+                try:
+                    if self.session_id:
+                        self.sio.emit('device_share_stop', {'session_id': self.session_id})
+                    self.sio.disconnect()
+                except Exception:
+                    pass
+            self.session_id = None
+            self.connected = False
+            self.session_stopped.emit()
+            self.log_message.emit("🛑 Device sharing stopped")
+
+        def approve_command(self, command_id: str):
+            """Approve a pending command from a Professional."""
+            if self.sio and self.connected:
+                self.sio.emit('device_command_respond', {
+                    'command_id': command_id,
+                    'approved': True,
+                })
+                self.log_message.emit(f"✅ Command {command_id[:8]}... approved")
+
+        def reject_command(self, command_id: str):
+            """Reject a pending command from a Professional."""
+            if self.sio and self.connected:
+                self.sio.emit('device_command_respond', {
+                    'command_id': command_id,
+                    'approved': False,
+                })
+                self.log_message.emit(f"❌ Command {command_id[:8]}... rejected")
+
+        def toggle_trust(self, enabled: bool):
+            """Toggle trust mode (auto-approve READ operations)."""
+            self.trust_mode = enabled
+            if self.sio and self.connected and self.session_id:
+                self.sio.emit('device_trust_toggle', {
+                    'session_id': self.session_id,
+                    'trust_mode': enabled,
+                })
+
+        def update_device_status(self, device_info: dict):
+            """Send updated device info to the relay."""
+            if self.sio and self.connected and self.session_id:
+                self.sio.emit('device_status_update', {
+                    'session_id': self.session_id,
+                    'device_info': device_info,
+                })
+
+        def refresh_capabilities(self):
+            """Re-scan plugin operations and push updated capabilities to relay."""
+            capabilities = self.build_capabilities()
+            if self.sio and self.connected and self.session_id:
+                self.sio.emit('device_capabilities_update', {
+                    'session_id': self.session_id,
+                    'capabilities': capabilities,
+                })
+
+        # ═══════════════════════════════════════════════════════════
+        # SCREEN SHARE — Host-side methods (Zero-Persistence)
+        # All data lives in RAM only. Nothing is written to disk.
+        # https://github.com/vehoelite/image-anarchy
+        # ═══════════════════════════════════════════════════════════
+
+        def approve_screen_share(self, screen_session_id, permissions=None):
+            """Approve a screen share request and start capture."""
+            if not self.sio or not self.connected:
+                return
+            perms = permissions or {'view': True, 'touch': False, 'keyboard': False}
+            self._screen_session_id = screen_session_id
+            self._screen_permissions = perms
+            self.sio.emit('screen_share_respond', {
+                'screen_session_id': screen_session_id,
+                'approved': True,
+                'permissions': perms,
+            })
+            self.log_message.emit("📺 Screen share approved — starting capture...")
+            self._start_screen_capture(screen_session_id)
+
+        def deny_screen_share(self, screen_session_id):
+            """Deny a screen share request."""
+            if self.sio and self.connected:
+                self.sio.emit('screen_share_respond', {
+                    'screen_session_id': screen_session_id,
+                    'approved': False,
+                })
+                self.log_message.emit("❌ Screen share request denied")
+
+        def update_screen_permissions(self, permissions):
+            """Update screen share permissions mid-session."""
+            if not self._screen_session_id or not self.sio or not self.connected:
+                return
+            self._screen_permissions = permissions
+            self.sio.emit('screen_permissions_update', {
+                'screen_session_id': self._screen_session_id,
+                'permissions': permissions,
+            })
+
+        def stop_screen_share(self):
+            """Host: Stop screen sharing."""
+            if self._screen_session_id and self.sio and self.connected:
+                self.sio.emit('screen_share_stop', {
+                    'screen_session_id': self._screen_session_id,
+                })
+            self._stop_screen_capture()
+
+        def _start_screen_capture(self, screen_session_id):
+            """Start the ScreenCaptureService thread."""
+            self._stop_screen_capture()  # Stop any existing capture
+
+            # Find ADB path
+            adb_path = self._find_adb_path()
+            if not adb_path:
+                self.error_signal.emit("Cannot start screen share: ADB not found")
+                logging.error("[SCREEN] ADB not found in any known location")
+                return
+
+            # Find device serial
+            serial = self._find_device_serial(adb_path)
+            if not serial:
+                self.error_signal.emit("Cannot start screen share: No ADB device connected")
+                logging.error(f"[SCREEN] No device found via {adb_path}")
+                return
+
+            logging.info(f"[SCREEN] Starting capture: adb={adb_path}, serial={serial}, session={screen_session_id[:8]}")
+
+            self._screen_capture = ScreenCaptureService(
+                adb_path=adb_path,
+                device_serial=serial,
+                screen_session_id=screen_session_id,
+                target_fps=5,
+                quality=55,
+                max_size=720,
+            )
+            self._screen_capture.frame_ready.connect(self._on_screen_frame)
+            self._screen_capture.status_changed.connect(
+                lambda s: self.log_message.emit(f"[SCREEN] {s}"))
+            self._screen_capture.error_occurred.connect(
+                lambda e: self.error_signal.emit(f"Screen capture error: {e}"))
+            self._screen_capture.stopped_signal.connect(self._on_screen_capture_stopped)
+            self._screen_capture.start()
+
+        def _stop_screen_capture(self):
+            """Stop the screen capture service."""
+            if self._screen_capture:
+                self._screen_capture.stop()
+                if not self._screen_capture.wait(3000):
+                    self._screen_capture.terminate()
+                self._screen_capture = None
+            self._screen_session_id = None
+            self._screen_permissions = {}
+
+        def _on_screen_frame(self, frame_data):
+            """Forward captured frame to relay as binary."""
+            if self.sio and self.connected and self._screen_session_id:
+                try:
+                    self.sio.emit('screen_frame', frame_data)
+                except Exception as e:
+                    logging.warning(f"[SCREEN] Failed to emit frame ({len(frame_data)} bytes): {e}")
+
+        def _on_screen_capture_stopped(self):
+            """Capture service stopped unexpectedly."""
+            self._screen_capture = None
+            self.log_message.emit("⏹️ Screen capture stopped")
+
+        def _inject_screen_input(self, data):
+            """Inject touch/key/text input via ADB (background thread)."""
+            if not self._screen_permissions:
+                return
+            input_type = data.get('type', '')
+            if input_type == 'touch' and not self._screen_permissions.get('touch'):
+                return
+            if input_type in ('key', 'text') and not self._screen_permissions.get('keyboard'):
+                return
+
+            adb_path = self._find_adb_path()
+            serial = self._find_device_serial(adb_path) if adb_path else None
+            if not adb_path or not serial:
+                return
+
+            import threading
+            def _do_input():
+                try:
+                    cmd = [adb_path, '-s', serial, 'shell', 'input']
+                    if input_type == 'touch':
+                        x, y = data.get('x', 0), data.get('y', 0)
+                        action = data.get('action', 'tap')
+                        if action == 'tap':
+                            cmd.extend(['tap', str(int(x)), str(int(y))])
+                        elif action == 'swipe':
+                            x2, y2 = data.get('x2', x), data.get('y2', y)
+                            dur = data.get('duration', 200)
+                            cmd.extend(['swipe', str(int(x)), str(int(y)),
+                                       str(int(x2)), str(int(y2)), str(int(dur))])
+                        else:
+                            return
+                    elif input_type == 'key':
+                        keycode = data.get('keycode', '')
+                        if keycode:
+                            cmd.extend(['keyevent', str(keycode)])
+                        else:
+                            return
+                    elif input_type == 'text':
+                        text = data.get('text', '')
+                        if text:
+                            cmd.extend(['text', text])
+                        else:
+                            return
+                    else:
+                        return
+                    subprocess.run(
+                        cmd, capture_output=True, timeout=5,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+                    )
+                except Exception as e:
+                    logging.warning(f"[SCREEN] Input injection failed: {e}")
+            threading.Thread(target=_do_input, daemon=True).start()
+
+        def _find_adb_path(self):
+            """Find ADB executable from plugins or system."""
+            import shutil
+            base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+            for p in [
+                base / 'plugins' / 'scrcpy_toolkit' / 'adb.exe',
+                base / 'plugins' / 'adb_toolkit' / 'platform-tools' / 'adb.exe',
+                base / 'platform-tools' / 'adb.exe',
+            ]:
+                if p.exists():
+                    return str(p)
+            return shutil.which('adb')
+
+        def _find_device_serial(self, adb_path):
+            """Find the first connected ADB device serial."""
+            if not adb_path:
+                return None
+            try:
+                result = subprocess.run(
+                    [adb_path, 'devices'], capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+                )
+                for line in result.stdout.strip().split('\n')[1:]:
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[1] == 'device':
+                        return parts[0]
+            except Exception:
+                pass
+            return None
+
+        def _execute_operation(self, data: dict):
+            """Execute a plugin-specific operation on the Host's device.
+            
+            Dispatches to the correct plugin based on plugin_id in the command data.
+            This is for structured operations (Professional clicked a button).
+            """
+            command_id = data.get('command_id')
+            plugin_id = data.get('plugin_id')
+            operation = data.get('operation')
+            params = data.get('params', {})
+            tech = data.get('technician', '?')
+
+            if operation in REMOTE_BLOCKED_OPS:
+                self._send_result(command_id, False, error=f"Operation '{operation}' is blocked remotely")
+                return
+
+            # Find the plugin
+            plugin = self._plugins.get(plugin_id)
+            if not plugin:
+                self._send_result(command_id, False, error=f"Plugin '{plugin_id}' not available on this device")
+                return
+
+            self._executing_command = command_id
+            self._log_lines = []
+            self.command_executing.emit(command_id, f"{plugin_id}:{operation}")
+            self.log_message.emit(f"⚙️ [{plugin_id}] Executing '{operation}' (requested by {tech})")
+
+            # Setup log capture — try plugin handler first, then plugin itself
+            handler = self._plugin_handlers.get(plugin_id)
+            log_connected = False
+            
+            def capture_log(line):
+                self._log_lines.append(str(line))
+                if self.sio and self.connected and self.session_id:
+                    self.sio.emit('device_log_stream', {
+                        'session_id': self.session_id,
+                        'command_id': command_id,
+                        'log_line': str(line),
+                    })
+
+            if handler and hasattr(handler, 'log_signal'):
+                handler.log_signal.connect(capture_log)
+                log_connected = True
+
+            def run_op():
+                success = False
+                result = None
+                error = None
+                try:
+                    # Try the handler first (for MTK-style operations)
+                    if handler:
+                        op_method = getattr(handler, operation, None)
+                        if op_method and callable(op_method):
+                            ret = op_method(**params) if params else op_method()
+                            if isinstance(ret, bool):
+                                success = ret
+                            elif isinstance(ret, (list, dict)):
+                                success = True
+                                result = ret
+                            elif ret is not None:
+                                success = True
+                                result = str(ret)
+                            else:
+                                success = False
+                                error = "Operation returned None"
+                        else:
+                            error = f"Unknown operation '{operation}' on plugin '{plugin_id}'"
+                    else:
+                        error = f"No handler for plugin '{plugin_id}' — use raw commands instead"
+                except Exception as e:
+                    error = str(e)
+
+                # Cleanup log capture
+                if log_connected:
+                    try:
+                        handler.log_signal.disconnect(capture_log)
+                    except Exception:
+                        pass
+
+                self._send_result(command_id, success, result=result, error=error)
+                self._executing_command = None
+                self.command_completed.emit(command_id, success)
+
+            import threading
+            threading.Thread(target=run_op, daemon=True).start()
+
+        def _execute_raw_command(self, data: dict):
+            """Execute a raw command from the Professional's master console.
+            
+            Routes the command to the correct plugin based on the prefix.
+            E.g. 'adb devices' → adb_toolkit, 'fastboot getvar all' → fastboot_toolkit
+            """
+            command_id = data.get('command_id')
+            raw_command = data.get('raw_command', '').strip()
+            tech = data.get('technician', '?')
+
+            if not raw_command:
+                self._send_result(command_id, False, error="Empty command")
+                return
+
+            # Parse prefix to find target plugin
+            prefix = raw_command.split()[0].lower()
+            plugin_id = self._prefix_map.get(prefix)
+
+            if not plugin_id:
+                available = ', '.join(sorted(self._prefix_map.keys()))
+                self._send_result(command_id, False, 
+                    error=f"Unknown command prefix '{prefix}'. Available: {available}")
+                return
+
+            plugin = self._plugins.get(plugin_id)
+            if not plugin:
+                self._send_result(command_id, False, error=f"Plugin '{plugin_id}' not loaded")
+                return
+
+            if not hasattr(plugin, 'execute_raw_command'):
+                self._send_result(command_id, False, 
+                    error=f"Plugin '{plugin_id}' doesn't support raw commands")
+                return
+
+            self._executing_command = command_id
+            self._log_lines = []
+            self.command_executing.emit(command_id, f"raw:{raw_command[:50]}")
+            self.log_message.emit(f"🖥️ [{plugin_id}] Raw command from {tech}: {raw_command}")
+
+            def capture_log(line):
+                self._log_lines.append(str(line))
+                if self.sio and self.connected and self.session_id:
+                    self.sio.emit('device_log_stream', {
+                        'session_id': self.session_id,
+                        'command_id': command_id,
+                        'log_line': str(line),
+                    })
+
+            def run_raw():
+                try:
+                    result = plugin.execute_raw_command(raw_command, log_callback=capture_log)
+                    self._send_result(
+                        command_id,
+                        result.get('success', False),
+                        result=result.get('output'),
+                        error=result.get('error'),
+                    )
+                except Exception as e:
+                    self._send_result(command_id, False, error=str(e))
+                finally:
+                    self._executing_command = None
+                    self.command_completed.emit(command_id, True)
+
+            import threading
+            threading.Thread(target=run_raw, daemon=True).start()
+
+        def _send_result(self, command_id: str, success: bool, result=None, error=None):
+            """Send command result back to relay server."""
+            if self.sio and self.connected:
+                self.sio.emit('device_command_result', {
+                    'command_id': command_id,
+                    'success': success,
+                    'result': result,
+                    'error': error,
+                    'logs': self._log_lines[-100:],  # Last 100 lines
+                })
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCREEN SHARE — ScreenCaptureService (Host-side capture thread)
+    # Zero-Persistence: No frames cached. No files written. RAM → Socket.IO.
+    # https://github.com/vehoelite/image-anarchy
+    # ═══════════════════════════════════════════════════════════════════════
+
+    class ScreenCaptureService(QThread):
+        """Captures device screenshots via ADB for zero-persistence relay.
+
+        Uses 'adb exec-out screencap -p' for maximum compatibility (Android 4.4+).
+        Each frame: PNG capture → JPEG compress → prepend 16-byte session UUID → emit.
+        The relay passes it through as opaque binary without inspection.
+
+        Frame wire format:
+            [16 bytes: screen_session_id as raw UUID] + [JPEG image data]
+
+        Privacy: No frames stored. No files created. All RAM-only.
+        Verify: https://github.com/vehoelite/image-anarchy
+        """
+
+        frame_ready = pyqtSignal(bytes)        # 16-byte UUID + JPEG data
+        status_changed = pyqtSignal(str)       # status text
+        error_occurred = pyqtSignal(str)       # error message
+        stopped_signal = pyqtSignal()          # capture ended
+
+        def __init__(self, adb_path, device_serial, screen_session_id,
+                     target_fps=5, quality=55, max_size=720, parent=None):
+            super().__init__(parent)
+            self.adb_path = adb_path
+            self.serial = device_serial
+            self.session_id = screen_session_id
+            # Convert UUID string → 16 raw bytes for frame prefix
+            self.session_id_bytes = bytes.fromhex(screen_session_id.replace('-', ''))
+            self.target_fps = max(1, min(target_fps, 15))   # Clamp 1-15fps
+            self.quality = max(20, min(quality, 90))         # Clamp 20-90
+            self.max_size = max(240, min(max_size, 1080))    # Clamp 240-1080
+            self._running = False
+            self._frame_count = 0
+
+        def run(self):
+            """Capture loop — runs in dedicated thread."""
+            import time
+            self._running = True
+            self._frame_count = 0
+            frame_interval = 1.0 / self.target_fps
+
+            logging.info(f"[SCREEN] Capture thread started: {self.adb_path} -s {self.serial}")
+            self.status_changed.emit("📸 Screen capture starting...")
+
+            while self._running:
+                t0 = time.monotonic()
+                try:
+                    # Capture PNG screenshot via ADB
+                    result = subprocess.run(
+                        [self.adb_path, '-s', self.serial, 'exec-out', 'screencap', '-p'],
+                        capture_output=True, timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+                    )
+                    if result.returncode != 0 or not result.stdout:
+                        if self._running:
+                            stderr_msg = (result.stderr or b'').decode('utf-8', errors='replace')[:200]
+                            logging.warning(f"[SCREEN] screencap failed: rc={result.returncode}, stderr={stderr_msg}")
+                            self.status_changed.emit("⚠️ screencap failed, retrying...")
+                            time.sleep(0.5)
+                        continue
+
+                    png_data = result.stdout
+                    if self._frame_count < 3:
+                        logging.info(f"[SCREEN] Frame {self._frame_count}: PNG={len(png_data)} bytes")
+
+                    # Convert PNG → JPEG with resize using QImage (thread-safe)
+                    img = QImage()
+                    if not img.loadFromData(png_data):
+                        logging.warning(f"[SCREEN] QImage.loadFromData failed for {len(png_data)} bytes")
+                        continue
+
+                    # Resize if either dimension exceeds max_size
+                    if max(img.width(), img.height()) > self.max_size:
+                        img = img.scaled(
+                            self.max_size, self.max_size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+
+                    # Convert to JPEG bytes
+                    from PyQt6.QtCore import QBuffer, QIODevice
+                    buf = QBuffer()
+                    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+                    img.save(buf, 'JPEG', self.quality)
+                    jpeg_data = bytes(buf.data())
+                    buf.close()
+
+                    if not jpeg_data or len(jpeg_data) < 100:
+                        continue
+
+                    # Emit frame: 16-byte session UUID prefix + JPEG data
+                    frame = self.session_id_bytes + jpeg_data
+                    self.frame_ready.emit(frame)
+
+                    self._frame_count += 1
+                    if self._frame_count == 1:
+                        self.status_changed.emit(
+                            f"📺 Streaming {img.width()}x{img.height()} @ ~{self.target_fps}fps"
+                        )
+
+                except subprocess.TimeoutExpired:
+                    if self._running:
+                        self.status_changed.emit("⚠️ ADB timeout, retrying...")
+                except Exception as e:
+                    if self._running:
+                        self.error_occurred.emit(f"Capture error: {e}")
+                        time.sleep(1)
+
+                # Rate limit
+                elapsed = time.monotonic() - t0
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0 and self._running:
+                    time.sleep(sleep_time)
+
+            self.status_changed.emit("⏹️ Screen capture stopped")
+            self.stopped_signal.emit()
+
+        def stop(self):
+            """Stop the capture loop."""
+            self._running = False
+
+        @property
+        def frame_count(self):
+            return self._frame_count
+
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCREEN SHARE — ScreenViewerWidget (Professional-side viewer)
+    # Zero-Persistence: No frames saved. No screenshots. All RAM-only.
+    # https://github.com/vehoelite/image-anarchy
+    # ═══════════════════════════════════════════════════════════════════════
+
+    class ScreenViewerWidget(QWidget):
+        """Professional-side screen viewer for Remote Play.
+
+        Receives JPEG frames from relay, renders in QWidget.
+        Supports mouse → touch and keyboard → key injection.
+
+        Zero-Persistence: No frames saved to disk. All RAM-only.
+        """
+
+        input_event = pyqtSignal(dict)    # Touch/key event to send to relay
+        closed = pyqtSignal()             # Viewer closed by user
+
+        def __init__(self, screen_session_id, host_name='', permissions=None, parent=None):
+            super().__init__(parent)
+            self.screen_session_id = screen_session_id
+            self.host_name = host_name
+            self.permissions = permissions or {'view': True, 'touch': False, 'keyboard': False}
+            import time as _time
+            self._current_frame = None       # QPixmap
+            self._device_width = 0
+            self._device_height = 0
+            self._frame_count = 0
+            self._last_fps_time = _time.monotonic()
+            self._last_fps_count = 0
+            self._current_fps = 0
+
+            self.setWindowTitle(f"📺 Screen Share — {host_name}")
+            self.setWindowFlags(Qt.WindowType.Window)
+            self.setMinimumSize(360, 640)
+            self.resize(400, 720)
+            self.setStyleSheet("background: #000;")
+            self.setMouseTracking(True)
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+            self._setup_ui()
+
+        def _setup_ui(self):
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+            # Status bar
+            self._status_bar = QLabel("📺 Waiting for frames...")
+            self._status_bar.setFixedHeight(24)
+            self._status_bar.setStyleSheet(
+                "background: #1a1a2e; color: #4fc3f7; font-size: 10px; padding: 2px 8px;"
+            )
+            layout.addWidget(self._status_bar)
+
+            # Frame display
+            self._frame_label = QLabel()
+            self._frame_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._frame_label.setStyleSheet("background: #000;")
+            self._frame_label.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+            layout.addWidget(self._frame_label, 1)
+
+            # Bottom bar
+            bottom = QHBoxLayout()
+            bottom.setContentsMargins(8, 4, 8, 4)
+
+            self._perm_label = QLabel()
+            self._update_perm_label()
+            self._perm_label.setStyleSheet("color: #888; font-size: 10px;")
+            bottom.addWidget(self._perm_label)
+
+            bottom.addStretch()
+
+            self._fps_label = QLabel("0 fps")
+            self._fps_label.setStyleSheet("color: #666; font-size: 10px;")
+            bottom.addWidget(self._fps_label)
+
+            disconnect_btn = QPushButton("🔴 Stop")
+            disconnect_btn.setFixedWidth(80)
+            disconnect_btn.setStyleSheet("""
+                QPushButton {
+                    background: #c62828; color: white; border: none;
+                    border-radius: 3px; padding: 3px 8px; font-size: 10px;
+                }
+                QPushButton:hover { background: #d32f2f; }
+            """)
+            disconnect_btn.clicked.connect(self.close)
+            bottom.addWidget(disconnect_btn)
+
+            layout.addLayout(bottom)
+
+        def update_frame(self, jpeg_data):
+            """Update displayed frame from raw JPEG bytes."""
+            import time
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(jpeg_data):
+                return
+
+            self._current_frame = pixmap
+            self._device_width = pixmap.width()
+            self._device_height = pixmap.height()
+            self._frame_count += 1
+
+            # Calculate FPS every second
+            now = time.monotonic()
+            if now - self._last_fps_time >= 1.0:
+                self._current_fps = self._frame_count - self._last_fps_count
+                self._last_fps_count = self._frame_count
+                self._last_fps_time = now
+                self._fps_label.setText(f"{self._current_fps} fps")
+                self._status_bar.setText(
+                    f"📺 {self._device_width}x{self._device_height} | "
+                    f"{self._current_fps}fps | Frame #{self._frame_count}"
+                )
+
+            # Scale pixmap to fit label while keeping aspect ratio
+            label_size = self._frame_label.size()
+            scaled = pixmap.scaled(
+                label_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._frame_label.setPixmap(scaled)
+
+        def update_permissions(self, perms):
+            """Update permissions mid-session."""
+            self.permissions = perms
+            self._update_perm_label()
+
+        def _update_perm_label(self):
+            parts = []
+            if self.permissions.get('view'):
+                parts.append("👁️ View")
+            if self.permissions.get('touch'):
+                parts.append("👆 Touch")
+            if self.permissions.get('keyboard'):
+                parts.append("⌨️ Keyboard")
+            self._perm_label.setText(" | ".join(parts) or "No permissions")
+
+        def mousePressEvent(self, event):
+            """Convert mouse click to touch tap on device."""
+            if not self.permissions.get('touch') or not self._current_frame:
+                return super().mousePressEvent(event)
+
+            coords = self._map_to_device(event.pos())
+            if coords:
+                x, y = coords
+                self.input_event.emit({
+                    'screen_session_id': self.screen_session_id,
+                    'type': 'touch',
+                    'x': x, 'y': y,
+                    'action': 'tap',
+                })
+
+        def keyPressEvent(self, event):
+            """Convert key press to device key event."""
+            if not self.permissions.get('keyboard'):
+                return super().keyPressEvent(event)
+
+            # Map Qt key → Android keycode
+            key_map = {
+                Qt.Key.Key_Return: 66,     # KEYCODE_ENTER
+                Qt.Key.Key_Backspace: 67,  # KEYCODE_DEL
+                Qt.Key.Key_Escape: 4,      # KEYCODE_BACK
+                Qt.Key.Key_Home: 3,        # KEYCODE_HOME
+                Qt.Key.Key_Tab: 61,        # KEYCODE_TAB
+                Qt.Key.Key_Up: 19,         # KEYCODE_DPAD_UP
+                Qt.Key.Key_Down: 20,       # KEYCODE_DPAD_DOWN
+                Qt.Key.Key_Left: 21,       # KEYCODE_DPAD_LEFT
+                Qt.Key.Key_Right: 22,      # KEYCODE_DPAD_RIGHT
+                Qt.Key.Key_VolumeUp: 24,   # KEYCODE_VOLUME_UP
+                Qt.Key.Key_VolumeDown: 25, # KEYCODE_VOLUME_DOWN
+            }
+
+            keycode = key_map.get(event.key())
+            if keycode:
+                self.input_event.emit({
+                    'screen_session_id': self.screen_session_id,
+                    'type': 'key',
+                    'keycode': keycode,
+                })
+            elif event.text():
+                self.input_event.emit({
+                    'screen_session_id': self.screen_session_id,
+                    'type': 'text',
+                    'text': event.text(),
+                })
+
+        def _map_to_device(self, pos):
+            """Map widget position to device screen coordinates."""
+            if not self._current_frame or not self._frame_label.pixmap():
+                return None
+
+            label_size = self._frame_label.size()
+            pixmap = self._frame_label.pixmap()
+
+            # Offset of the displayed image within the label
+            x_offset = (label_size.width() - pixmap.width()) / 2
+            y_offset = (label_size.height() - pixmap.height()) / 2
+
+            # Position relative to the frame label
+            frame_label_pos = self._frame_label.mapFrom(self, pos)
+
+            # Position within the displayed pixmap
+            px = frame_label_pos.x() - x_offset
+            py = frame_label_pos.y() - y_offset
+
+            if px < 0 or py < 0 or px >= pixmap.width() or py >= pixmap.height():
+                return None
+
+            # Scale to device resolution
+            scale_x = self._device_width / pixmap.width()
+            scale_y = self._device_height / pixmap.height()
+
+            return (px * scale_x, py * scale_y)
+
+        def closeEvent(self, event):
+            """Emit closed signal when viewer is closed."""
+            self.closed.emit()
+            super().closeEvent(event)
+
+
     class PluginPlayground(QWidget):
         """Plugin testing and validation environment."""
 
         def __init__(self, parent=None):
             super().__init__(parent)
+
             self.loaded_plugin_path: Optional[str] = None
             self.loaded_plugin_widget: Optional[QWidget] = None
             self.file_watcher_timer: Optional[QTimer] = None
@@ -17137,9 +21601,10 @@ def create_gui_app():
             main_layout.setContentsMargins(0, 0, 0, 0)
             main_layout.setSpacing(0)
 
-            # Header
+            # Header - fixed height, no stretch
             header = QFrame()
             header.setStyleSheet("background: #1e1e1e; border-bottom: 1px solid #444;")
+            header.setFixedHeight(45)  # Fixed height for header
             header_layout = QHBoxLayout(header)
             header_layout.setContentsMargins(16, 10, 16, 10)
 
@@ -17162,14 +21627,19 @@ def create_gui_app():
             splitter = QSplitter(Qt.Orientation.Horizontal)
             splitter.setStyleSheet("QSplitter::handle { background: #444; }")
 
-            # Left panel: Plugin loader and validation
+            # Left panel: Plugin loader and validation (wrapped in scroll area for 1080p)
+            left_scroll = QScrollArea()
+            left_scroll.setWidgetResizable(True)
+            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            left_scroll.setStyleSheet("QScrollArea { background: #252525; border: none; border-right: 1px solid #444; }")
+            left_scroll.setMinimumWidth(300)
+            left_scroll.setMaximumWidth(400)
+            
             left_panel = QFrame()
-            left_panel.setStyleSheet("background: #252525; border-right: 1px solid #444;")
-            left_panel.setMinimumWidth(350)
-            left_panel.setMaximumWidth(450)
+            left_panel.setStyleSheet("background: #252525;")
             left_layout = QVBoxLayout(left_panel)
             left_layout.setContentsMargins(12, 12, 12, 12)
-            left_layout.setSpacing(12)
+            left_layout.setSpacing(10)
 
             # Load plugin section
             load_frame = QFrame()
@@ -17228,43 +21698,55 @@ def create_gui_app():
 
             left_layout.addWidget(load_frame)
 
-            # Validation checklist
+            # Validation checklist (compact for 1080p)
             validation_frame = QFrame()
             validation_frame.setStyleSheet("background: #1a1a1a; border: 1px solid #444; border-radius: 8px;")
             validation_layout = QVBoxLayout(validation_frame)
-            validation_layout.setContentsMargins(12, 12, 12, 12)
-            validation_layout.setSpacing(6)
+            validation_layout.setContentsMargins(10, 10, 10, 10)
+            validation_layout.setSpacing(3)
 
             validation_title = QLabel("✅ Validation Checklist")
-            validation_title.setStyleSheet("font-weight: bold; color: #4caf50;")
+            validation_title.setStyleSheet("font-weight: bold; color: #4caf50; font-size: 12px;")
             validation_layout.addWidget(validation_title)
 
-            # Checklist items
+            # Checklist items - ALL 15 REQUIRED MANIFEST FIELDS (compact)
             self.check_items = {}
             checks = [
                 ('manifest_exists', '📄 manifest.json exists'),
-                ('manifest_valid', '✓ manifest.json is valid JSON'),
-                ('has_id', '🔖 Has plugin ID'),
-                ('has_name', '📛 Has plugin name'),
-                ('has_version', '🏷️ Has version'),
-                ('has_description', '📝 Has description'),
-                ('has_author', '👤 Has author'),
+                ('manifest_valid', '✓ manifest.json valid'),
+                # All 15 required fields
+                ('has_id', '🔖 id'),
+                ('has_name', '📛 name'),
+                ('has_version', '🏷️ version'),
+                ('has_description', '📝 description'),
+                ('has_author', '👤 author'),
+                ('has_icon', '🎨 icon'),
+                ('has_license_type', '📜 license_type'),
+                ('has_website', '🌐 website'),
+                ('has_support_url', '🆘 support_url'),
+                ('has_min_version', '⚙️ min_version'),
+                ('has_git_clone', '📥 git_clone'),
+                ('has_requirements', '📦 requirements'),
+                ('has_bundled_binaries', '💾 bundled_binaries'),
+                ('has_setup_commands', '🔧 setup_commands'),
+                ('has_enabled', '✅ enabled'),
+                # Plugin file checks
                 ('plugin_py_exists', '🐍 plugin.py exists'),
-                ('plugin_loads', '⚡ Plugin loads without errors'),
-                ('widget_creates', '🖼️ Widget creates successfully'),
-                ('deps_available', '📦 Dependencies available'),
+                ('plugin_loads', '⚡ Plugin loads'),
+                ('widget_creates', '🖼️ Widget creates'),
+                ('deps_available', '📦 Deps available'),
             ]
 
             for check_id, check_label in checks:
                 check_row = QHBoxLayout()
-                check_row.setSpacing(8)
+                check_row.setSpacing(4)
 
                 status_label = QLabel("⬜")
-                status_label.setFixedWidth(20)
+                status_label.setFixedWidth(16)
                 check_row.addWidget(status_label)
 
                 text_label = QLabel(check_label)
-                text_label.setStyleSheet("color: #888; font-size: 11px;")
+                text_label.setStyleSheet("color: #888; font-size: 10px;")
                 check_row.addWidget(text_label)
                 check_row.addStretch()
 
@@ -17318,7 +21800,8 @@ def create_gui_app():
             left_layout.addWidget(deps_frame)
             left_layout.addStretch()
 
-            splitter.addWidget(left_panel)
+            left_scroll.setWidget(left_panel)
+            splitter.addWidget(left_scroll)
 
             # Right panel: Plugin preview and console
             right_panel = QWidget()
@@ -17502,14 +21985,40 @@ def create_gui_app():
                     self._log(f"Error reading manifest: {e}", 'error')
                     all_passed = False
 
-            # Check 3-7: Required fields
+            # Check ALL 15 required manifest fields (strict validation)
             if manifest_data:
-                self._update_check('has_id', bool(manifest_data.get('id') or manifest_data.get('name')))
-                self._update_check('has_name', bool(manifest_data.get('name')))
-                self._update_check('has_version', bool(manifest_data.get('version')))
-                self._update_check('has_description', bool(manifest_data.get('description')))
-                self._update_check('has_author', bool(manifest_data.get('author')))
-
+                # Field presence checks - ALL 15 REQUIRED
+                field_checks = [
+                    ('has_id', 'id', manifest_data.get('id')),
+                    ('has_name', 'name', manifest_data.get('name')),
+                    ('has_version', 'version', manifest_data.get('version')),
+                    ('has_description', 'description', manifest_data.get('description')),
+                    ('has_author', 'author', manifest_data.get('author')),
+                    ('has_icon', 'icon', manifest_data.get('icon')),
+                    ('has_license_type', 'license_type', manifest_data.get('license_type')),
+                    ('has_website', 'website', manifest_data.get('website')),
+                    ('has_support_url', 'support_url', manifest_data.get('support_url')),
+                    ('has_min_version', 'min_version', manifest_data.get('min_version')),
+                    ('has_git_clone', 'git_clone', 'git_clone' in manifest_data),  # Can be null
+                    ('has_requirements', 'requirements', 'requirements' in manifest_data),  # Can be empty list
+                    ('has_bundled_binaries', 'bundled_binaries', 'bundled_binaries' in manifest_data),  # Can be empty list
+                    ('has_setup_commands', 'setup_commands', 'setup_commands' in manifest_data),  # Can be empty list
+                    ('has_enabled', 'enabled', 'enabled' in manifest_data),  # Must be present
+                ]
+                
+                missing_fields = []
+                for check_id, field_name, field_present in field_checks:
+                    passed = bool(field_present)
+                    self._update_check(check_id, passed)
+                    if not passed:
+                        missing_fields.append(field_name)
+                        all_passed = False
+                
+                if missing_fields:
+                    self._log(f"⚠️ Missing required fields: {', '.join(missing_fields)}", 'warning')
+                else:
+                    self._log("✅ All 15 required manifest fields present", 'success')
+                
                 # Show dependencies
                 deps_info = []
                 if manifest_data.get('requirements'):
@@ -17961,8 +22470,8 @@ def create_gui_app():
             # PLUGIN STORE TAB
             # =====================================================================
             store_widget = QWidget()
-            store_layout = QVBoxLayout(store_widget)
-            store_layout.setContentsMargins(8, 12, 8, 8)
+            store_main_layout = QVBoxLayout(store_widget)
+            store_main_layout.setContentsMargins(8, 12, 8, 8)
             
             # Store Header with search and auth
             store_header = QHBoxLayout()
@@ -18027,6 +22536,33 @@ def create_gui_app():
             refresh_store_btn.clicked.connect(self._refresh_store)
             store_header.addWidget(refresh_store_btn)
             
+            # Chat toggle button
+            self.chat_toggle_btn = QPushButton("💬")
+            self.chat_toggle_btn.setFixedSize(32, 32)
+            self.chat_toggle_btn.setToolTip("Toggle Community Chat")
+            self.chat_toggle_btn.setCheckable(True)
+            self.chat_toggle_btn.setChecked(False)  # Chat hidden by default
+            self.chat_toggle_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3a3a4a;
+                    border-radius: 16px;
+                    border: none;
+                    font-size: 16px;
+                }
+                QPushButton:hover {
+                    background-color: #4fc3f7;
+                }
+                QPushButton:checked {
+                    background-color: #4fc3f7;
+                }
+            """)
+            self.chat_toggle_btn.clicked.connect(self._toggle_chat_panel)
+            self.chat_toggle_btn.setToolTip("Click: Show/Hide chat\nDouble-click: Undock chat")
+            self._chat_click_timer = None
+            self._chat_is_undocked = False
+            self._chat_floating_window = None
+            store_header.addWidget(self.chat_toggle_btn)
+            
             # Auth buttons
             self.login_btn = QPushButton("🔑 Login")
             self.login_btn.setStyleSheet("""
@@ -18061,7 +22597,7 @@ def create_gui_app():
             self.user_menu_btn.clicked.connect(self._show_user_menu)
             store_header.addWidget(self.user_menu_btn)
             
-            store_layout.addLayout(store_header)
+            store_main_layout.addLayout(store_header)
             
             # Category filter
             cat_layout = QHBoxLayout()
@@ -18111,7 +22647,16 @@ def create_gui_app():
             """)
             cat_layout.addWidget(self.upload_btn)
             
-            store_layout.addLayout(cat_layout)
+            store_main_layout.addLayout(cat_layout)
+            
+            # Horizontal splitter: Plugin grid (left) + Chat (right)
+            store_splitter = QSplitter(Qt.Orientation.Horizontal)
+            store_splitter.setChildrenCollapsible(False)
+            
+            # Left side: Plugin grid
+            store_left = QWidget()
+            store_left_layout = QVBoxLayout(store_left)
+            store_left_layout.setContentsMargins(0, 0, 0, 0)
             
             # Store plugin grid (using scroll area with grid)
             self.store_scroll = QScrollArea()
@@ -18125,15 +22670,30 @@ def create_gui_app():
             self.store_grid_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             
             self.store_scroll.setWidget(self.store_grid_widget)
-            store_layout.addWidget(self.store_scroll)
+            store_left_layout.addWidget(self.store_scroll)
             
             # Store status
             self.store_status = QLabel("Connect to the Plugin Store to browse available plugins.")
             self.store_status.setStyleSheet("color: #6a6a8a; font-size: 12px; padding: 8px;")
             self.store_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            store_layout.addWidget(self.store_status)
+            store_left_layout.addWidget(self.store_status)
+            
+            store_splitter.addWidget(store_left)
+            
+            # Right side: Community Chat (hidden by default)
+            self.community_chat = CommunityChatWidget()
+            self.community_chat.setMinimumWidth(250)
+            self.community_chat.setMaximumWidth(350)
+            self.community_chat.setVisible(False)  # Hidden by default
+            store_splitter.addWidget(self.community_chat)
+            
+            # Set splitter sizes (100% plugins when chat hidden)
+            store_splitter.setSizes([850, 0])
+            
+            store_main_layout.addWidget(store_splitter, 1)
             
             self.view_tabs.addTab(store_widget, "🛒 Store")
+
             
             # =====================================================================
             # PLUGIN PLAYGROUND TAB - Fully Functional!
@@ -18517,6 +23077,71 @@ def create_gui_app():
                 )
                 return
             
+            # ═══════════════════════════════════════════════════════════════════════
+            # Check for deferred setup_commands (pip install ., etc.)
+            # These run on first plugin open after download to ensure all files exist
+            # ═══════════════════════════════════════════════════════════════════════
+            if not data['builtin'] and plugin_manager.has_pending_setup_commands(plugin_id):
+                msg = (
+                    f"Plugin '{manifest.name}' needs to complete setup.\n\n"
+                    "This includes installing Python packages and dependencies.\n"
+                    "This may take a few minutes.\n\n"
+                    "Would you like to run the setup now?"
+                )
+                
+                reply = QMessageBox.question(
+                    self,
+                    "Plugin Setup Required",
+                    msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    from PyQt6.QtWidgets import QProgressDialog
+                    progress = QProgressDialog(
+                        "Running plugin setup...", "Cancel", 0, 100, self
+                    )
+                    progress.setWindowModality(Qt.WindowModality.WindowModal)
+                    progress.setMinimumDuration(0)
+                    progress.setValue(0)
+                    progress.setWindowTitle(f"Setting up {manifest.name}")
+                    
+                    def progress_callback(step_name: str, status: str, pct: int):
+                        progress.setLabelText(f"{step_name}\n{status}")
+                        progress.setValue(pct)
+                        QApplication.processEvents()
+                    
+                    self._log(f"Running deferred setup for {manifest.name}...")
+                    QApplication.processEvents()
+                    
+                    success, message = plugin_manager.run_deferred_setup_commands(plugin_id, progress_callback)
+                    progress.close()
+                    
+                    if success:
+                        self._log(f"✓ Setup complete for {manifest.name}")
+                        QMessageBox.information(
+                            self,
+                            "Setup Complete",
+                            f"Plugin '{manifest.name}' setup completed successfully!"
+                        )
+                    else:
+                        self._log(f"✗ Setup failed: {message}")
+                        QMessageBox.warning(
+                            self,
+                            "Setup Issues",
+                            f"Setup encountered issues:\n\n{message[:500]}\n\n"
+                            "The plugin may still work, but some features might be unavailable."
+                        )
+                        # Continue anyway - user might want to try the plugin
+                else:
+                    QMessageBox.information(
+                        self,
+                        "Setup Skipped",
+                        "Setup was skipped. The plugin may not work correctly.\n\n"
+                        "You can try again by reopening the plugin."
+                    )
+                    return
+            
             # Check for post-install steps (drivers, git clones, etc.)
             if not data['builtin'] and manifest.post_install:
                 # Check if post-install has already been completed
@@ -18741,17 +23366,172 @@ def create_gui_app():
             if plugin_store_api.is_logged_in():
                 self.login_btn.setVisible(False)
                 self.user_menu_btn.setVisible(True)
-                self.user_menu_btn.setText(f"👤 {plugin_store_api.user.get('username', 'User')}")
+                username = plugin_store_api.user.get('username', 'User')
+                self.user_menu_btn.setText(f"👤 {username}")
                 self.upload_btn.setVisible(True)
+                
+                # Connect to community chat when logged in
+                if hasattr(self, 'community_chat'):
+                    self.community_chat.connect_chat(username)
             else:
                 self.login_btn.setVisible(True)
                 self.user_menu_btn.setVisible(False)
                 self.upload_btn.setVisible(False)
+                
+                # Disconnect from community chat when logged out
+                if hasattr(self, 'community_chat'):
+                    self.community_chat.disconnect_chat()
+        
+        def _toggle_chat_panel(self):
+            """Toggle the community chat panel visibility or undock on double-click."""
+            # Detect double-click for undock
+            if self._chat_click_timer is not None:
+                # This is a double-click - undock or dock
+                self._chat_click_timer.stop()
+                self._chat_click_timer = None
+                self._toggle_chat_dock()
+                return
+            
+            # Start timer to detect double-click
+            self._chat_click_timer = QTimer()
+            self._chat_click_timer.setSingleShot(True)
+            self._chat_click_timer.timeout.connect(self._do_toggle_chat_visibility)
+            self._chat_click_timer.start(300)  # 300ms window for double-click
+            
+        def _do_toggle_chat_visibility(self):
+            """Actually toggle chat visibility after double-click timeout."""
+            self._chat_click_timer = None
+            
+            # If undocked, just focus the floating window
+            if self._chat_is_undocked and self._chat_floating_window:
+                self._chat_floating_window.raise_()
+                self._chat_floating_window.activateWindow()
+                return
+            
+            is_visible = self.chat_toggle_btn.isChecked()
+            self.community_chat.setVisible(is_visible)
+            
+            # Adjust splitter sizes based on visibility
+            if is_visible:
+                # Show chat: 75% plugins, 25% chat
+                total = sum(self.findChild(QSplitter).sizes()) if self.findChild(QSplitter) else 850
+                self.findChild(QSplitter).setSizes([int(total * 0.75), int(total * 0.25)])
+            else:
+                # Hide chat: 100% plugins
+                if self.findChild(QSplitter):
+                    total = sum(self.findChild(QSplitter).sizes())
+                    self.findChild(QSplitter).setSizes([total, 0])
+                    
+        def _toggle_chat_dock(self):
+            """Toggle between docked and floating chat window."""
+            if self._chat_is_undocked:
+                # Dock back into main window
+                self._dock_chat()
+            else:
+                # Undock into floating window
+                self._undock_chat()
+                
+        def _undock_chat(self):
+            """Undock chat into floating window."""
+            if self._chat_is_undocked:
+                return
+                
+            # Create floating window with proper close handling
+            class ChatFloatingWindow(QWidget):
+                closed = pyqtSignal()
+                def __init__(self, parent_ref):
+                    super().__init__(None, Qt.WindowType.Window)
+                    self._parent_ref = parent_ref
+                def closeEvent(self, event):
+                    # Dock the chat back before closing
+                    if self._parent_ref and hasattr(self._parent_ref, '_dock_chat_internal'):
+                        self._parent_ref._dock_chat_internal()
+                    event.accept()
+            
+            self._chat_floating_window = ChatFloatingWindow(self)
+            self._chat_floating_window.setWindowTitle("💬 Community Chat - Image Anarchy")
+            self._chat_floating_window.setMinimumSize(350, 500)
+            self._chat_floating_window.resize(400, 600)
+            self._chat_floating_window.setStyleSheet("background-color: #1e1e1e;")
+            
+            # Move chat widget to floating window
+            layout = QVBoxLayout(self._chat_floating_window)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.community_chat.setParent(self._chat_floating_window)
+            layout.addWidget(self.community_chat)
+            self.community_chat.setVisible(True)
+            self.community_chat.setMinimumWidth(0)  # Remove min width constraint
+            self.community_chat.setMaximumWidth(16777215)  # Remove max width constraint
+            
+            # Position near main window
+            main_geo = self.geometry()
+            self._chat_floating_window.move(main_geo.right() + 10, main_geo.top())
+            
+            self._chat_floating_window.show()
+            self._chat_is_undocked = True
+            
+            # Update button state
+            self.chat_toggle_btn.setChecked(True)
+            self.chat_toggle_btn.setToolTip("Double-click: Dock chat back")
+            
+        def _dock_chat_internal(self):
+            """Internal dock method called from floating window closeEvent.
+            Does NOT close the floating window (it's already closing)."""
+            if not self._chat_is_undocked:
+                return
+                
+            # Find the splitter in plugin store tab
+            splitter = self.findChild(QSplitter)
+            if splitter:
+                # Move chat widget back to splitter
+                self.community_chat.setParent(None)
+                self.community_chat.setMinimumWidth(250)
+                self.community_chat.setMaximumWidth(350)
+                splitter.addWidget(self.community_chat)
+                self.community_chat.setVisible(True)
+                
+                # Adjust splitter sizes
+                total = sum(splitter.sizes())
+                splitter.setSizes([int(total * 0.75), int(total * 0.25)])
+            
+            # Clear reference (window is closing itself)
+            self._chat_floating_window = None
+            self._chat_is_undocked = False
+            self.chat_toggle_btn.setToolTip("Click: Show/Hide chat\nDouble-click: Undock chat")
+            
+        def _dock_chat(self):
+            """Dock chat back into main window (called from double-click)."""
+            if not self._chat_is_undocked:
+                return
+                
+            # Find the splitter in plugin store tab
+            splitter = self.findChild(QSplitter)
+            if splitter:
+                # Move chat widget back to splitter
+                self.community_chat.setParent(None)
+                self.community_chat.setMinimumWidth(250)
+                self.community_chat.setMaximumWidth(350)
+                splitter.addWidget(self.community_chat)
+                self.community_chat.setVisible(True)
+                
+                # Adjust splitter sizes
+                total = sum(splitter.sizes())
+                splitter.setSizes([int(total * 0.75), int(total * 0.25)])
+            
+            # Close floating window
+            if self._chat_floating_window:
+                # Temporarily clear reference to avoid recursion
+                window = self._chat_floating_window
+                self._chat_floating_window = None
+                self._chat_is_undocked = False
+                window.close()
+                window.deleteLater()
+                
+            self.chat_toggle_btn.setToolTip("Click: Show/Hide chat\nDouble-click: Undock chat")
         
         def _refresh_store(self):
-            """Refresh the plugin store listing."""
+            """Refresh the plugin store listing using background thread."""
             self.store_status.setText("Loading plugins from store...")
-            QApplication.processEvents()
             
             # Clear existing grid
             while self.store_grid_layout.count():
@@ -18759,19 +23539,27 @@ def create_gui_app():
                 if item.widget():
                     item.widget().deleteLater()
             
-            # Fetch plugins
-            plugins = plugin_store_api.get_plugins()
+            # Fetch plugins in background thread to avoid blocking UI
+            self._store_refresh_thread = StoreRefreshThread(plugin_store_api)
             
-            if not plugins:
-                self.store_status.setText(
-                    "No plugins found or unable to connect to store.\n"
-                    f"Server: {plugin_store_api.base_url}"
-                )
-                return
+            def on_store_refresh_finished(plugins):
+                if not plugins:
+                    self.store_status.setText(
+                        "No plugins found or unable to connect to store.\n"
+                        f"Server: {plugin_store_api.base_url}"
+                    )
+                    return
+                
+                self.store_status.setText(f"Found {len(plugins)} plugins")
+                self._store_plugins = plugins
+                self._display_store_plugins(plugins)
             
-            self.store_status.setText(f"Found {len(plugins)} plugins")
-            self._store_plugins = plugins
-            self._display_store_plugins(plugins)
+            def on_store_refresh_error(error_msg):
+                self.store_status.setText(f"Error loading store: {error_msg}")
+            
+            self._store_refresh_thread.finished.connect(on_store_refresh_finished)
+            self._store_refresh_thread.error.connect(on_store_refresh_error)
+            self._store_refresh_thread.start()
         
         def _display_store_plugins(self, plugins: list):
             """Display plugins in the store grid."""
@@ -18902,7 +23690,11 @@ def create_gui_app():
                 """)
             else:
                 price = plugin.get('price', 0)
-                price_badge.setText(f"${price:.2f}")
+                try:
+                    price_val = float(price)
+                except (ValueError, TypeError):
+                    price_val = 0.0
+                price_badge.setText(f"${price_val:.2f}")
                 price_badge.setStyleSheet("""
                     QLabel {
                         background-color: rgba(244, 67, 54, 0.2);
@@ -18993,7 +23785,12 @@ def create_gui_app():
             author_label.setStyleSheet("color: #888;")
             header_info.addWidget(author_label)
             
-            stats_label = QLabel(f"⬇️ {full_plugin.get('downloads', 0)} downloads • ⭐ {full_plugin.get('rating', 0):.1f} ({full_plugin.get('rating_count', 0)} reviews)")
+            # Safely convert rating to float (API may return string)
+            try:
+                rating_val = float(full_plugin.get('rating', 0) or 0)
+            except (ValueError, TypeError):
+                rating_val = 0.0
+            stats_label = QLabel(f"⬇️ {full_plugin.get('downloads', 0)} downloads • ⭐ {rating_val:.1f} ({full_plugin.get('rating_count', 0)} reviews)")
             stats_label.setStyleSheet("color: #666; font-size: 11px;")
             header_info.addWidget(stats_label)
             
@@ -19008,7 +23805,10 @@ def create_gui_app():
                 price_badge = QLabel("DONATION")
                 price_badge.setStyleSheet("background: #ff9800; color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;")
             else:
-                price = full_plugin.get('price', 0)
+                try:
+                    price = float(full_plugin.get('price', 0) or 0)
+                except (ValueError, TypeError):
+                    price = 0.0
                 price_badge = QLabel(f"${price:.2f}")
                 price_badge.setStyleSheet("background: #f44336; color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;")
             header.addWidget(price_badge)
@@ -19039,11 +23839,16 @@ def create_gui_app():
             
             # Screenshots button (if screenshots available)
             screenshots = full_plugin.get('screenshots', [])
+            logger.debug(f"[PLUGIN DETAILS] Raw screenshots data: {screenshots} (type: {type(screenshots).__name__})")
             if isinstance(screenshots, str):
                 try:
                     screenshots = json.loads(screenshots)
+                    logger.debug(f"[PLUGIN DETAILS] Parsed screenshots: {screenshots}")
                 except:
                     screenshots = []
+                    logger.debug(f"[PLUGIN DETAILS] Failed to parse screenshots JSON")
+            
+            logger.info(f"[PLUGIN DETAILS] Plugin {plugin_name} has {len(screenshots)} screenshots: {screenshots}")
             
             if screenshots:
                 screenshots_btn = QPushButton(f"🖼️ View Screenshots ({len(screenshots)})")
@@ -19113,7 +23918,12 @@ def create_gui_app():
             if reviews:
                 reviews_html = ""
                 for r in reviews[:10]:
-                    stars = "⭐" * r.get('rating', 0) + "☆" * (5 - r.get('rating', 0))
+                    try:
+                        review_rating = int(r.get('rating', 0) or 0)
+                    except (ValueError, TypeError):
+                        review_rating = 0
+                    review_rating = max(0, min(5, review_rating))  # Clamp to 0-5
+                    stars = "⭐" * review_rating + "☆" * (5 - review_rating)
                     reviews_html += f"<p><b>{r.get('username', 'User')}</b> {stars}<br>"
                     reviews_html += f"<span style='color:#aaa;'>{r.get('comment', '')}</span></p><hr>"
                 reviews_list.setHtml(reviews_html)
@@ -19256,8 +24066,21 @@ def create_gui_app():
                 scroll_layout.addWidget(ss_container)
                 self._screenshot_labels.append(ss_label)
                 
-                # Load image asynchronously
-                ss_url = f"{base_url}/screenshots/{ss_filename}"
+                # Construct URL - handle different formats
+                if ss_filename.startswith('http://') or ss_filename.startswith('https://'):
+                    # Already a full URL
+                    ss_url = ss_filename
+                elif ss_filename.startswith('/screenshots/'):
+                    # Path with leading slash
+                    ss_url = f"{base_url}{ss_filename}"
+                elif ss_filename.startswith('screenshots/'):
+                    # Path without leading slash
+                    ss_url = f"{base_url}/{ss_filename}"
+                else:
+                    # Just filename
+                    ss_url = f"{base_url}/screenshots/{ss_filename}"
+                
+                logger.debug(f"Loading screenshot from: {ss_url}")
                 self._load_screenshot_async(ss_label, ss_url, i)
             
             scroll_layout.addStretch()
@@ -19275,32 +24098,66 @@ def create_gui_app():
             dialog.exec()
         
         def _load_screenshot_async(self, label, url: str, index: int):
-            """Load a screenshot image asynchronously."""
+            """Load a screenshot image asynchronously using a worker thread with signals."""
             import urllib.request
+            import urllib.error
             from PyQt6.QtGui import QPixmap
-            from PyQt6.QtCore import QByteArray
+            from PyQt6.QtCore import QByteArray, QObject, pyqtSignal
+            
+            # Create a simple signal emitter for thread-safe UI updates
+            class ScreenshotSignal(QObject):
+                finished = pyqtSignal(bytes, object, str, int)  # data, label, url, index
+                error = pyqtSignal(str, object)  # error_msg, label
+            
+            signal_obj = ScreenshotSignal()
+            
+            def on_finished(data, lbl, url, idx):
+                try:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(QByteArray(data))
+                    
+                    if not pixmap.isNull():
+                        if pixmap.width() > 750:
+                            pixmap = pixmap.scaledToWidth(750, Qt.TransformationMode.SmoothTransformation)
+                        lbl.setPixmap(pixmap)
+                        lbl.setMinimumHeight(pixmap.height())
+                        logger.debug(f"[SCREENSHOT] Successfully displayed screenshot {idx+1}")
+                    else:
+                        lbl.setText(f"❌ Failed to decode image {idx+1}\nURL: {url[:60]}...")
+                except RuntimeError:
+                    pass  # Widget was deleted
+            
+            def on_error(error_msg, lbl):
+                try:
+                    lbl.setText(error_msg)
+                except RuntimeError:
+                    pass  # Widget was deleted
+            
+            signal_obj.finished.connect(on_finished)
+            signal_obj.error.connect(on_error)
+            
+            # Keep reference to prevent garbage collection
+            label.setProperty('_signal_obj', signal_obj)
             
             def load_image():
                 try:
-                    req = urllib.request.Request(url, headers={'User-Agent': 'ImageAnarchy/1.1'})
+                    headers = {'User-Agent': 'ImageAnarchy/' + APP_VERSION}
+                    headers.update(get_cf_headers())
+                    logger.info(f"[SCREENSHOT] Loading screenshot {index+1} from: {url}")
+                    req = urllib.request.Request(url, headers=headers)
                     with urllib.request.urlopen(req, timeout=15) as response:
                         data = response.read()
+                        logger.info(f"[SCREENSHOT] Downloaded {len(data)} bytes for screenshot {index+1}")
+                        signal_obj.finished.emit(data, label, url, index)
                         
-                        pixmap = QPixmap()
-                        pixmap.loadFromData(QByteArray(data))
-                        
-                        if not pixmap.isNull():
-                            # Scale to fit nicely (max 750px wide)
-                            if pixmap.width() > 750:
-                                pixmap = pixmap.scaledToWidth(750, Qt.TransformationMode.SmoothTransformation)
-                            label.setPixmap(pixmap)
-                            label.setMinimumHeight(pixmap.height())
-                        else:
-                            label.setText(f"❌ Failed to load image {index+1}")
+                except urllib.error.HTTPError as e:
+                    logger.error(f"[SCREENSHOT] HTTP Error {e.code} loading screenshot {index+1}: {url}")
+                    signal_obj.error.emit(f"❌ HTTP {e.code}: {url[:50]}...", label)
                 except Exception as e:
-                    label.setText(f"❌ Error loading screenshot {index+1}:\n{str(e)[:50]}")
+                    error_msg = str(e)[:100]
+                    logger.error(f"[SCREENSHOT] Error loading screenshot {index+1}: {error_msg} - URL: {url}")
+                    signal_obj.error.emit(f"❌ Error: {str(e)[:40]}\nURL: {url[:50]}...", label)
             
-            # Run in thread to avoid blocking UI
             import threading
             thread = threading.Thread(target=load_image, daemon=True)
             thread.start()
@@ -19635,10 +24492,157 @@ def create_gui_app():
                 self._display_store_plugins(filtered)
                 self.store_status.setText(f"Showing {len(filtered)} plugins in '{category}'")
         
+        def _show_anonymous_terms_dialog(self, plugin_name: str) -> bool:
+            """Show terms acceptance dialog for anonymous downloads.
+            
+            Returns True if user accepts, False otherwise.
+            """
+            dialog = QDialog(self)
+            dialog.setWindowTitle("🏴 Image Anarchy - Terms of Use")
+            dialog.setMinimumSize(600, 550)
+            dialog.setMaximumSize(800, 700)
+            
+            layout = QVBoxLayout(dialog)
+            layout.setSpacing(15)
+            
+            # Header
+            header = QLabel(f"<h2 style='color: #ff6b6b; text-align: center;'>🏴 Before You Download</h2>")
+            header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(header)
+            
+            # Intro text
+            intro = QLabel(
+                f"<p style='font-size: 13px;'>You're about to download <b>{plugin_name}</b> as an anonymous user.</p>"
+                "<p style='font-size: 12px; color: #888;'>Please review and accept our terms to continue.</p>"
+            )
+            intro.setWordWrap(True)
+            intro.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(intro)
+            
+            # Scrollable terms content
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setMinimumHeight(300)
+            
+            terms_widget = QWidget()
+            terms_layout = QVBoxLayout(terms_widget)
+            terms_layout.setContentsMargins(15, 15, 15, 15)
+            
+            terms_html = """
+            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #e0e0e0;">
+            
+            <div style="background: #1a1a2e; border: 1px solid #444; border-radius: 8px; padding: 12px; margin-bottom: 15px;">
+            <h3 style="color: #00ff88; margin-top: 0;">🎯 Our Mission</h3>
+            <p>Image Anarchy empowers <b>true device ownership</b>. When you buy a device, you should have complete control over it.</p>
+            <p style="color: #00ff88;"><b>You bought it. You own it.</b></p>
+            </div>
+            
+            <div style="background: #1a1a2e; border: 2px solid #00ff88; border-radius: 8px; padding: 12px; margin-bottom: 15px;">
+            <h3 style="color: #00ff88; margin-top: 0;">✅ By Downloading, I Agree:</h3>
+            <ul style="margin: 5px 0; padding-left: 20px;">
+            <li><b>Only use these tools on devices I legally own</b></li>
+            <li><b>Comply with all applicable laws</b> in my jurisdiction</li>
+            <li><b>NEVER use these tools on stolen devices</b></li>
+            <li><b>Not use these tools for fraud</b> of any kind</li>
+            <li><b>Accept full responsibility</b> for my actions</li>
+            </ul>
+            </div>
+            
+            <div style="background: #1a1a2e; border: 2px solid #ff6b6b; border-radius: 8px; padding: 12px; margin-bottom: 15px;">
+            <h3 style="color: #ff6b6b; margin-top: 0;">⚠️ IMEI Warning</h3>
+            <p><b>IMEI modification is illegal in many countries</b> including the US, UK, Australia, Canada, and EU.</p>
+            <p>Image Anarchy provides IMEI tools for <b>legitimate purposes only</b>: restoring corrupted IMEI on YOUR OWN device, repairing after failed flash.</p>
+            <p style="color: #ff6b6b;"><b>Using these tools on stolen devices or for fraud is STRICTLY PROHIBITED.</b></p>
+            </div>
+            
+            <div style="background: #2a2a4a; border: 1px solid #666; border-radius: 8px; padding: 12px; margin-bottom: 15px;">
+            <h3 style="color: #00d4ff; margin-top: 0;">📜 The Promise</h3>
+            <p style="font-style: italic; color: #ccc; margin: 5px 0;">
+            "I am here to exercise control over devices I legally own. I will not use these tools to steal, 
+            defraud, or harm others. I understand that device modification carries risks and responsibilities, 
+            and I accept both."
+            </p>
+            </div>
+            
+            <p style="text-align: center; color: #888; font-size: 11px;">
+            Full policy: <a href="https://imageanarchy.com/policy" style="color: #00d4ff;">imageanarchy.com/policy</a>
+            </p>
+            </div>
+            """
+            
+            terms_label = QLabel(terms_html)
+            terms_label.setWordWrap(True)
+            terms_label.setOpenExternalLinks(True)
+            terms_label.setTextFormat(Qt.TextFormat.RichText)
+            terms_layout.addWidget(terms_label)
+            
+            scroll.setWidget(terms_widget)
+            scroll.setStyleSheet("QScrollArea { border: 1px solid #333; border-radius: 8px; background: #0d0d1a; }")
+            layout.addWidget(scroll)
+            
+            # Checkbox
+            checkbox = QCheckBox("I have read and agree to the Image Anarchy Terms of Use")
+            checkbox.setStyleSheet("QCheckBox { font-size: 13px; padding: 10px; } QCheckBox::indicator { width: 18px; height: 18px; }")
+            layout.addWidget(checkbox)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.setSpacing(15)
+            
+            # Login suggestion
+            login_label = QLabel("<a href='#' style='color: #00d4ff;'>Login for faster downloads →</a>")
+            login_label.setOpenExternalLinks(False)
+            login_label.linkActivated.connect(lambda: self._prompt_login_from_terms(dialog))
+            btn_layout.addWidget(login_label)
+            
+            btn_layout.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.setMinimumWidth(100)
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(cancel_btn)
+            
+            accept_btn = QPushButton("✅ I Agree - Continue Download")
+            accept_btn.setMinimumWidth(200)
+            accept_btn.setEnabled(False)
+            accept_btn.setStyleSheet("QPushButton:disabled { background-color: #333; color: #666; }")
+            accept_btn.clicked.connect(dialog.accept)
+            btn_layout.addWidget(accept_btn)
+            
+            # Enable accept button when checkbox is checked
+            checkbox.stateChanged.connect(lambda state: accept_btn.setEnabled(state == Qt.CheckState.Checked.value))
+            
+            layout.addLayout(btn_layout)
+            
+            result = dialog.exec()
+            return result == QDialog.DialogCode.Accepted
+        
+        def _prompt_login_from_terms(self, terms_dialog: QDialog):
+            """Show login prompt from terms dialog."""
+            terms_dialog.reject()  # Close terms dialog
+            # Switch to account tab if it exists, or show login dialog
+            if hasattr(self, 'store_tabs'):
+                # Find and switch to account tab
+                for i in range(self.store_tabs.count()):
+                    if 'account' in self.store_tabs.tabText(i).lower():
+                        self.store_tabs.setCurrentIndex(i)
+                        break
+            QMessageBox.information(
+                self,
+                "Login",
+                "Please log in or create an account to download without the terms prompt.\n\n"
+                "Logged-in users only need to accept terms once during registration."
+            )
+
         def _download_store_plugin(self, plugin: dict):
             """Download and install a plugin from the store."""
             plugin_id = plugin.get('id')
             plugin_name = plugin.get('name', plugin_id)
+            
+            # Check if anonymous download - require terms acceptance first
+            if not plugin_store_api.is_logged_in():
+                if not self._show_anonymous_terms_dialog(plugin_name):
+                    return  # User declined terms
             
             reply = QMessageBox.question(
                 self,
@@ -20213,6 +25217,319 @@ def create_gui_app():
 
             tabs.addTab(logs_widget, "📊 Logs & Stats")
 
+            # Security tab
+            security_widget = QWidget()
+            security_layout = QVBoxLayout(security_widget)
+
+            security_label = QLabel("🔒 Security logs and scan results:")
+            security_label.setStyleSheet("font-weight: bold;")
+            security_layout.addWidget(security_label)
+
+            # Security logs filter
+            sec_filter_row = QHBoxLayout()
+            sec_filter_label = QLabel("Event Type:")
+            sec_filter_row.addWidget(sec_filter_label)
+
+            self._security_filter_combo = QComboBox()
+            self._security_filter_combo.addItems(["All Events", "SCAN_THREAT", "FILE_QUARANTINED", "UPLOAD_BLOCKED", "SCAN_CLEAN"])
+            self._security_filter_combo.currentTextChanged.connect(lambda: self._load_security_logs(dialog))
+            sec_filter_row.addWidget(self._security_filter_combo)
+
+            sec_filter_row.addStretch()
+
+            refresh_sec_btn = QPushButton("🔄 Refresh")
+            refresh_sec_btn.clicked.connect(lambda: self._load_security_logs(dialog))
+            sec_filter_row.addWidget(refresh_sec_btn)
+
+            security_layout.addLayout(sec_filter_row)
+
+            self._security_logs_list = QListWidget()
+            self._security_logs_list.setStyleSheet("""
+                QListWidget::item { padding: 6px; border-bottom: 1px solid #333; font-family: monospace; }
+                QListWidget::item:selected { background: #2d4a6d; }
+            """)
+            security_layout.addWidget(self._security_logs_list)
+
+            # Quarantine section
+            quarantine_label = QLabel("🦠 Quarantined Files:")
+            quarantine_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            security_layout.addWidget(quarantine_label)
+
+            self._quarantine_list = QListWidget()
+            self._quarantine_list.setMaximumHeight(150)
+            self._quarantine_list.setStyleSheet("""
+                QListWidget::item { padding: 4px; border-bottom: 1px solid #333; }
+                QListWidget::item:selected { background: #4d2a2d; }
+            """)
+            security_layout.addWidget(self._quarantine_list)
+
+            quarantine_btn_layout = QHBoxLayout()
+            refresh_quar_btn = QPushButton("🔄 Refresh")
+            refresh_quar_btn.clicked.connect(lambda: self._load_quarantine_files(dialog))
+            quarantine_btn_layout.addWidget(refresh_quar_btn)
+
+            quarantine_btn_layout.addStretch()
+
+            delete_quar_btn = QPushButton("🗑️ Delete Selected")
+            delete_quar_btn.setStyleSheet("background: #f44336;")
+            delete_quar_btn.clicked.connect(lambda: self._delete_quarantine_file(dialog))
+            quarantine_btn_layout.addWidget(delete_quar_btn)
+
+            security_layout.addLayout(quarantine_btn_layout)
+
+            tabs.addTab(security_widget, "🔒 Security")
+
+            # IP Banning tab
+            ip_widget = QWidget()
+            ip_layout = QVBoxLayout(ip_widget)
+
+            ip_label = QLabel("🚫 IP Banning Management:")
+            ip_label.setStyleSheet("font-weight: bold;")
+            ip_layout.addWidget(ip_label)
+
+            # Ban IP section
+            ban_group = QGroupBox("Ban an IP Address")
+            ban_group.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 15px; }")
+            ban_form = QFormLayout(ban_group)
+
+            self._ban_ip_input = QLineEdit()
+            self._ban_ip_input.setPlaceholderText("e.g., 192.168.1.100")
+            ban_form.addRow("IP Address:", self._ban_ip_input)
+
+            self._ban_reason_input = QLineEdit()
+            self._ban_reason_input.setPlaceholderText("Reason for ban...")
+            ban_form.addRow("Reason:", self._ban_reason_input)
+
+            self._ban_permanent_checkbox = QCheckBox("Permanent ban (no expiry)")
+            ban_form.addRow("", self._ban_permanent_checkbox)
+
+            ban_btn = QPushButton("🚫 Ban IP")
+            ban_btn.setStyleSheet("background: #f44336; padding: 8px 16px;")
+            ban_btn.clicked.connect(lambda: self._ban_ip_action(dialog))
+            ban_form.addRow("", ban_btn)
+
+            ip_layout.addWidget(ban_group)
+
+            # Banned IPs list
+            banned_label = QLabel("🚫 Currently Banned IPs:")
+            banned_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            ip_layout.addWidget(banned_label)
+
+            self._banned_ips_list = QListWidget()
+            self._banned_ips_list.setStyleSheet("""
+                QListWidget::item { padding: 6px; border-bottom: 1px solid #333; }
+                QListWidget::item:selected { background: #4d2a2d; }
+            """)
+            ip_layout.addWidget(self._banned_ips_list)
+
+            banned_btn_layout = QHBoxLayout()
+            refresh_banned_btn = QPushButton("🔄 Refresh")
+            refresh_banned_btn.clicked.connect(lambda: self._load_banned_ips(dialog))
+            banned_btn_layout.addWidget(refresh_banned_btn)
+
+            banned_btn_layout.addStretch()
+
+            unban_btn = QPushButton("✅ Unban Selected")
+            unban_btn.setStyleSheet("background: #4CAF50; padding: 8px 16px;")
+            unban_btn.clicked.connect(lambda: self._unban_ip_action(dialog))
+            banned_btn_layout.addWidget(unban_btn)
+
+            ip_layout.addLayout(banned_btn_layout)
+
+            # Suspicious IPs list
+            suspicious_label = QLabel("⚠️ Suspicious IPs (high request count):")
+            suspicious_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            ip_layout.addWidget(suspicious_label)
+
+            self._suspicious_ips_list = QListWidget()
+            self._suspicious_ips_list.setMaximumHeight(150)
+            self._suspicious_ips_list.setStyleSheet("""
+                QListWidget::item { padding: 4px; border-bottom: 1px solid #333; }
+                QListWidget::item:selected { background: #4d3a2d; }
+            """)
+            ip_layout.addWidget(self._suspicious_ips_list)
+
+            tabs.addTab(ip_widget, "🚫 IP Bans")
+
+            # Chat Admin tab
+            chat_admin_widget = QWidget()
+            chat_admin_layout = QVBoxLayout(chat_admin_widget)
+
+            chat_admin_label = QLabel("💬 Chat & Rooms Administration:")
+            chat_admin_label.setStyleSheet("font-weight: bold;")
+            chat_admin_layout.addWidget(chat_admin_label)
+
+            # Chat stats section
+            chat_stats_group = QGroupBox("📈 Chat Statistics")
+            chat_stats_group.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 15px; }")
+            chat_stats_layout = QGridLayout(chat_stats_group)
+
+            self._chat_stats_labels = {}
+            chat_stat_items = [
+                ("total_messages", "Total Messages:", 0, 0),
+                ("messages_today", "Messages Today:", 0, 1),
+                ("total_rooms", "Total Rooms:", 0, 2),
+                ("active_users", "Active Users (24h):", 1, 0),
+                ("online_now", "Online Now:", 1, 1),
+                ("total_users", "Registered Users:", 1, 2),
+            ]
+
+            for key, label_text, row, col in chat_stat_items:
+                label = QLabel(label_text)
+                label.setStyleSheet("color: #888;")
+                value = QLabel("--")
+                value.setStyleSheet("font-weight: bold; font-size: 16px; color: #4fc3f7;")
+                self._chat_stats_labels[key] = value
+
+                item_layout = QVBoxLayout()
+                item_layout.addWidget(label)
+                item_layout.addWidget(value)
+                chat_stats_layout.addLayout(item_layout, row, col)
+
+            chat_admin_layout.addWidget(chat_stats_group)
+
+            # Rooms management section
+            rooms_label = QLabel("🏠 Chat Rooms:")
+            rooms_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            chat_admin_layout.addWidget(rooms_label)
+
+            self._admin_rooms_list = QListWidget()
+            self._admin_rooms_list.setStyleSheet("""
+                QListWidget::item { padding: 8px; border-bottom: 1px solid #333; }
+                QListWidget::item:selected { background: #2d4a6d; }
+            """)
+            chat_admin_layout.addWidget(self._admin_rooms_list)
+
+            rooms_btn_layout = QHBoxLayout()
+            
+            # Create Room button with emoji picker
+            create_room_btn = QPushButton("➕ Create Room")
+            create_room_btn.setStyleSheet("background: #4CAF50; padding: 8px 16px;")
+            create_room_btn.clicked.connect(lambda: self._show_create_room_dialog(dialog))
+            rooms_btn_layout.addWidget(create_room_btn)
+            
+            refresh_rooms_btn = QPushButton("🔄 Refresh")
+            refresh_rooms_btn.clicked.connect(lambda: self._load_admin_chat_data(dialog))
+            rooms_btn_layout.addWidget(refresh_rooms_btn)
+
+            rooms_btn_layout.addStretch()
+
+            view_room_btn = QPushButton("👁️ View Messages")
+            view_room_btn.setStyleSheet("background: #2196F3; padding: 8px 16px;")
+            view_room_btn.clicked.connect(lambda: self._view_room_messages(dialog))
+            rooms_btn_layout.addWidget(view_room_btn)
+
+            delete_room_btn = QPushButton("🗑️ Delete Room")
+            delete_room_btn.setStyleSheet("background: #f44336; padding: 8px 16px;")
+            delete_room_btn.clicked.connect(lambda: self._delete_admin_room(dialog))
+            rooms_btn_layout.addWidget(delete_room_btn)
+
+            chat_admin_layout.addLayout(rooms_btn_layout)
+
+            # Users management section
+            chat_users_label = QLabel("👥 Chat Users (with moderation actions):")
+            chat_users_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+            chat_admin_layout.addWidget(chat_users_label)
+
+            # Search/filter row
+            user_filter_row = QHBoxLayout()
+            user_filter_label = QLabel("Search:")
+            user_filter_row.addWidget(user_filter_label)
+
+            self._chat_user_search = QLineEdit()
+            self._chat_user_search.setPlaceholderText("Search by username...")
+            self._chat_user_search.textChanged.connect(lambda: self._filter_chat_users())
+            user_filter_row.addWidget(self._chat_user_search)
+
+            user_filter_row.addStretch()
+            chat_admin_layout.addLayout(user_filter_row)
+
+            self._admin_chat_users_list = QListWidget()
+            self._admin_chat_users_list.setMaximumHeight(200)
+            self._admin_chat_users_list.setStyleSheet("""
+                QListWidget::item { padding: 6px; border-bottom: 1px solid #333; }
+                QListWidget::item:selected { background: #2d4a6d; }
+            """)
+            chat_admin_layout.addWidget(self._admin_chat_users_list)
+
+            users_btn_layout = QHBoxLayout()
+
+            mute_user_btn = QPushButton("🔇 Mute User")
+            mute_user_btn.setStyleSheet("background: #ff9800; padding: 8px 16px;")
+            mute_user_btn.clicked.connect(lambda: self._admin_mute_user(dialog))
+            users_btn_layout.addWidget(mute_user_btn)
+
+            ban_user_btn = QPushButton("🚫 Ban from Chat")
+            ban_user_btn.setStyleSheet("background: #f44336; padding: 8px 16px;")
+            ban_user_btn.clicked.connect(lambda: self._admin_ban_chat_user(dialog))
+            users_btn_layout.addWidget(ban_user_btn)
+
+            users_btn_layout.addStretch()
+
+            unban_user_btn = QPushButton("✅ Unban User")
+            unban_user_btn.setStyleSheet("background: #4CAF50; padding: 8px 16px;")
+            unban_user_btn.clicked.connect(lambda: self._admin_unban_chat_user(dialog))
+            users_btn_layout.addWidget(unban_user_btn)
+
+            chat_admin_layout.addLayout(users_btn_layout)
+
+            # Global chat settings
+            settings_group = QGroupBox("⚙️ Global Chat Settings")
+            settings_group.setStyleSheet("QGroupBox { font-weight: bold; padding-top: 15px; }")
+            settings_layout = QFormLayout(settings_group)
+
+            self._chat_enabled_checkbox = QCheckBox("Chat enabled")
+            self._chat_enabled_checkbox.setChecked(True)
+            settings_layout.addRow("", self._chat_enabled_checkbox)
+
+            self._chat_slowmode_input = QSpinBox()
+            self._chat_slowmode_input.setRange(0, 300)
+            self._chat_slowmode_input.setSuffix(" seconds")
+            self._chat_slowmode_input.setToolTip("0 = no slow mode")
+            settings_layout.addRow("Slow Mode:", self._chat_slowmode_input)
+
+            broadcast_layout = QHBoxLayout()
+            self._chat_broadcast_input = QLineEdit()
+            self._chat_broadcast_input.setPlaceholderText("System announcement message...")
+            broadcast_layout.addWidget(self._chat_broadcast_input)
+            broadcast_btn = QPushButton("📢 Broadcast")
+            broadcast_btn.setStyleSheet("background: #ff9800;")
+            broadcast_btn.clicked.connect(lambda: self._broadcast_chat_message(dialog))
+            broadcast_layout.addWidget(broadcast_btn)
+            settings_layout.addRow("Broadcast:", broadcast_layout)
+
+            chat_admin_layout.addWidget(settings_group)
+
+            tabs.addTab(chat_admin_widget, "💬 Chat Admin")
+
+            # Forum tab with iframe
+            forum_widget = QWidget()
+            forum_layout = QVBoxLayout(forum_widget)
+            forum_layout.setContentsMargins(0, 0, 0, 0)
+            
+            try:
+                from PyQt6.QtWebEngineWidgets import QWebEngineView
+                from PyQt6.QtCore import QUrl
+                forum_webview = QWebEngineView()
+                forum_webview.setUrl(QUrl("https://forum.imageanarchy.com"))
+                forum_layout.addWidget(forum_webview)
+            except ImportError:
+                # Fallback if QtWebEngine not installed
+                fallback_label = QLabel("📌 Forum: forum.imageanarchy.com\n\nQtWebEngine not installed.\nRun: pip install PyQt6-WebEngine")
+                fallback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                fallback_label.setStyleSheet("font-size: 14px; color: #888; padding: 40px;")
+                
+                open_browser_btn = QPushButton("🌐 Open Forum in Browser")
+                open_browser_btn.setStyleSheet("padding: 15px 30px; font-size: 14px;")
+                open_browser_btn.clicked.connect(lambda: __import__('webbrowser').open("https://forum.imageanarchy.com"))
+                
+                forum_layout.addStretch()
+                forum_layout.addWidget(fallback_label)
+                forum_layout.addWidget(open_browser_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+                forum_layout.addStretch()
+            
+            tabs.addTab(forum_widget, "🌐 Forum")
+
             # Connect tab change to load data
             def on_tab_changed(idx):
                 if idx == 1:
@@ -20221,6 +25538,18 @@ def create_gui_app():
                     self._load_app_versions(dialog)
                 elif idx == 3:
                     self._load_logs_and_stats(dialog)
+                elif idx == 4:
+                    self._load_security_logs(dialog)
+                    self._load_quarantine_files(dialog)
+                elif idx == 5:
+                    self._load_banned_ips(dialog)
+                elif idx == 6:
+                    self._load_admin_chat_data(dialog)
+                # idx == 7 is Forum tab - no special load needed
+                elif idx == 5:
+                    self._load_banned_ips(dialog)
+                elif idx == 6:
+                    self._load_admin_chat_data(dialog)
             tabs.currentChanged.connect(on_tab_changed)
 
             layout.addWidget(tabs)
@@ -20241,74 +25570,82 @@ def create_gui_app():
             dialog.exec()
         
         def _load_pending_plugins(self, dialog):
-            """Load pending plugins from server."""
+            """Load pending plugins from server using background thread."""
             self._admin_pending_list.clear()
             self._admin_status.setText("Loading pending plugins...")
             self._admin_status.setStyleSheet("color: #888;")
-            QApplication.processEvents()
             
-            result = plugin_store_api.get_pending_plugins()
+            # Use background thread to avoid blocking UI
+            self._admin_pending_thread = AdminApiThread(plugin_store_api, 'get_pending_plugins')
             
-            if 'error' in result:
-                self._admin_status.setText(f"Error: {result['error']}")
-                self._admin_status.setStyleSheet("color: #f44336;")
-                return
-            
-            plugins = result.get('plugins', [])
-            
-            if not plugins:
-                self._admin_status.setText("🎉 No pending plugins to review!")
-                self._admin_status.setStyleSheet("color: #4CAF50;")
-                return
-            
-            for p in plugins:
-                item = QListWidgetItem()
-                item.setData(Qt.ItemDataRole.UserRole, p)
+            def on_pending_loaded(result):
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
                 
-                status_icon = "⏳"
-                text = f"{p.get('icon', '📦')} {p.get('name', 'Unknown')} v{p.get('version', '?')}\n"
-                text += f"   by {p.get('author_name', 'Unknown')} | {p.get('category', 'other')}\n"
-                text += f"   {p.get('description', '')[:100]}..."
-                item.setText(text)
+                plugins = result.get('plugins', [])
                 
-                self._admin_pending_list.addItem(item)
+                if not plugins:
+                    self._admin_status.setText("🎉 No pending plugins to review!")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    return
+                
+                for p in plugins:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, p)
+                    
+                    status_icon = "⏳"
+                    text = f"{p.get('icon', '📦')} {p.get('name', 'Unknown')} v{p.get('version', '?')}\n"
+                    text += f"   by {p.get('author_name', 'Unknown')} | {p.get('category', 'other')}\n"
+                    text += f"   {p.get('description', '')[:100]}..."
+                    item.setText(text)
+                    
+                    self._admin_pending_list.addItem(item)
+                
+                self._admin_status.setText(f"Found {len(plugins)} pending plugin(s)")
+                self._admin_status.setStyleSheet("color: #4fc3f7;")
             
-            self._admin_status.setText(f"Found {len(plugins)} pending plugin(s)")
-            self._admin_status.setStyleSheet("color: #4fc3f7;")
+            self._admin_pending_thread.finished.connect(on_pending_loaded)
+            self._admin_pending_thread.start()
         
         def _load_all_admin_plugins(self, dialog):
-            """Load all plugins from server."""
+            """Load all plugins from server using background thread."""
             self._admin_all_list.clear()
             self._admin_status.setText("Loading all plugins...")
-            QApplication.processEvents()
             
-            result = plugin_store_api.get_all_admin_plugins()
+            # Use background thread to avoid blocking UI
+            self._admin_all_thread = AdminApiThread(plugin_store_api, 'get_all_admin_plugins')
             
-            if 'error' in result:
-                self._admin_status.setText(f"Error: {result['error']}")
-                self._admin_status.setStyleSheet("color: #f44336;")
-                return
-            
-            plugins = result.get('plugins', [])
-            
-            for p in plugins:
-                item = QListWidgetItem()
-                item.setData(Qt.ItemDataRole.UserRole, p)
+            def on_all_loaded(result):
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
                 
-                status = p.get('status', 'unknown')
-                status_icon = "✅" if status == 'approved' else "⏳" if status == 'pending' else "❌"
+                plugins = result.get('plugins', [])
                 
-                text = f"{status_icon} {p.get('icon', '📦')} {p.get('name', 'Unknown')} v{p.get('version', '?')} [{status}]\n"
-                text += f"   by {p.get('author_name', 'Unknown')} | ⬇️ {p.get('downloads', 0)} downloads"
-                item.setText(text)
+                for p in plugins:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, p)
+                    
+                    status = p.get('status', 'unknown')
+                    status_icon = "✅" if status == 'approved' else "⏳" if status == 'pending' else "❌"
+                    
+                    text = f"{status_icon} {p.get('icon', '📦')} {p.get('name', 'Unknown')} v{p.get('version', '?')} [{status}]\n"
+                    text += f"   by {p.get('author_name', 'Unknown')} | ⬇️ {p.get('downloads', 0)} downloads"
+                    item.setText(text)
+                    
+                    self._admin_all_list.addItem(item)
                 
-                self._admin_all_list.addItem(item)
+                self._admin_status.setText(f"Found {len(plugins)} plugin(s)")
+                self._admin_status.setStyleSheet("color: #4fc3f7;")
             
-            self._admin_status.setText(f"Found {len(plugins)} plugin(s)")
-            self._admin_status.setStyleSheet("color: #4fc3f7;")
+            self._admin_all_thread.finished.connect(on_all_loaded)
+            self._admin_all_thread.start()
         
         def _approve_selected_plugin(self, dialog):
-            """Approve the selected pending plugin."""
+            """Approve the selected pending plugin using background thread with progress tracking."""
             item = self._admin_pending_list.currentItem()
             if not item:
                 QMessageBox.warning(dialog, "No Selection", "Please select a plugin to approve.")
@@ -20321,29 +25658,128 @@ def create_gui_app():
             reply = QMessageBox.question(
                 dialog,
                 "Approve Plugin",
-                f"Approve '{plugin_name}'?\n\nIt will become publicly visible in the store.",
+                f"Approve '{plugin_name}'?\n\nIt will become publicly visible in the store.\n\n⚠️ Note: If the plugin has external dependencies,\nvirus scanning may take several minutes.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             
             if reply != QMessageBox.StandardButton.Yes:
                 return
             
-            self._admin_status.setText(f"Approving {plugin_name}...")
-            QApplication.processEvents()
+            # Create progress dialog
+            progress_dialog = QDialog(dialog)
+            progress_dialog.setWindowTitle(f"Approving {plugin_name}")
+            progress_dialog.setFixedSize(450, 180)
+            progress_dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+            progress_layout = QVBoxLayout(progress_dialog)
+            progress_layout.setSpacing(15)
             
-            result = plugin_store_api.approve_plugin(plugin_id)
+            title_label = QLabel(f"🔄 Approving: {plugin_name}")
+            title_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #2196F3;")
+            progress_layout.addWidget(title_label)
             
-            if 'error' in result:
-                self._admin_status.setText(f"Error: {result['error']}")
-                self._admin_status.setStyleSheet("color: #f44336;")
-            else:
-                self._admin_status.setText(f"✅ {plugin_name} approved!")
-                self._admin_status.setStyleSheet("color: #4CAF50;")
-                self._load_pending_plugins(dialog)
-                self._refresh_store()  # Refresh main store view
+            progress_bar = QProgressBar()
+            progress_bar.setMinimum(0)
+            progress_bar.setMaximum(100)
+            progress_bar.setValue(0)
+            progress_bar.setTextVisible(True)
+            progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 2px solid #333;
+                    border-radius: 5px;
+                    text-align: center;
+                    background-color: #1a1a2e;
+                    height: 25px;
+                }
+                QProgressBar::chunk {
+                    background-color: #4fc3f7;
+                    border-radius: 3px;
+                }
+            """)
+            progress_layout.addWidget(progress_bar)
+            
+            status_label = QLabel("Starting approval process...")
+            status_label.setStyleSheet("color: #888; font-size: 11px;")
+            status_label.setWordWrap(True)
+            progress_layout.addWidget(status_label)
+            
+            cancel_btn = QPushButton("Close (approval will continue in background)")
+            cancel_btn.setEnabled(False)
+            cancel_btn.clicked.connect(progress_dialog.accept)
+            progress_layout.addWidget(cancel_btn)
+            
+            # Store references for the timer
+            self._approve_progress_dialog = progress_dialog
+            self._approve_progress_bar = progress_bar
+            self._approve_status_label = status_label
+            self._approve_cancel_btn = cancel_btn
+            self._approve_plugin_id = plugin_id
+            self._approve_plugin_name = plugin_name
+            self._approve_completed = False
+            
+            # Progress polling timer
+            self._approve_progress_timer = QTimer()
+            self._approve_progress_timer.setInterval(2000)  # Poll every 2 seconds
+            
+            def poll_progress():
+                if self._approve_completed:
+                    self._approve_progress_timer.stop()
+                    return
+                try:
+                    progress = plugin_store_api.get_approve_progress(self._approve_plugin_id)
+                    if progress and 'status' in progress:
+                        step = progress.get('step', 'Processing...')
+                        pct = progress.get('progress', 0)
+                        status = progress.get('status', '')
+                        
+                        self._approve_progress_bar.setValue(pct)
+                        self._approve_status_label.setText(step)
+                        
+                        if status == 'completed':
+                            self._approve_progress_timer.stop()
+                        elif status == 'failed':
+                            self._approve_progress_timer.stop()
+                            error = progress.get('error', 'Unknown error')
+                            self._approve_status_label.setText(f"❌ Failed: {error}")
+                            self._approve_status_label.setStyleSheet("color: #f44336; font-size: 11px;")
+                except Exception:
+                    pass  # Silently ignore polling errors
+            
+            self._approve_progress_timer.timeout.connect(poll_progress)
+            self._approve_progress_timer.start()
+            
+            # Start approval in background thread
+            self._admin_approve_thread = AdminApiThread(plugin_store_api, 'approve_plugin', plugin_id)
+            
+            def on_approve_finished(result):
+                self._approve_completed = True
+                self._approve_progress_timer.stop()
+                
+                if 'error' in result:
+                    self._approve_progress_bar.setValue(100)
+                    self._approve_status_label.setText(f"❌ Error: {result['error']}")
+                    self._approve_status_label.setStyleSheet("color: #f44336; font-size: 11px;")
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                else:
+                    self._approve_progress_bar.setValue(100)
+                    self._approve_status_label.setText(f"✅ {plugin_name} approved successfully!")
+                    self._approve_status_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+                    self._admin_status.setText(f"✅ {plugin_name} approved!")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    self._load_pending_plugins(dialog)
+                    self._refresh_store()  # Refresh main store view
+                
+                self._approve_cancel_btn.setText("Close")
+                self._approve_cancel_btn.setEnabled(True)
+            
+            self._admin_approve_thread.finished.connect(on_approve_finished)
+            self._admin_approve_thread.start()
+            
+            # Show progress dialog
+            progress_dialog.exec()
         
         def _reject_selected_plugin(self, dialog):
-            """Reject the selected pending plugin."""
+            """Reject the selected pending plugin using background thread."""
             item = self._admin_pending_list.currentItem()
             if not item:
                 QMessageBox.warning(dialog, "No Selection", "Please select a plugin to reject.")
@@ -20362,21 +25798,26 @@ def create_gui_app():
             if not ok:
                 return
             
-            self._admin_status.setText(f"Rejecting {plugin_name}...")
-            QApplication.processEvents()
+            self._admin_status.setText(f"⏳ Rejecting {plugin_name}...")
+            self._admin_status.setStyleSheet("color: #ff9800;")
             
-            result = plugin_store_api.reject_plugin(plugin_id, reason)
+            # Use background thread to avoid blocking UI
+            self._admin_reject_thread = AdminApiThread(plugin_store_api, 'reject_plugin', plugin_id, reason)
             
-            if 'error' in result:
-                self._admin_status.setText(f"Error: {result['error']}")
-                self._admin_status.setStyleSheet("color: #f44336;")
-            else:
-                self._admin_status.setText(f"❌ {plugin_name} rejected")
-                self._admin_status.setStyleSheet("color: #ff9800;")
-                self._load_pending_plugins(dialog)
+            def on_reject_finished(result):
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                else:
+                    self._admin_status.setText(f"❌ {plugin_name} rejected")
+                    self._admin_status.setStyleSheet("color: #ff9800;")
+                    self._load_pending_plugins(dialog)
+            
+            self._admin_reject_thread.finished.connect(on_reject_finished)
+            self._admin_reject_thread.start()
         
         def _delete_selected_plugin(self, dialog):
-            """Delete the selected plugin."""
+            """Delete the selected plugin using background thread."""
             item = self._admin_all_list.currentItem()
             if not item:
                 QMessageBox.warning(dialog, "No Selection", "Please select a plugin to delete.")
@@ -20396,19 +25837,24 @@ def create_gui_app():
             if reply != QMessageBox.StandardButton.Yes:
                 return
             
-            self._admin_status.setText(f"Deleting {plugin_name}...")
-            QApplication.processEvents()
+            self._admin_status.setText(f"⏳ Deleting {plugin_name}...")
+            self._admin_status.setStyleSheet("color: #ff9800;")
             
-            result = plugin_store_api.delete_plugin(plugin_id)
+            # Use background thread to avoid blocking UI
+            self._admin_delete_thread = AdminApiThread(plugin_store_api, 'delete_plugin', plugin_id)
             
-            if 'error' in result:
-                self._admin_status.setText(f"Error: {result['error']}")
-                self._admin_status.setStyleSheet("color: #f44336;")
-            else:
-                self._admin_status.setText(f"🗑️ {plugin_name} deleted")
-                self._admin_status.setStyleSheet("color: #ff9800;")
-                self._load_all_admin_plugins(dialog)
-                self._refresh_store()
+            def on_delete_finished(result):
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                else:
+                    self._admin_status.setText(f"🗑️ {plugin_name} deleted")
+                    self._admin_status.setStyleSheet("color: #ff9800;")
+                    self._load_all_admin_plugins(dialog)
+                    self._refresh_store()
+            
+            self._admin_delete_thread.finished.connect(on_delete_finished)
+            self._admin_delete_thread.start()
 
         def _browse_update_file(self):
             """Browse for update exe file."""
@@ -20419,7 +25865,7 @@ def create_gui_app():
                 self._update_file_path.setText(file_path)
 
         def _publish_app_update(self, dialog):
-            """Publish a new app version."""
+            """Publish a new app version with chunked upload support."""
             version = self._update_version_input.text().strip()
             changelog = self._update_changelog_input.toPlainText().strip()
             file_path = self._update_file_path.text().strip()
@@ -20433,78 +25879,74 @@ def create_gui_app():
                 QMessageBox.warning(dialog, "File Not Found", f"File not found: {file_path}")
                 return
 
+            # Get file size for user info
+            file_size = os.path.getsize(file_path)
+            size_mb = file_size / (1024 * 1024)
+            
             # Show progress
             self._update_progress.setVisible(True)
             self._update_progress.setValue(0)
-            self._admin_status.setText("📤 Uploading update...")
+            
+            if size_mb > 45:
+                chunks_needed = int((size_mb / 45) + 1)
+                self._admin_status.setText(f"📤 Uploading {size_mb:.1f} MB in {chunks_needed} chunks (Cloudflare limit)...")
+            else:
+                self._admin_status.setText(f"📤 Uploading {size_mb:.1f} MB...")
+            self._admin_status.setStyleSheet("color: #2196F3;")
             QApplication.processEvents()
 
-            try:
-                # Upload using multipart form
-                import urllib.request
-                import mimetypes
-
-                boundary = f'----WebKitFormBoundary{uuid.uuid4().hex}'
-
-                # Build multipart body
-                lines = []
-
-                # Version field
-                lines.append(f'--{boundary}')
-                lines.append('Content-Disposition: form-data; name="version"')
-                lines.append('')
-                lines.append(version)
-
-                # Changelog field
-                lines.append(f'--{boundary}')
-                lines.append('Content-Disposition: form-data; name="changelog"')
-                lines.append('')
-                lines.append(changelog)
-
-                # Is critical field
-                lines.append(f'--{boundary}')
-                lines.append('Content-Disposition: form-data; name="is_critical"')
-                lines.append('')
-                lines.append('1' if is_critical else '0')
-
-                # Convert text lines to bytes
-                body_start = '\r\n'.join(lines).encode('utf-8') + b'\r\n'
-
-                # File part header
-                filename = os.path.basename(file_path)
-                file_header = f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\nContent-Type: application/octet-stream\r\n\r\n'
-
-                # Read file
-                with open(file_path, 'rb') as f:
-                    file_data = f.read()
-
-                # End boundary
-                body_end = f'\r\n--{boundary}--\r\n'.encode('utf-8')
-
-                # Combine all parts
-                body = body_start + file_header.encode('utf-8') + file_data + body_end
-
-                self._update_progress.setValue(50)
+            # Run upload in a background thread to not freeze UI
+            class UpdateUploadThread(QThread):
+                progress = pyqtSignal(int, str)
+                finished = pyqtSignal(dict)
+                
+                def __init__(self, api, version, changelog, file_path, is_critical):
+                    super().__init__()
+                    self.api = api
+                    self.version = version
+                    self.changelog = changelog
+                    self.file_path = file_path
+                    self.is_critical = is_critical
+                
+                def run(self):
+                    try:
+                        # Read file
+                        with open(self.file_path, 'rb') as f:
+                            file_data = f.read()
+                        
+                        def progress_callback(pct, msg):
+                            self.progress.emit(pct, msg)
+                        
+                        # Use the API method with progress callback
+                        result = self.api.publish_app_update(
+                            version=self.version,
+                            changelog=self.changelog,
+                            file_data=file_data,
+                            filename=os.path.basename(self.file_path),
+                            is_critical=self.is_critical,
+                            progress_callback=progress_callback
+                        )
+                        self.finished.emit(result)
+                    except Exception as e:
+                        self.finished.emit({'error': str(e)})
+            
+            self._upload_thread = UpdateUploadThread(
+                plugin_store_api, version, changelog, file_path, is_critical
+            )
+            
+            def on_progress(pct, msg):
+                self._update_progress.setValue(pct)
+                self._admin_status.setText(f"📤 {msg}")
                 QApplication.processEvents()
-
-                # Send request
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/publish"
-                req = urllib.request.Request(url, data=body, method='POST')
-                req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                # Add Cloudflare Zero Trust headers
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                import ssl
-                ctx = ssl.create_default_context()
-
-                with urllib.request.urlopen(req, timeout=300, context=ctx) as response:
-                    result = json.loads(response.read().decode('utf-8'))
-
-                self._update_progress.setValue(100)
+            
+            def on_finished(result):
                 self._update_progress.setVisible(False)
-
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
+                
                 if result.get('success'):
                     self._admin_status.setText(f"✅ Version {version} published successfully!")
                     self._admin_status.setStyleSheet("color: #4CAF50;")
@@ -20516,12 +25958,12 @@ def create_gui_app():
                     # Refresh list
                     self._load_app_versions(dialog)
                 else:
-                    raise Exception(result.get('error', 'Unknown error'))
-
-            except Exception as e:
-                self._update_progress.setVisible(False)
-                self._admin_status.setText(f"❌ Upload failed: {e}")
-                self._admin_status.setStyleSheet("color: #f44336;")
+                    self._admin_status.setText(f"❌ Upload failed: {result.get('error', 'Unknown error')}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+            
+            self._upload_thread.progress.connect(on_progress)
+            self._upload_thread.finished.connect(on_finished)
+            self._upload_thread.start()
 
         def _load_app_versions(self, dialog):
             """Load published app versions from server."""
@@ -20530,20 +25972,14 @@ def create_gui_app():
             QApplication.processEvents()
 
             try:
-                import urllib.request
-                import ssl
+                result = plugin_store_api.get_app_versions()
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
 
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/list"
-                req = urllib.request.Request(url)
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-
-                versions = data.get('versions', [])
+                versions = result.get('versions', [])
 
                 for v in versions:
                     size_mb = v.get('file_size', 0) / (1024 * 1024)
@@ -20587,22 +26023,14 @@ def create_gui_app():
                 return
 
             try:
-                import urllib.request
-                import ssl
+                result = plugin_store_api.toggle_version_publish(version, not is_published)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
 
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/{version}"
-                data = json.dumps({'published': not is_published}).encode('utf-8')
-                req = urllib.request.Request(url, data=data, method='PUT')
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                req.add_header('Content-Type', 'application/json')
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                    result = json.loads(response.read().decode('utf-8'))
-
-                self._admin_status.setText(f"✅ Version {version} {'unpublished' if is_published else 'published'}")
+                self._admin_status.setText(f"✅ Version {version} {'published' if not is_published else 'unpublished'}")
                 self._admin_status.setStyleSheet("color: #4CAF50;")
                 self._load_app_versions(dialog)
 
@@ -20628,18 +26056,12 @@ def create_gui_app():
                 return
 
             try:
-                import urllib.request
-                import ssl
-
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/{version}"
-                req = urllib.request.Request(url, method='DELETE')
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                    result = json.loads(response.read().decode('utf-8'))
+                result = plugin_store_api.delete_app_version(version)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
 
                 self._admin_status.setText(f"🗑️ Version {version} deleted")
                 self._admin_status.setStyleSheet("color: #ff9800;")
@@ -20662,22 +26084,16 @@ def create_gui_app():
         def _load_update_stats(self, dialog):
             """Load update statistics from server."""
             try:
-                import urllib.request
-                import ssl
-
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/stats"
-                req = urllib.request.Request(url)
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                    data = json.loads(response.read().decode('utf-8'))
+                result = plugin_store_api.get_update_stats()
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
 
                 # Update stat labels
-                today = data.get('today', {})
-                week = data.get('week', {})
+                today = result.get('today', {})
+                week = result.get('week', {})
 
                 self._stats_labels['checks_today'].setText(str(today.get('checks', 0)))
                 self._stats_labels['downloads_today'].setText(str(today.get('downloads', 0)))
@@ -20694,7 +26110,7 @@ def create_gui_app():
 
                 # Update version distribution
                 self._version_dist_list.clear()
-                for v in data.get('version_distribution', []):
+                for v in result.get('version_distribution', []):
                     self._version_dist_list.addItem(f"v{v['current_version']}: {v['count']} checks")
 
                 self._admin_status.setText("📊 Statistics loaded")
@@ -20707,9 +26123,6 @@ def create_gui_app():
         def _load_update_logs(self, dialog):
             """Load update logs from server."""
             try:
-                import urllib.request
-                import ssl
-
                 # Determine filter
                 filter_text = self._log_filter_combo.currentText()
                 event_type = None
@@ -20718,22 +26131,16 @@ def create_gui_app():
                 elif filter_text == "Downloads":
                     event_type = "download"
 
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/logs?limit=100"
-                if event_type:
-                    url += f"&event_type={event_type}"
-
-                req = urllib.request.Request(url)
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                    data = json.loads(response.read().decode('utf-8'))
+                result = plugin_store_api.get_update_logs(limit=100, event_type=event_type)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
 
                 self._update_logs_list.clear()
 
-                logs = data.get('logs', [])
+                logs = result.get('logs', [])
                 errors_only = filter_text == "Errors Only"
 
                 for log in logs:
@@ -20758,7 +26165,7 @@ def create_gui_app():
                         item.setForeground(QColor('#f44336'))
                     self._update_logs_list.addItem(item)
 
-                total = data.get('total', len(logs))
+                total = result.get('total', len(logs))
                 self._admin_status.setText(f"📋 Showing {len(logs)} of {total} log entries")
                 self._admin_status.setStyleSheet("color: #4fc3f7;")
 
@@ -20777,20 +26184,14 @@ def create_gui_app():
                 return
 
             try:
-                import urllib.request
-                import ssl
+                result = plugin_store_api.clear_old_logs(days)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"❌ Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
 
-                url = f"{PLUGIN_STORE_URL}/api/admin/updates/logs?older_than_days={days}"
-                req = urllib.request.Request(url, method='DELETE')
-                req.add_header('Authorization', f'Bearer {plugin_store_api.token}')
-                for key, value in get_cf_headers().items():
-                    req.add_header(key, value)
-
-                ctx = ssl.create_default_context()
-                with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-
-                deleted = data.get('deleted', 0)
+                deleted = result.get('deleted', 0)
                 self._admin_status.setText(f"🗑️ Deleted {deleted} old log entries")
                 self._admin_status.setStyleSheet("color: #ff9800;")
 
@@ -20799,6 +26200,802 @@ def create_gui_app():
 
             except Exception as e:
                 self._admin_status.setText(f"❌ Failed to clear logs: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+
+        # =====================================================================
+        # Security Tab Handler Methods
+        # =====================================================================
+        
+        def _load_security_logs(self, dialog):
+            """Load security event logs from server."""
+            self._security_logs_list.clear()
+            self._admin_status.setText("Loading security logs...")
+            self._admin_status.setStyleSheet("color: #888;")
+            QApplication.processEvents()
+            
+            try:
+                event_type = None
+                filter_text = self._security_filter_combo.currentText()
+                if filter_text != "All Events":
+                    event_type = filter_text
+                
+                result = plugin_store_api.get_security_logs(limit=100, event_type=event_type)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
+                
+                logs = result.get('logs', [])
+                
+                if not logs:
+                    self._admin_status.setText("No security events found")
+                    self._admin_status.setStyleSheet("color: #4fc3f7;")
+                    return
+                
+                for log in logs:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, log)
+                    
+                    event_type = log.get('event_type', 'UNKNOWN')
+                    created = log.get('created_at', '')[:19]
+                    details = log.get('details', {})
+                    
+                    # Color-code by severity
+                    if event_type in ['SCAN_THREAT', 'FILE_QUARANTINED', 'UPLOAD_BLOCKED']:
+                        item.setForeground(QColor('#f44336'))  # Red for threats
+                        icon = "🔴"
+                    elif event_type in ['SCAN_CLEAN']:
+                        item.setForeground(QColor('#4CAF50'))  # Green for clean
+                        icon = "🟢"
+                    else:
+                        item.setForeground(QColor('#ff9800'))  # Orange for other
+                        icon = "🟡"
+                    
+                    text = f"{icon} [{created}] {event_type}"
+                    if isinstance(details, dict):
+                        if 'plugin_id' in details:
+                            text += f" | Plugin: {details['plugin_id']}"
+                        if 'filename' in details:
+                            text += f" | File: {details['filename']}"
+                        if 'threats' in details and details['threats']:
+                            text += f" | Threats: {len(details['threats'])}"
+                    
+                    item.setText(text)
+                    self._security_logs_list.addItem(item)
+                
+                self._admin_status.setText(f"Loaded {len(logs)} security events")
+                self._admin_status.setStyleSheet("color: #4fc3f7;")
+                
+            except Exception as e:
+                self._admin_status.setText(f"❌ Failed to load security logs: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _load_quarantine_files(self, dialog):
+            """Load quarantined files list from server."""
+            self._quarantine_list.clear()
+            
+            try:
+                result = plugin_store_api.get_quarantine_files()
+                
+                if 'error' in result:
+                    return
+                
+                files = result.get('files', [])
+                
+                for f in files:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, f)
+                    
+                    name = f.get('name', 'Unknown')
+                    size = f.get('size', 0)
+                    quarantined = f.get('quarantined_at', '')[:19]
+                    
+                    size_str = f"{size / 1024:.1f} KB" if size < 1048576 else f"{size / 1048576:.1f} MB"
+                    
+                    item.setText(f"🦠 {name} ({size_str}) - Quarantined: {quarantined}")
+                    item.setForeground(QColor('#f44336'))
+                    self._quarantine_list.addItem(item)
+                
+            except Exception as e:
+                pass  # Silently fail for quarantine list
+        
+        def _delete_quarantine_file(self, dialog):
+            """Delete a selected quarantined file."""
+            item = self._quarantine_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a file to delete.")
+                return
+            
+            file_data = item.data(Qt.ItemDataRole.UserRole)
+            filename = file_data.get('name', '')
+            
+            reply = QMessageBox.question(
+                dialog, "Confirm Delete",
+                f"Permanently delete quarantined file '{filename}'?\n\nThis cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            
+            try:
+                result = plugin_store_api.delete_quarantine_file(filename)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
+                
+                self._admin_status.setText(f"🗑️ Deleted quarantined file: {filename}")
+                self._admin_status.setStyleSheet("color: #ff9800;")
+                self._load_quarantine_files(dialog)
+                
+            except Exception as e:
+                self._admin_status.setText(f"❌ Failed to delete file: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        # =====================================================================
+        # IP Banning Tab Handler Methods
+        # =====================================================================
+        
+        def _load_banned_ips(self, dialog):
+            """Load banned and suspicious IPs from server."""
+            self._banned_ips_list.clear()
+            self._suspicious_ips_list.clear()
+            self._admin_status.setText("Loading IP data...")
+            self._admin_status.setStyleSheet("color: #888;")
+            QApplication.processEvents()
+            
+            try:
+                result = plugin_store_api.get_banned_ips()
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
+                
+                banned = result.get('banned', [])
+                suspicious = result.get('suspicious', [])
+                
+                # Load banned IPs
+                for ip_data in banned:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, ip_data)
+                    
+                    ip = ip_data.get('ip_address', 'Unknown')
+                    reason = ip_data.get('ban_reason', 'No reason')
+                    expires = ip_data.get('ban_expires')
+                    
+                    if expires:
+                        text = f"🚫 {ip} | {reason} | Expires: {expires[:19]}"
+                    else:
+                        text = f"🚫 {ip} | {reason} | PERMANENT"
+                        item.setForeground(QColor('#f44336'))
+                    
+                    item.setText(text)
+                    self._banned_ips_list.addItem(item)
+                
+                # Load suspicious IPs
+                for ip_data in suspicious:
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, ip_data)
+                    
+                    ip = ip_data.get('ip_address', 'Unknown')
+                    count = ip_data.get('request_count', 0)
+                    last_request = ip_data.get('last_request', '')[:19]
+                    
+                    item.setText(f"⚠️ {ip} | {count} requests | Last: {last_request}")
+                    item.setForeground(QColor('#ff9800'))
+                    self._suspicious_ips_list.addItem(item)
+                
+                self._admin_status.setText(f"Found {len(banned)} banned, {len(suspicious)} suspicious IPs")
+                self._admin_status.setStyleSheet("color: #4fc3f7;")
+                
+            except Exception as e:
+                self._admin_status.setText(f"❌ Failed to load IP data: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _ban_ip_action(self, dialog):
+            """Ban an IP address."""
+            ip = self._ban_ip_input.text().strip()
+            if not ip:
+                QMessageBox.warning(dialog, "Invalid Input", "Please enter an IP address.")
+                return
+            
+            reason = self._ban_reason_input.text().strip() or "Banned by admin"
+            permanent = self._ban_permanent_checkbox.isChecked()
+            
+            try:
+                result = plugin_store_api.ban_ip(ip, reason, permanent)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
+                
+                self._admin_status.setText(f"🚫 Banned IP: {ip}")
+                self._admin_status.setStyleSheet("color: #ff9800;")
+                
+                # Clear inputs
+                self._ban_ip_input.clear()
+                self._ban_reason_input.clear()
+                self._ban_permanent_checkbox.setChecked(False)
+                
+                # Refresh list
+                self._load_banned_ips(dialog)
+                
+            except Exception as e:
+                self._admin_status.setText(f"❌ Failed to ban IP: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _unban_ip_action(self, dialog):
+            """Unban a selected IP address."""
+            item = self._banned_ips_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select an IP to unban.")
+                return
+            
+            ip_data = item.data(Qt.ItemDataRole.UserRole)
+            ip = ip_data.get('ip_address', '')
+            
+            try:
+                result = plugin_store_api.unban_ip(ip)
+                
+                if 'error' in result:
+                    self._admin_status.setText(f"Error: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+                    return
+                
+                self._admin_status.setText(f"✅ Unbanned IP: {ip}")
+                self._admin_status.setStyleSheet("color: #4CAF50;")
+                
+                # Refresh list
+                self._load_banned_ips(dialog)
+                
+            except Exception as e:
+                self._admin_status.setText(f"❌ Failed to unban IP: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+
+        # =====================================================================
+        # Chat Admin Methods
+        # =====================================================================
+        
+        def _show_create_room_dialog(self, parent_dialog):
+            """Show dialog to create a new chat room with emoji picker (admin only)."""
+            dialog = QDialog(parent_dialog)
+            dialog.setWindowTitle("Create Chat Room")
+            dialog.setMinimumWidth(400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Common emoji options for room icons
+            ROOM_EMOJIS = [
+                "🌐", "💬", "📢", "🎮", "🛠️", "📱", "💻", "🎨", 
+                "📚", "🎵", "🎬", "📸", "🔧", "⚙️", "🚀", "💡",
+                "🔒", "👥", "🏠", "⭐", "🔥", "💎", "🎯", "📣",
+                "🌟", "🎉", "💼", "🎓", "🏆", "🎁", "📌", "🔔"
+            ]
+            
+            # Emoji selection
+            emoji_label = QLabel("Room Icon (optional):")
+            layout.addWidget(emoji_label)
+            
+            emoji_layout = QGridLayout()
+            self._selected_room_emoji = ""
+            emoji_buttons = []
+            
+            def select_emoji(emoji, btn):
+                self._selected_room_emoji = emoji
+                # Update selection visuals
+                for b in emoji_buttons:
+                    b.setStyleSheet("font-size: 20px; padding: 5px; background: #333; border: 1px solid #555;")
+                btn.setStyleSheet("font-size: 20px; padding: 5px; background: #2d4a6d; border: 2px solid #4fc3f7;")
+            
+            for i, emoji in enumerate(ROOM_EMOJIS):
+                btn = QPushButton(emoji)
+                btn.setFixedSize(40, 40)
+                btn.setStyleSheet("font-size: 20px; padding: 5px; background: #333; border: 1px solid #555;")
+                btn.clicked.connect(lambda checked, e=emoji, b=btn: select_emoji(e, b))
+                emoji_buttons.append(btn)
+                emoji_layout.addWidget(btn, i // 8, i % 8)
+            
+            layout.addLayout(emoji_layout)
+            
+            # Room name
+            name_label = QLabel("Room Name:")
+            layout.addWidget(name_label)
+            
+            name_input = QLineEdit()
+            name_input.setPlaceholderText("e.g., Announcements, Help Desk, etc.")
+            layout.addWidget(name_input)
+            
+            # Description
+            desc_label = QLabel("Description (optional):")
+            layout.addWidget(desc_label)
+            
+            desc_input = QLineEdit()
+            desc_input.setPlaceholderText("What is this room for?")
+            layout.addWidget(desc_input)
+            
+            # Private room checkbox
+            private_checkbox = QCheckBox("Private room (requires password)")
+            layout.addWidget(private_checkbox)
+            
+            # Password field
+            password_input = QLineEdit()
+            password_input.setPlaceholderText("Room password")
+            password_input.setEchoMode(QLineEdit.EchoMode.Password)
+            password_input.setEnabled(False)
+            layout.addWidget(password_input)
+            
+            private_checkbox.toggled.connect(password_input.setEnabled)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            btn_layout.addWidget(cancel_btn)
+            
+            create_btn = QPushButton("Create Room")
+            create_btn.setStyleSheet("background: #4CAF50; padding: 10px 20px;")
+            
+            def do_create():
+                name = name_input.text().strip()
+                if not name:
+                    QMessageBox.warning(dialog, "Error", "Please enter a room name.")
+                    return
+                
+                # Prepend emoji if selected
+                full_name = f"{self._selected_room_emoji} {name}".strip() if self._selected_room_emoji else name
+                
+                try:
+                    data = {
+                        'name': full_name,
+                        'description': desc_input.text().strip(),
+                        'is_private': private_checkbox.isChecked(),
+                    }
+                    if private_checkbox.isChecked():
+                        data['password'] = password_input.text()
+                    
+                    result = plugin_store_api._request('POST', '/api/admin/chat/rooms', data)
+                    
+                    if 'error' in result:
+                        QMessageBox.warning(dialog, "Error", f"Failed to create room: {result['error']}")
+                    else:
+                        QMessageBox.information(dialog, "Success", f"Room '{full_name}' created successfully!")
+                        dialog.accept()
+                        # Refresh rooms list
+                        self._load_admin_chat_data(parent_dialog)
+                        
+                except Exception as e:
+                    QMessageBox.critical(dialog, "Error", f"Failed to create room: {e}")
+            
+            create_btn.clicked.connect(do_create)
+            btn_layout.addWidget(create_btn)
+            
+            layout.addLayout(btn_layout)
+            
+            dialog.exec()
+        
+        def _load_admin_chat_data(self, dialog):
+            """Load chat statistics, rooms, and users for admin panel."""
+            self._admin_status.setText("Loading chat data...")
+            self._admin_status.setStyleSheet("color: #888;")
+            
+            # Store dialog reference for callback
+            self._chat_admin_dialog = dialog
+            
+            def do_load():
+                try:
+                    # Use plugin_store_api._request() — same path that works
+                    # for all other admin endpoints (urllib + CF headers + app signature)
+                    stats = plugin_store_api._request('GET', '/api/admin/chat/stats')
+                    
+                    # Check if endpoints are deployed
+                    if isinstance(stats, dict) and stats.get('error'):
+                        err = stats['error']
+                        if '404' in str(err) or 'Not Found' in str(err):
+                            return {'error': 'Chat admin API not deployed yet. Please deploy server.js to the server.'}
+                        if '401' in str(err) or 'Authentication' in str(err).lower():
+                            return {'error': 'Authentication expired. Please log out and log back in.'}
+                        if '403' in str(err) or 'denied' in str(err).lower() or 'Admin' in str(err):
+                            return {'error': f"Access denied: {err}"}
+                        return {'error': err}
+                    
+                    rooms_result = plugin_store_api._request('GET', '/api/admin/chat/rooms')
+                    rooms = rooms_result.get('rooms', []) if isinstance(rooms_result, dict) and 'error' not in rooms_result else []
+                    
+                    users_result = plugin_store_api._request('GET', '/api/admin/chat/users')
+                    users = users_result.get('users', []) if isinstance(users_result, dict) and 'error' not in users_result else []
+                    
+                    return {'stats': stats, 'rooms': rooms, 'users': users}
+                except Exception as e:
+                    return {'error': str(e)}
+            
+            # Run in thread
+            import threading
+            def run_and_update():
+                result = do_load()
+                # Store result for callback
+                self._chat_admin_result = result
+                # Update UI in main thread - use invokeMethod pattern
+                QTimer.singleShot(0, self._do_update_chat_admin_ui)
+            
+            thread = threading.Thread(target=run_and_update, daemon=True)
+            thread.start()
+        
+        def _do_update_chat_admin_ui(self):
+            """Internal callback to update chat admin UI from main thread."""
+            try:
+                result = getattr(self, '_chat_admin_result', {'error': 'No result'})
+                dialog = getattr(self, '_chat_admin_dialog', None)
+                if dialog:
+                    self._update_chat_admin_ui(dialog, result)
+            except Exception:
+                pass  # Silently handle UI update errors
+        
+        def _update_chat_admin_ui(self, dialog, result):
+            """Update chat admin UI with loaded data."""
+            if 'error' in result:
+                self._admin_status.setText(f"Error: {result['error']}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+                return
+            
+            # Update stats
+            stats = result.get('stats', {})
+            stat_mapping = {
+                'total_messages': stats.get('total_messages', 0),
+                'messages_today': stats.get('messages_today', 0),
+                'total_rooms': stats.get('total_rooms', 0),
+                'active_users': stats.get('active_users_24h', 0),
+                'online_now': stats.get('online_now', 0),
+                'total_users': stats.get('total_users', 0),
+            }
+            for key, value in stat_mapping.items():
+                if key in self._chat_stats_labels:
+                    self._chat_stats_labels[key].setText(str(value))
+            
+            # Update rooms list
+            self._admin_rooms_list.clear()
+            rooms = result.get('rooms', [])
+            self._chat_admin_rooms = rooms  # Store for later use
+            
+            for room in rooms:
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, room)
+                
+                icon = "🔒" if room.get('is_private') else "💬"
+                if room.get('id') == 'general':
+                    icon = "🌐"
+                
+                member_count = room.get('member_count', 0)
+                msg_count = room.get('message_count', 0)
+                owner = room.get('owner_name', 'System')
+                
+                text = f"{icon} {room.get('name', 'Unknown')}\n"
+                text += f"   Owner: {owner} | Members: {member_count} | Messages: {msg_count}"
+                if room.get('has_password'):
+                    text += " | 🔑 Password"
+                item.setText(text)
+                
+                self._admin_rooms_list.addItem(item)
+            
+            # Update users list
+            self._admin_chat_users_list.clear()
+            users = result.get('users', [])
+            self._chat_admin_users = users  # Store for filtering
+            
+            for user in users:
+                self._add_chat_user_item(user)
+            
+            self._admin_status.setText(f"Loaded {len(rooms)} rooms, {len(users)} users")
+            self._admin_status.setStyleSheet("color: #4CAF50;")
+        
+        def _add_chat_user_item(self, user):
+            """Add a user item to the chat users list."""
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, user)
+            
+            status_icon = "🟢" if user.get('is_online') else "⚫"
+            admin_badge = " [ADMIN]" if user.get('is_admin') else ""
+            ban_badge = " 🚫 BANNED" if user.get('is_banned') else ""
+            mute_badge = " 🔇 MUTED" if user.get('is_muted') else ""
+            
+            msg_count = user.get('message_count', 0)
+            last_seen = user.get('last_seen', 'Never')[:10] if user.get('last_seen') else 'Never'
+            
+            text = f"{status_icon} {user.get('username', 'Unknown')}{admin_badge}{ban_badge}{mute_badge}"
+            text += f"\n   Messages: {msg_count} | Last seen: {last_seen}"
+            item.setText(text)
+            
+            self._admin_chat_users_list.addItem(item)
+        
+        def _filter_chat_users(self):
+            """Filter chat users list by search text."""
+            search_text = self._chat_user_search.text().lower()
+            self._admin_chat_users_list.clear()
+            
+            for user in getattr(self, '_chat_admin_users', []):
+                username = user.get('username', '').lower()
+                if search_text in username:
+                    self._add_chat_user_item(user)
+        
+        def _view_room_messages(self, dialog):
+            """View messages in a selected room."""
+            item = self._admin_rooms_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a room.")
+                return
+            
+            room = item.data(Qt.ItemDataRole.UserRole)
+            room_id = room.get('id', 'general')
+            room_name = room.get('name', 'Unknown')
+            
+            # Create messages dialog
+            msg_dialog = QDialog(dialog)
+            msg_dialog.setWindowTitle(f"💬 Messages in: {room_name}")
+            msg_dialog.setMinimumWidth(600)
+            msg_dialog.setMinimumHeight(500)
+            
+            layout = QVBoxLayout(msg_dialog)
+            
+            # Messages list
+            messages_list = QListWidget()
+            messages_list.setStyleSheet("""
+                QListWidget::item { padding: 8px; border-bottom: 1px solid #333; }
+            """)
+            layout.addWidget(messages_list)
+            
+            # Load messages
+            try:
+                result = plugin_store_api._request('GET', f'/api/admin/chat/rooms/{room_id}/messages')
+                
+                if 'error' not in result:
+                    messages = result.get('messages', [])
+                    for msg in messages:
+                        msg_item = QListWidgetItem()
+                        msg_item.setData(Qt.ItemDataRole.UserRole, msg)
+                        
+                        username = msg.get('username', 'Unknown')
+                        content = msg.get('message', '')[:200]
+                        timestamp = msg.get('created_at', '')[:16]
+                        deleted = " [DELETED]" if msg.get('is_deleted') else ""
+                        
+                        text = f"[{timestamp}] {username}: {content}{deleted}"
+                        msg_item.setText(text)
+                        messages_list.addItem(msg_item)
+                    
+                    if not messages:
+                        messages_list.addItem("No messages in this room.")
+                else:
+                    messages_list.addItem(f"Error loading messages: {result.get('error', 'Unknown error')}")
+            except Exception as e:
+                messages_list.addItem(f"Error: {e}")
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            
+            delete_msg_btn = QPushButton("🗑️ Delete Selected Message")
+            delete_msg_btn.setStyleSheet("background: #f44336;")
+            delete_msg_btn.clicked.connect(lambda: self._delete_admin_message(msg_dialog, messages_list, room_id))
+            btn_layout.addWidget(delete_msg_btn)
+            
+            btn_layout.addStretch()
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(msg_dialog.accept)
+            btn_layout.addWidget(close_btn)
+            
+            layout.addLayout(btn_layout)
+            msg_dialog.exec()
+        
+        def _delete_admin_message(self, dialog, messages_list, room_id):
+            """Delete a message from admin panel."""
+            item = messages_list.currentItem()
+            if not item:
+                return
+            
+            msg = item.data(Qt.ItemDataRole.UserRole)
+            if not msg:
+                return
+            
+            msg_id = msg.get('id')
+            
+            confirm = QMessageBox.question(
+                dialog, "Delete Message",
+                f"Delete this message?\n\n{msg.get('message', '')[:100]}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            
+            try:
+                result = plugin_store_api._request('DELETE', f'/api/chat/messages/{msg_id}')
+                
+                if 'error' not in result:
+                    messages_list.takeItem(messages_list.row(item))
+                    QMessageBox.information(dialog, "Deleted", "Message deleted.")
+                else:
+                    QMessageBox.warning(dialog, "Error", f"Failed to delete: {result['error']}")
+            except Exception as e:
+                QMessageBox.warning(dialog, "Error", f"Failed: {e}")
+        
+        def _delete_admin_room(self, dialog):
+            """Delete a chat room."""
+            item = self._admin_rooms_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a room to delete.")
+                return
+            
+            room = item.data(Qt.ItemDataRole.UserRole)
+            room_id = room.get('id')
+            room_name = room.get('name', 'Unknown')
+            
+            if room_id == 'general':
+                QMessageBox.warning(dialog, "Cannot Delete", "Cannot delete the General room.")
+                return
+            
+            confirm = QMessageBox.question(
+                dialog, "Delete Room",
+                f"Are you sure you want to delete '{room_name}'?\n\nThis will delete all messages and members.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            
+            try:
+                result = plugin_store_api._request('DELETE', f'/api/chat/rooms/{room_id}')
+                
+                if 'error' not in result:
+                    self._admin_status.setText(f"✅ Deleted room: {room_name}")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    self._load_admin_chat_data(dialog)
+                else:
+                    self._admin_status.setText(f"❌ Failed: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+            except Exception as e:
+                self._admin_status.setText(f"❌ Error: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _admin_mute_user(self, dialog):
+            """Mute a user from chat."""
+            item = self._admin_chat_users_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a user to mute.")
+                return
+            
+            user = item.data(Qt.ItemDataRole.UserRole)
+            user_id = user.get('id')
+            username = user.get('username', 'Unknown')
+            
+            duration, ok = QInputDialog.getItem(
+                dialog, "Mute Duration", f"Mute {username} for:",
+                ["5 minutes", "30 minutes", "1 hour", "6 hours", "24 hours", "7 days"],
+                0, False
+            )
+            
+            if not ok:
+                return
+            
+            try:
+                result = plugin_store_api._request('POST', '/api/chat/mute', {'user_id': user_id, 'duration': duration})
+                
+                if 'error' not in result:
+                    self._admin_status.setText(f"✅ Muted {username} for {duration}")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    self._load_admin_chat_data(dialog)
+                else:
+                    self._admin_status.setText(f"❌ Failed: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+            except Exception as e:
+                self._admin_status.setText(f"❌ Error: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _admin_ban_chat_user(self, dialog):
+            """Ban a user from chat."""
+            item = self._admin_chat_users_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a user to ban.")
+                return
+            
+            user = item.data(Qt.ItemDataRole.UserRole)
+            user_id = user.get('id')
+            username = user.get('username', 'Unknown')
+            
+            if user.get('is_admin'):
+                QMessageBox.warning(dialog, "Cannot Ban", "Cannot ban an admin user.")
+                return
+            
+            duration, ok = QInputDialog.getItem(
+                dialog, "Ban Duration", f"Ban {username} from chat for:",
+                ["1 hour", "24 hours", "7 days", "30 days", "Permanent"],
+                0, False
+            )
+            
+            if not ok:
+                return
+            
+            reason, ok2 = QInputDialog.getText(
+                dialog, "Ban Reason", "Reason for ban (optional):"
+            )
+            
+            try:
+                result = plugin_store_api._request('POST', '/api/chat/ban', {
+                    'user_id': user_id, 'duration': duration, 'reason': reason or 'Banned by admin'
+                })
+                
+                if 'error' not in result:
+                    self._admin_status.setText(f"✅ Banned {username} for {duration}")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    self._load_admin_chat_data(dialog)
+                else:
+                    self._admin_status.setText(f"❌ Failed: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+            except Exception as e:
+                self._admin_status.setText(f"❌ Error: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _admin_unban_chat_user(self, dialog):
+            """Unban a user from chat."""
+            item = self._admin_chat_users_list.currentItem()
+            if not item:
+                QMessageBox.warning(dialog, "No Selection", "Please select a user to unban.")
+                return
+            
+            user = item.data(Qt.ItemDataRole.UserRole)
+            user_id = user.get('id')
+            username = user.get('username', 'Unknown')
+            
+            if not user.get('is_banned'):
+                QMessageBox.information(dialog, "Not Banned", f"{username} is not banned.")
+                return
+            
+            try:
+                result = plugin_store_api._request('DELETE', f'/api/chat/ban/{user_id}')
+                
+                if 'error' not in result:
+                    self._admin_status.setText(f"✅ Unbanned {username}")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    self._load_admin_chat_data(dialog)
+                else:
+                    self._admin_status.setText(f"❌ Failed: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+            except Exception as e:
+                self._admin_status.setText(f"❌ Error: {e}")
+                self._admin_status.setStyleSheet("color: #f44336;")
+        
+        def _broadcast_chat_message(self, dialog):
+            """Broadcast a system message to all chat users."""
+            message = self._chat_broadcast_input.text().strip()
+            if not message:
+                QMessageBox.warning(dialog, "Empty Message", "Please enter a message to broadcast.")
+                return
+            
+            confirm = QMessageBox.question(
+                dialog, "Broadcast Message",
+                f"Send this message to ALL chat users?\n\n{message}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            
+            try:
+                result = plugin_store_api._request('POST', '/api/admin/chat/broadcast', {'message': message})
+                
+                if 'error' not in result:
+                    self._admin_status.setText("✅ Broadcast sent!")
+                    self._admin_status.setStyleSheet("color: #4CAF50;")
+                    self._chat_broadcast_input.clear()
+                else:
+                    self._admin_status.setText(f"❌ Failed: {result['error']}")
+                    self._admin_status.setStyleSheet("color: #f44336;")
+            except Exception as e:
+                self._admin_status.setText(f"❌ Error: {e}")
                 self._admin_status.setStyleSheet("color: #f44336;")
 
         def _review_selected_plugin(self, dialog):
@@ -21049,7 +27246,16 @@ def create_gui_app():
             summary_group = QGroupBox("📊 Summary")
             summary_layout = QFormLayout(summary_group)
             summary_layout.addRow("Total Files:", QLabel(str(summary.get('totalFiles', 0))))
-            summary_layout.addRow("Binaries:", QLabel(str(summary.get('totalBinaries', 0))))
+            
+            # Show both in-ZIP binaries and manifest bundled_binaries
+            in_zip_binaries = summary.get('totalBinaries', 0)
+            bundled_binaries_count = len(plugin.get('bundled_binaries', []))
+            if bundled_binaries_count > 0:
+                summary_layout.addRow("Binaries (in ZIP):", QLabel(str(in_zip_binaries)))
+                summary_layout.addRow("Binaries (to download):", QLabel(f"⬇️ {bundled_binaries_count}"))
+            else:
+                summary_layout.addRow("Binaries:", QLabel(str(in_zip_binaries)))
+            
             summary_layout.addRow("Scans Performed:", QLabel(str(summary.get('totalScans', 0))))
             summary_layout.addRow("Has Threats:", QLabel("❌ YES" if summary.get('hasThreats') else "✅ No"))
             summary_layout.addRow("Pending Deps:", QLabel("⏳ Yes" if summary.get('hasPendingDeps') else "✅ No"))
@@ -22096,7 +28302,2072 @@ This Agreement constitutes the entire agreement between Developer and Image Anar
             self._upload_thread.finished.connect(on_upload_finished)
             self._upload_thread.start()
 
-    return QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab, PreReadyChecklistDialog
+    # =========================================================================
+    # FORUM TAB - Embedded Forum with QWebEngineView
+    # =========================================================================
+    
+    class ForumTab(QWidget):
+        """Forum tab with embedded web view for forum.imageanarchy.com"""
+        
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self._setup_ui()
+            
+        def _setup_ui(self):
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            
+            # Mini toolbar for forum controls
+            toolbar = QHBoxLayout()
+            toolbar.setContentsMargins(8, 4, 8, 4)
+            toolbar.setSpacing(8)
+            
+            self.back_btn = QPushButton("◀")
+            self.back_btn.setFixedSize(32, 28)
+            self.back_btn.setToolTip("Back")
+            self.back_btn.setEnabled(False)
+            toolbar.addWidget(self.back_btn)
+            
+            self.forward_btn = QPushButton("▶")
+            self.forward_btn.setFixedSize(32, 28)
+            self.forward_btn.setToolTip("Forward")
+            self.forward_btn.setEnabled(False)
+            toolbar.addWidget(self.forward_btn)
+            
+            self.refresh_btn = QPushButton("🔄")
+            self.refresh_btn.setFixedSize(32, 28)
+            self.refresh_btn.setToolTip("Refresh")
+            toolbar.addWidget(self.refresh_btn)
+            
+            self.home_btn = QPushButton("🏠")
+            self.home_btn.setFixedSize(32, 28)
+            self.home_btn.setToolTip("Forum Home")
+            toolbar.addWidget(self.home_btn)
+            
+            toolbar.addStretch()
+            
+            self.loading_label = QLabel("")
+            self.loading_label.setStyleSheet("color: #4fc3f7; font-size: 11px;")
+            toolbar.addWidget(self.loading_label)
+            
+            self.open_external_btn = QPushButton("🌐 Open in Browser")
+            self.open_external_btn.setToolTip("Open forum in external browser")
+            toolbar.addWidget(self.open_external_btn)
+            
+            toolbar_widget = QWidget()
+            toolbar_widget.setLayout(toolbar)
+            toolbar_widget.setStyleSheet("background: #252535;")
+            layout.addWidget(toolbar_widget)
+            
+            # Web view or fallback - use the pre-imported _QWebEngineView class
+            self._has_webview = False
+            self._webview_error = None
+            
+            if _webengine_available and _QWebEngineView is not None:
+                try:
+                    self.webview = _QWebEngineView()
+                    self.webview.setUrl(QUrl("https://forum.imageanarchy.com"))
+                    
+                    # Connect signals
+                    self.webview.loadStarted.connect(self._on_load_started)
+                    self.webview.loadFinished.connect(self._on_load_finished)
+                    self.webview.loadProgress.connect(self._on_load_progress)
+                    
+                    self.back_btn.clicked.connect(self.webview.back)
+                    self.forward_btn.clicked.connect(self.webview.forward)
+                    self.refresh_btn.clicked.connect(self.webview.reload)
+                    self.home_btn.clicked.connect(lambda: self.webview.setUrl(QUrl("https://forum.imageanarchy.com")))
+                    
+                    # Update nav buttons on history change
+                    self.webview.urlChanged.connect(self._update_nav_buttons)
+                    
+                    layout.addWidget(self.webview, 1)
+                    self._has_webview = True
+                    
+                except Exception as e:
+                    self._webview_error = f"Error: {e}"
+            else:
+                self._webview_error = "PyQt6-WebEngine not installed."
+            
+            if not self._has_webview:
+                # Fallback UI
+                fallback = QWidget()
+                fallback_layout = QVBoxLayout(fallback)
+                fallback_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                
+                icon_label = QLabel("🌐")
+                icon_label.setStyleSheet("font-size: 64px;")
+                icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                fallback_layout.addWidget(icon_label)
+                
+                title = QLabel("Image Anarchy Forum")
+                title.setStyleSheet("font-size: 24px; font-weight: bold; color: #4fc3f7;")
+                title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                fallback_layout.addWidget(title)
+                
+                error_msg = self._webview_error or "PyQt6-WebEngine not installed."
+                desc = QLabel(f"{error_msg}\nInstall with: pip install PyQt6-WebEngine")
+                desc.setStyleSheet("font-size: 14px; color: #888; margin: 20px;")
+                desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                desc.setWordWrap(True)
+                fallback_layout.addWidget(desc)
+                
+                layout.addWidget(fallback, 1)
+            
+            # External browser button always works
+            self.open_external_btn.clicked.connect(lambda: __import__('webbrowser').open("https://forum.imageanarchy.com"))
+            
+        def _on_load_started(self):
+            self.loading_label.setText("Loading...")
+            
+        def _on_load_finished(self, ok):
+            self.loading_label.setText("" if ok else "Load failed")
+            self._update_nav_buttons()
+            
+        def _on_load_progress(self, progress):
+            if progress < 100:
+                self.loading_label.setText(f"Loading... {progress}%")
+            else:
+                self.loading_label.setText("")
+                
+        def _update_nav_buttons(self):
+            if self._has_webview:
+                history = self.webview.history()
+                self.back_btn.setEnabled(history.canGoBack())
+                self.forward_btn.setEnabled(history.canGoForward())
+
+    # =========================================================================
+    # CHAT TAB - Full-Featured Community Chat
+    # =========================================================================
+    
+    class ChatTab(QWidget):
+        """Full-featured community chat tab with dock/undock and Remote Play support.
+        
+        Remote Play Roles:
+            HOST         = User sharing their device for repair
+            PROFESSIONAL = Technician operating Host's tools remotely
+        """
+        
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.main_window = parent
+            self._floating_window = None
+            self._is_docked = True
+            self._chat_widget = None
+            # Remote Play state
+            self._share_session = None          # DeviceShareSession (Host side)
+            self._active_device_session = None  # Session info when Professional connects
+            self._remote_console = None         # Floating master console window
+            self._pro_socket = None             # Professional's socket to remote-ctl
+            self._trust_mode = 'ask'            # ask | trust_read | trust_all
+            self._screen_viewer = None          # ScreenViewerWidget (Professional side)
+            self._setup_ui()
+            
+        def _setup_ui(self):
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+            
+            # Main content splitter (features | chat)
+            self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+            
+            # Left side - Feature buttons panel
+            features_panel = self._create_features_panel()
+            self.main_splitter.addWidget(features_panel)
+            
+            # Right side - Chat area
+            chat_panel = self._create_chat_panel()
+            self.main_splitter.addWidget(chat_panel)
+            
+            # Set initial sizes (features: 350px, chat: rest)
+            self.main_splitter.setSizes([350, 800])
+            
+            layout.addWidget(self.main_splitter)
+            
+        def _create_features_panel(self):
+            """Create the left panel with large feature buttons."""
+            panel = QWidget()
+            panel.setMinimumWidth(300)
+            panel.setMaximumWidth(450)
+            panel.setStyleSheet("background: #1e1e2e;")
+            
+            layout = QVBoxLayout(panel)
+            layout.setContentsMargins(20, 20, 20, 20)
+            layout.setSpacing(16)
+            
+            # Header
+            header = QLabel("💬 Community Hub")
+            header.setStyleSheet("font-size: 24px; font-weight: bold; color: #4fc3f7; margin-bottom: 10px;")
+            layout.addWidget(header)
+            
+            desc = QLabel("Connect with the Image Anarchy community")
+            desc.setStyleSheet("font-size: 12px; color: #888; margin-bottom: 20px;")
+            desc.setWordWrap(True)
+            layout.addWidget(desc)
+            
+            # Feature buttons grid
+            buttons_widget = QWidget()
+            buttons_layout = QGridLayout(buttons_widget)
+            buttons_layout.setSpacing(12)
+            
+            # Button definitions: (icon, title, subtitle, enabled, callback)
+            self.feature_buttons = {}
+            features = [
+                ("💬", "Chat", "Join conversations", True, self._focus_chat),
+                ("📨", "Invites", "Room invitations", True, self._show_invites),
+                ("📁", "Files", "Shared attachments", True, self._show_shared_files),
+                ("👥", "Members", "Online users", True, self._show_members),
+                ("🔧", "Share Device", "Host: let pros help", True, self._share_device),
+                ("⚙️", "Settings", "Chat preferences", True, self._show_settings),
+            ]
+            
+            for i, (icon, title, subtitle, enabled, callback) in enumerate(features):
+                btn = self._create_feature_button(icon, title, subtitle, enabled)
+                if callback:
+                    btn.clicked.connect(callback)
+                self.feature_buttons[title] = btn
+                buttons_layout.addWidget(btn, i // 2, i % 2)
+            
+            layout.addWidget(buttons_widget)
+            
+            # Remote Play section
+            layout.addSpacing(20)
+            
+            remote_header = QLabel("🔌 Remote Play")
+            remote_header.setStyleSheet("font-size: 14px; font-weight: bold; color: #4fc3f7; margin-top: 10px;")
+            layout.addWidget(remote_header)
+            
+            self._share_status = QLabel("⚫ Not sharing")
+            self._share_status.setStyleSheet("font-size: 11px; color: #888; margin: 4px 0;")
+            self._share_status.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._share_status.customContextMenuRequested.connect(self._share_status_context_menu)
+            layout.addWidget(self._share_status)
+            
+            self.remote_connect_btn = QPushButton("📱 Connect as Professional")
+            self.remote_connect_btn.setStyleSheet("""
+                QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a3a4a, stop:1 #2a2a3a);
+                    color: #4fc3f7;
+                    border: 1px solid #4fc3f7;
+                    border-radius: 8px;
+                    padding: 15px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2a4a5a, stop:1 #3a3a4a);
+                    border-color: #81d4fa;
+                }
+                QPushButton:pressed {
+                    background: #1a2a3a;
+                }
+            """)
+            self.remote_connect_btn.setToolTip("Connect to a Host's shared device as a Professional")
+            self.remote_connect_btn.clicked.connect(self._connect_to_device)
+            layout.addWidget(self.remote_connect_btn)
+            
+            layout.addStretch()
+            
+            # Window controls at bottom
+            controls = QHBoxLayout()
+            controls.setSpacing(8)
+            
+            self.undock_btn = QPushButton("📤 Undock Chat")
+            self.undock_btn.setToolTip("Open chat in a floating window")
+            self.undock_btn.clicked.connect(self._toggle_dock)
+            controls.addWidget(self.undock_btn)
+            
+            self.stay_on_top_btn = QPushButton("📌")
+            self.stay_on_top_btn.setFixedWidth(40)
+            self.stay_on_top_btn.setCheckable(True)
+            self.stay_on_top_btn.setToolTip("Keep floating window on top")
+            self.stay_on_top_btn.setEnabled(False)
+            self.stay_on_top_btn.clicked.connect(self._toggle_stay_on_top)
+            controls.addWidget(self.stay_on_top_btn)
+            
+            controls.addStretch()
+            
+            layout.addLayout(controls)
+            
+            return panel
+            
+        def _create_feature_button(self, icon, title, subtitle, enabled=True):
+            """Create a large feature button with icon, title and subtitle."""
+            btn = QPushButton()
+            btn.setMinimumSize(140, 100)
+            
+            # Create layout for button content
+            btn_layout = QVBoxLayout(btn)
+            btn_layout.setContentsMargins(10, 10, 10, 10)
+            btn_layout.setSpacing(4)
+            
+            icon_label = QLabel(icon)
+            icon_label.setStyleSheet("font-size: 28px;")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            btn_layout.addWidget(icon_label)
+            
+            title_label = QLabel(title)
+            title_label.setStyleSheet("font-size: 13px; font-weight: bold;")
+            title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            btn_layout.addWidget(title_label)
+            
+            sub_label = QLabel(subtitle)
+            sub_label.setStyleSheet("font-size: 10px; color: #888;")
+            sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            btn_layout.addWidget(sub_label)
+            
+            if enabled:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background: #2a2a3a;
+                        border: 1px solid #3a3a4a;
+                        border-radius: 12px;
+                    }
+                    QPushButton:hover {
+                        background: #3a3a4a;
+                        border-color: #4fc3f7;
+                    }
+                    QPushButton:pressed {
+                        background: #4a4a5a;
+                    }
+                """)
+            else:
+                btn.setEnabled(False)
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background: #222;
+                        border: 1px dashed #333;
+                        border-radius: 12px;
+                        color: #555;
+                    }
+                """)
+                sub_label.setText("Coming Soon")
+                sub_label.setStyleSheet("font-size: 10px; color: #555; font-style: italic;")
+            
+            return btn
+            
+        def _create_chat_panel(self):
+            """Create the right panel with embedded chat widget or auth prompt."""
+            panel = QWidget()
+            self._chat_panel_layout = QVBoxLayout(panel)
+            self._chat_panel_layout.setContentsMargins(0, 0, 0, 0)
+            self._chat_panel_layout.setSpacing(0)
+            
+            # Chat widget (always created, shown/hidden based on auth state)
+            self._chat_widget = CommunityChatWidget(self)
+            self._chat_panel_layout.addWidget(self._chat_widget, 1)
+            
+            # Auth overlay (shown when not logged in)
+            self._auth_overlay = self._create_auth_overlay()
+            self._chat_panel_layout.addWidget(self._auth_overlay, 1)
+            
+            # Show correct view based on login state
+            if plugin_store_api.token:
+                self._auth_overlay.setVisible(False)
+                self._chat_widget.setVisible(True)
+                QTimer.singleShot(500, self._connect_chat)
+            else:
+                self._auth_overlay.setVisible(True)
+                self._chat_widget.setVisible(False)
+            
+            return panel
+        
+        def _create_auth_overlay(self):
+            """Create login/register overlay for the chat panel."""
+            overlay = QWidget()
+            overlay.setStyleSheet("background: #1a1a2e;")
+            
+            main_layout = QVBoxLayout(overlay)
+            main_layout.setContentsMargins(40, 40, 40, 40)
+            main_layout.setSpacing(0)
+            
+            main_layout.addStretch(1)
+            
+            # Container card
+            card = QWidget()
+            card.setMaximumWidth(420)
+            card.setStyleSheet("""
+                QWidget {
+                    background: #252540;
+                    border: 1px solid #3a3a5a;
+                    border-radius: 16px;
+                }
+            """)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(30, 30, 30, 30)
+            card_layout.setSpacing(16)
+            
+            # Icon + title
+            icon_label = QLabel("🏴")
+            icon_label.setStyleSheet("font-size: 48px; background: transparent; border: none;")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(icon_label)
+            
+            title = QLabel("Join the Community")
+            title.setStyleSheet("font-size: 22px; font-weight: bold; color: #4fc3f7; background: transparent; border: none;")
+            title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(title)
+            
+            subtitle = QLabel("Sign in or create an account to chat, share devices,\nand connect with other users.")
+            subtitle.setStyleSheet("font-size: 12px; color: #888; background: transparent; border: none;")
+            subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            subtitle.setWordWrap(True)
+            card_layout.addWidget(subtitle)
+            
+            card_layout.addSpacing(8)
+            
+            # Tab widget for Login / Register
+            self._auth_tabs = QTabWidget()
+            self._auth_tabs.setStyleSheet("""
+                QTabWidget::pane {
+                    border: 1px solid #3a3a5a;
+                    border-radius: 8px;
+                    background: #1e1e35;
+                    top: -1px;
+                }
+                QTabBar::tab {
+                    background: #2a2a42;
+                    color: #888;
+                    padding: 8px 24px;
+                    border: 1px solid #3a3a5a;
+                    border-bottom: none;
+                    border-top-left-radius: 8px;
+                    border-top-right-radius: 8px;
+                    font-weight: bold;
+                    font-size: 12px;
+                }
+                QTabBar::tab:selected {
+                    background: #1e1e35;
+                    color: #4fc3f7;
+                }
+                QTabBar::tab:hover:!selected {
+                    background: #333355;
+                }
+            """)
+            
+            field_style = """
+                QLineEdit {
+                    background: #2a2a42;
+                    border: 1px solid #3a3a5a;
+                    border-radius: 8px;
+                    padding: 10px 14px;
+                    color: #e0e0e0;
+                    font-size: 13px;
+                }
+                QLineEdit:focus {
+                    border-color: #4fc3f7;
+                }
+            """
+            
+            btn_style = """
+                QPushButton {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #c62828, stop:1 #d32f2f);
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    padding: 12px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d32f2f, stop:1 #e53935);
+                }
+                QPushButton:pressed {
+                    background: #b71c1c;
+                }
+                QPushButton:disabled {
+                    background: #555;
+                }
+            """
+            
+            # ── Login Tab ──
+            login_tab = QWidget()
+            login_tab.setStyleSheet("background: transparent; border: none;")
+            login_lay = QVBoxLayout(login_tab)
+            login_lay.setContentsMargins(16, 16, 16, 16)
+            login_lay.setSpacing(12)
+            
+            self._login_user = QLineEdit()
+            self._login_user.setPlaceholderText("Username")
+            self._login_user.setStyleSheet(field_style)
+            login_lay.addWidget(self._login_user)
+            
+            self._login_pass = QLineEdit()
+            self._login_pass.setPlaceholderText("Password")
+            self._login_pass.setEchoMode(QLineEdit.EchoMode.Password)
+            self._login_pass.setStyleSheet(field_style)
+            login_lay.addWidget(self._login_pass)
+            
+            self._login_btn = QPushButton("Sign In")
+            self._login_btn.setStyleSheet(btn_style)
+            self._login_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._login_btn.clicked.connect(self._do_login)
+            login_lay.addWidget(self._login_btn)
+            
+            self._login_status = QLabel("")
+            self._login_status.setStyleSheet("color: #f44336; font-size: 11px; background: transparent; border: none;")
+            self._login_status.setWordWrap(True)
+            self._login_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            login_lay.addWidget(self._login_status)
+            
+            # Enter key triggers login
+            self._login_pass.returnPressed.connect(self._do_login)
+            self._login_user.returnPressed.connect(lambda: self._login_pass.setFocus())
+            
+            self._auth_tabs.addTab(login_tab, "Sign In")
+            
+            # ── Register Tab ──
+            reg_tab = QWidget()
+            reg_tab.setStyleSheet("background: transparent; border: none;")
+            reg_lay = QVBoxLayout(reg_tab)
+            reg_lay.setContentsMargins(16, 16, 16, 16)
+            reg_lay.setSpacing(10)
+            
+            self._reg_user = QLineEdit()
+            self._reg_user.setPlaceholderText("Choose a username")
+            self._reg_user.setStyleSheet(field_style)
+            reg_lay.addWidget(self._reg_user)
+            
+            self._reg_email = QLineEdit()
+            self._reg_email.setPlaceholderText("Email address")
+            self._reg_email.setStyleSheet(field_style)
+            reg_lay.addWidget(self._reg_email)
+            
+            self._reg_pass = QLineEdit()
+            self._reg_pass.setPlaceholderText("Password (min 6 characters)")
+            self._reg_pass.setEchoMode(QLineEdit.EchoMode.Password)
+            self._reg_pass.setStyleSheet(field_style)
+            reg_lay.addWidget(self._reg_pass)
+            
+            self._reg_pass2 = QLineEdit()
+            self._reg_pass2.setPlaceholderText("Confirm password")
+            self._reg_pass2.setEchoMode(QLineEdit.EchoMode.Password)
+            self._reg_pass2.setStyleSheet(field_style)
+            reg_lay.addWidget(self._reg_pass2)
+            
+            self._reg_btn = QPushButton("Create Account")
+            self._reg_btn.setStyleSheet(btn_style)
+            self._reg_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._reg_btn.clicked.connect(self._do_register)
+            reg_lay.addWidget(self._reg_btn)
+            
+            self._reg_status = QLabel("")
+            self._reg_status.setStyleSheet("color: #f44336; font-size: 11px; background: transparent; border: none;")
+            self._reg_status.setWordWrap(True)
+            self._reg_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            reg_lay.addWidget(self._reg_status)
+            
+            # Enter key triggers register
+            self._reg_pass2.returnPressed.connect(self._do_register)
+            
+            self._auth_tabs.addTab(reg_tab, "Register")
+            
+            card_layout.addWidget(self._auth_tabs)
+            
+            # Forum note
+            note = QLabel("Your account also works on the <a href='https://forum.imageanarchy.com/forum/' style='color: #4fc3f7;'>Image Anarchy Forum</a>")
+            note.setStyleSheet("font-size: 11px; color: #666; background: transparent; border: none;")
+            note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            note.setOpenExternalLinks(True)
+            card_layout.addWidget(note)
+            
+            # Center the card horizontally
+            h_layout = QHBoxLayout()
+            h_layout.addStretch(1)
+            h_layout.addWidget(card)
+            h_layout.addStretch(1)
+            
+            main_layout.addLayout(h_layout)
+            main_layout.addStretch(1)
+            
+            return overlay
+        
+        def _do_login(self):
+            """Handle login from the auth overlay."""
+            username = self._login_user.text().strip()
+            password = self._login_pass.text()
+            
+            if not username or not password:
+                self._login_status.setText("Please enter username and password")
+                return
+            
+            self._login_btn.setEnabled(False)
+            self._login_status.setText("Signing in...")
+            self._login_status.setStyleSheet("color: #888; font-size: 11px; background: transparent; border: none;")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.login(username, password)
+            
+            self._login_btn.setEnabled(True)
+            
+            if 'error' in result:
+                self._login_status.setText(result['error'])
+                self._login_status.setStyleSheet("color: #f44336; font-size: 11px; background: transparent; border: none;")
+            else:
+                self._login_status.setText("")
+                self._on_auth_success(username)
+        
+        def _do_register(self):
+            """Handle registration from the auth overlay."""
+            username = self._reg_user.text().strip()
+            email = self._reg_email.text().strip()
+            password = self._reg_pass.text()
+            password2 = self._reg_pass2.text()
+            
+            if not username or not email or not password:
+                self._reg_status.setText("Please fill in all fields")
+                return
+            
+            if password != password2:
+                self._reg_status.setText("Passwords don't match")
+                return
+            
+            if len(password) < 6:
+                self._reg_status.setText("Password must be at least 6 characters")
+                return
+            
+            if '@' not in email or '.' not in email:
+                self._reg_status.setText("Please enter a valid email address")
+                return
+            
+            self._reg_btn.setEnabled(False)
+            self._reg_status.setText("Creating account...")
+            self._reg_status.setStyleSheet("color: #888; font-size: 11px; background: transparent; border: none;")
+            QApplication.processEvents()
+            
+            result = plugin_store_api.register(username, email, password)
+            
+            self._reg_btn.setEnabled(True)
+            
+            if 'error' in result:
+                self._reg_status.setText(result['error'])
+                self._reg_status.setStyleSheet("color: #f44336; font-size: 11px; background: transparent; border: none;")
+            else:
+                self._reg_status.setText("")
+                self._on_auth_success(username)
+        
+        def _on_auth_success(self, username):
+            """Transition from auth overlay to live chat after login/register."""
+            # Hide auth, show chat
+            self._auth_overlay.setVisible(False)
+            self._chat_widget.setVisible(True)
+            
+            # Connect to chat
+            QTimer.singleShot(300, self._connect_chat)
+            
+            # Update Plugin Store tab auth UI if it exists
+            try:
+                main_win = self.main_window
+                if main_win:
+                    for i in range(main_win.tab_widget.count()):
+                        tab = main_win.tab_widget.widget(i)
+                        if hasattr(tab, '_update_auth_ui'):
+                            tab._update_auth_ui()
+            except Exception:
+                pass
+            
+        def _connect_chat(self):
+            """Connect to chat server."""
+            if self._chat_widget and plugin_store_api.token and plugin_store_api.user:
+                username = plugin_store_api.user.get('username', '')
+                if username:
+                    self._chat_widget.connect_chat(username)
+                
+        def _focus_chat(self):
+            """Focus on the chat input."""
+            if self._chat_widget:
+                self._chat_widget.message_input.setFocus()
+                
+        def _show_invites(self):
+            """Show pending invites dialog."""
+            if self._chat_widget:
+                self._chat_widget._show_invites_dialog()
+                
+        def _show_shared_files(self):
+            """Show shared files in current room."""
+            QMessageBox.information(self, "Shared Files", "📁 Shared files feature coming soon!\n\nView images and files shared in the current room.")
+            
+        def _show_members(self):
+            """Show room members."""
+            if self._chat_widget:
+                # Trigger the online users popup
+                count = self._chat_widget.online_count.text()
+                QMessageBox.information(self, "Online Members", f"👥 {count}\n\nClick the online count in chat to see the full list.")
+                
+        def _show_settings(self):
+            """Show chat settings dialog."""
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Chat Settings")
+            dialog.setMinimumWidth(400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            # Notifications section
+            notif_group = QGroupBox("🔔 Notifications")
+            notif_layout = QVBoxLayout(notif_group)
+            
+            self._notif_sounds = QCheckBox("Play sound on new messages")
+            self._notif_sounds.setChecked(True)
+            notif_layout.addWidget(self._notif_sounds)
+            
+            self._notif_toast = QCheckBox("Show toast notifications")
+            self._notif_toast.setChecked(True)
+            notif_layout.addWidget(self._notif_toast)
+            
+            layout.addWidget(notif_group)
+            
+            # Appearance section
+            appear_group = QGroupBox("🎨 Appearance")
+            appear_layout = QVBoxLayout(appear_group)
+            
+            self._compact_mode = QCheckBox("Compact message view")
+            appear_layout.addWidget(self._compact_mode)
+            
+            self._show_timestamps = QCheckBox("Show message timestamps")
+            self._show_timestamps.setChecked(True)
+            appear_layout.addWidget(self._show_timestamps)
+            
+            layout.addWidget(appear_group)
+            
+            # Remote Play — Trust Settings
+            remote_group = QGroupBox("🔧 Remote Play — Trust Settings")
+            remote_group.setStyleSheet("QGroupBox { color: #4fc3f7; font-weight: bold; }")
+            remote_layout = QVBoxLayout(remote_group)
+            
+            remote_label = QLabel("When a Professional requests to run a command on your device:")
+            remote_label.setWordWrap(True)
+            remote_label.setStyleSheet("color: #ccc;")
+            remote_layout.addWidget(remote_label)
+            
+            ask_radio = QRadioButton("❓ Ask me for every command (safest)")
+            ask_radio.setChecked(self._trust_mode == 'ask')
+            remote_layout.addWidget(ask_radio)
+            
+            trust_read_radio = QRadioButton("📖 Auto-approve READ operations, ask for others")
+            trust_read_radio.setChecked(self._trust_mode == 'trust_read')
+            remote_layout.addWidget(trust_read_radio)
+            
+            trust_all_radio = QRadioButton("⚡ Trust mode — auto-approve everything (⚠️ dangerous)")
+            trust_all_radio.setChecked(self._trust_mode == 'trust_all')
+            trust_all_radio.setStyleSheet("QRadioButton { color: #f44336; }")
+            remote_layout.addWidget(trust_all_radio)
+            
+            trust_warning = QLabel("⚠️ Trust mode lets the Professional run ANY command without asking you!")
+            trust_warning.setStyleSheet("font-size: 10px; color: #f44336; font-style: italic; margin-top: 4px;")
+            trust_warning.setWordWrap(True)
+            remote_layout.addWidget(trust_warning)
+            
+            # Save trust mode on change
+            ask_radio.toggled.connect(lambda c: setattr(self, '_trust_mode', 'ask') if c else None)
+            trust_read_radio.toggled.connect(lambda c: setattr(self, '_trust_mode', 'trust_read') if c else None)
+            trust_all_radio.toggled.connect(lambda c: setattr(self, '_trust_mode', 'trust_all') if c else None)
+            
+            layout.addWidget(remote_group)
+            
+            # Buttons
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            btn_layout.addWidget(close_btn)
+            
+            layout.addLayout(btn_layout)
+            
+            dialog.exec()
+        
+        # ═══════════════════════════════════════════════════════════════
+        # REMOTE PLAY — HOST METHODS
+        # ═══════════════════════════════════════════════════════════════
+        
+        def _share_device(self):
+            """Host: Open dialog to share device with Professionals."""
+            if self._share_session:
+                reply = QMessageBox.question(
+                    self, "Stop Sharing?",
+                    "🔴 You are currently sharing your device.\n\nStop sharing?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._stop_sharing()
+                return
+            
+            # Get current room
+            room_id = None
+            if self._chat_widget and hasattr(self._chat_widget, 'current_room'):
+                room_id = self._chat_widget.current_room
+            if not room_id:
+                QMessageBox.warning(self, "No Room", "Join a chat room first to share your device.")
+                return
+            
+            username = ''
+            if hasattr(plugin_store_api, 'user') and plugin_store_api.user:
+                username = plugin_store_api.user.get('username', '')
+            if not username:
+                QMessageBox.warning(self, "Not Logged In", "Please log in to share your device.")
+                return
+            
+            # Build list of remote-capable plugins (from manifests, not just loaded ones)
+            pm = plugin_manager
+            remote_plugins = []
+            for pid, manifest in pm.manifests.items():
+                if getattr(manifest, 'remote_capable', False):
+                    # Check if plugin is loaded; if so, verify it has remote ops
+                    plugin = pm.plugins.get(pid)
+                    has_ops = plugin is not None and hasattr(plugin, 'get_remote_operations')
+                    remote_plugins.append((pid, manifest.name, has_ops, plugin is not None))
+            
+            if not remote_plugins:
+                QMessageBox.information(self, "No Remote Plugins",
+                    "No plugins with remote capabilities are installed.")
+                return
+            
+            # Show share dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle("🔧 Share Your Device")
+            dialog.setMinimumWidth(480)
+            dialog.setStyleSheet("background: #1e1e2e; color: #eee;")
+            
+            dlg_layout = QVBoxLayout(dialog)
+            dlg_layout.setSpacing(16)
+            
+            title = QLabel("Share Your Device with a Professional")
+            title.setStyleSheet("font-size: 18px; font-weight: bold; color: #4fc3f7;")
+            dlg_layout.addWidget(title)
+            
+            desc = QLabel(
+                "Select which tools a Professional can use to help repair or "
+                "modify your device. You'll be asked to approve commands "
+                "based on your trust settings."
+            )
+            desc.setWordWrap(True)
+            desc.setStyleSheet("color: #aaa; font-size: 12px;")
+            dlg_layout.addWidget(desc)
+            
+            # Plugin checkboxes
+            plugins_group = QGroupBox("Available Tools")
+            plugins_group.setStyleSheet("QGroupBox { color: #4fc3f7; font-weight: bold; }")
+            plugins_layout = QVBoxLayout(plugins_group)
+            
+            checkboxes = {}
+            for pid, pname, has_ops, is_loaded in remote_plugins:
+                cb = QCheckBox(f"  {pname}")
+                if has_ops:
+                    cb.setChecked(True)
+                elif is_loaded:
+                    # Loaded but no remote ops method
+                    cb.setChecked(False)
+                    cb.setEnabled(False)
+                    cb.setToolTip("Plugin hasn't implemented remote operations yet")
+                    cb.setStyleSheet("color: #666;")
+                else:
+                    # Not loaded yet — will be loaded on share
+                    cb.setChecked(True)
+                    cb.setToolTip("Will be loaded when sharing starts")
+                checkboxes[pid] = cb
+                plugins_layout.addWidget(cb)
+            
+            dlg_layout.addWidget(plugins_group)
+            
+            # Trust mode
+            trust_group = QGroupBox("Trust Settings for This Session")
+            trust_group.setStyleSheet("QGroupBox { color: #4fc3f7; font-weight: bold; }")
+            trust_layout = QVBoxLayout(trust_group)
+            
+            ask_radio = QRadioButton("❓ Ask me for every command (safest)")
+            ask_radio.setChecked(self._trust_mode == 'ask')
+            trust_layout.addWidget(ask_radio)
+            
+            trust_read_radio = QRadioButton("📖 Auto-approve READ operations")
+            trust_read_radio.setChecked(self._trust_mode == 'trust_read')
+            trust_layout.addWidget(trust_read_radio)
+            
+            trust_all_radio = QRadioButton("⚡ Trust everything (⚠️ dangerous)")
+            trust_all_radio.setChecked(self._trust_mode == 'trust_all')
+            trust_all_radio.setStyleSheet("QRadioButton { color: #f44336; }")
+            trust_layout.addWidget(trust_all_radio)
+            
+            dlg_layout.addWidget(trust_group)
+            
+            # Room info
+            room_label = QLabel(f"📍 Sharing in room: {room_id}")
+            room_label.setStyleSheet("color: #888; font-size: 11px;")
+            dlg_layout.addWidget(room_label)
+            
+            # Buttons
+            share_btn_row = QHBoxLayout()
+            share_btn_row.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(dialog.reject)
+            share_btn_row.addWidget(cancel_btn)
+            
+            share_btn = QPushButton("🔧 Start Sharing")
+            share_btn.setStyleSheet("""
+                QPushButton {
+                    background: #c62828;
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 10px 24px;
+                    font-size: 14px;
+                    font-weight: bold;
+                }
+                QPushButton:hover { background: #d32f2f; }
+            """)
+            
+            def on_share():
+                if trust_all_radio.isChecked():
+                    self._trust_mode = 'trust_all'
+                elif trust_read_radio.isChecked():
+                    self._trust_mode = 'trust_read'
+                else:
+                    self._trust_mode = 'ask'
+                selected = [pid for pid, cb in checkboxes.items() if cb.isChecked()]
+                if not selected:
+                    QMessageBox.warning(dialog, "No Tools", "Select at least one tool to share.")
+                    return
+                dialog.accept()
+                self._start_sharing(room_id, username, selected)
+            
+            share_btn.clicked.connect(on_share)
+            share_btn_row.addWidget(share_btn)
+            dlg_layout.addLayout(share_btn_row)
+            
+            dialog.exec()
+        
+        def _start_sharing(self, room_id, username, plugin_ids):
+            """Create DeviceShareSession and begin sharing."""
+            try:
+                session = DeviceShareSession(parent=self)
+                
+                pm = plugin_manager
+                for pid in plugin_ids:
+                    plugin = pm.plugins.get(pid)
+                    if not plugin:
+                        # Lazy-load the plugin
+                        try:
+                            plugin = pm.load_plugin(pid)
+                        except Exception as e:
+                            logging.warning(f"Failed to load plugin {pid} for sharing: {e}")
+                    if plugin:
+                        session.register_plugin(pid, plugin)
+                
+                session.build_capabilities()
+                
+                # Connect signals
+                session.session_started.connect(self._on_sharing_started)
+                session.session_stopped.connect(self._on_sharing_stopped)
+                session.command_received.connect(self._handle_approval_request)
+                session.professional_joined_signal.connect(self._on_professional_joined)
+                session.screen_share_requested.connect(self._handle_screen_share_request)
+                session.screen_share_ended_signal.connect(
+                    lambda reason: self._share_status.setText(f"📺 Screen share ended: {reason}")
+                )
+                session.log_message.connect(lambda msg: self._on_command_log({'operation': msg}))
+                
+                session.start_sharing(room_id, username)
+                self._share_session = session
+                
+                self._share_status.setText("🟡 Connecting...")
+                self._share_status.setStyleSheet("font-size: 11px; color: #ff9800; margin: 4px 0;")
+                
+            except Exception as e:
+                logging.error(f"Failed to start sharing: {e}")
+                QMessageBox.critical(self, "Share Failed", f"Could not start sharing:\n{e}")
+        
+        def _on_sharing_started(self, session_id=None):
+            """Callback when sharing is successfully started."""
+            self._current_session_id = session_id
+            self._share_status.setText("🟢 Sharing — waiting for Professional")
+            if session_id:
+                self._share_status.setToolTip(f"Session ID: {session_id}\nRight-click to copy")
+            self._share_status.setStyleSheet(
+                "font-size: 11px; color: #4caf50; margin: 4px 0; font-weight: bold;"
+            )
+            # Auto-copy to clipboard
+            if session_id:
+                try:
+                    QApplication.clipboard().setText(session_id)
+                    logging.info(f"Session ID copied to clipboard: {session_id}")
+                except Exception:
+                    pass
+        
+        def _copy_session_id(self):
+            """Copy the current session ID to clipboard."""
+            sid = getattr(self, '_current_session_id', None)
+            if sid:
+                QApplication.clipboard().setText(sid)
+                # Brief visual feedback
+                old = self._share_status.text()
+                self._share_status.setText("📋 Session ID copied!")
+                QTimer.singleShot(1500, lambda: self._share_status.setText(old))
+        
+        def _share_status_context_menu(self, pos):
+            """Right-click menu on share status label."""
+            sid = getattr(self, '_current_session_id', None)
+            if not sid:
+                return
+            menu = QMenu(self)
+            copy_action = menu.addAction("📋 Copy Session ID")
+            stop_action = menu.addAction("🔴 Stop Sharing")
+            action = menu.exec(self._share_status.mapToGlobal(pos))
+            if action == copy_action:
+                self._copy_session_id()
+            elif action == stop_action:
+                self._stop_sharing()
+        
+        def _on_professional_joined(self, pro_name):
+            """Callback when a Professional connects to our session."""
+            self._share_status.setText(f"🟢 Sharing with {pro_name}")
+            self._share_status.setStyleSheet(
+                "font-size: 11px; color: #4caf50; margin: 4px 0; font-weight: bold;"
+            )
+        
+        def _on_sharing_stopped(self):
+            """Callback when sharing stops."""
+            self._share_status.setText("⚫ Not sharing")
+            self._share_status.setStyleSheet("font-size: 11px; color: #888; margin: 4px 0;")
+            self._share_session = None
+        
+        def _stop_sharing(self):
+            """Stop sharing device."""
+            if self._share_session:
+                self._share_session.stop_sharing()
+                self._share_session = None
+            self._share_status.setText("⚫ Not sharing")
+            self._share_status.setStyleSheet("font-size: 11px; color: #888; margin: 4px 0;")
+        
+        def _on_command_log(self, data):
+            """Host: log remote command execution."""
+            cmd = data.get('operation') or data.get('raw_command', 'unknown')
+            success = data.get('success', False)
+            icon = '✅' if success else '❌'
+            logging.info(f"Remote command {icon}: {cmd}")
+        
+        # ═══════════════════════════════════════════════════════════════
+        # REMOTE PLAY — APPROVAL DIALOG (HOST)
+        # ═══════════════════════════════════════════════════════════════
+        
+        def _handle_approval_request(self, data):
+            """Host: Show approval dialog for incoming Professional command."""
+            cmd_type = data.get('type', 'operation')
+            command_id = data.get('command_id', '')
+            pro_name = data.get('technician', data.get('professional_name', 'Unknown'))
+            risk = data.get('risk_level', data.get('risk', 'MODIFY'))
+            
+            if cmd_type == 'raw_command':
+                cmd_text = data.get('raw_command', '')
+                title_text = "Raw Console Command"
+            else:
+                cmd_text = data.get('operation', '')
+                plugin_id = data.get('plugin_id', '')
+                title_text = f"{plugin_id}: {cmd_text}"
+            
+            # Auto-approve logic
+            if self._trust_mode == 'trust_all':
+                if self._share_session:
+                    self._share_session.approve_command(command_id)
+                return
+            
+            if self._trust_mode == 'trust_read' and risk == 'READ':
+                if self._share_session:
+                    self._share_session.approve_command(command_id)
+                return
+            
+            # Show dialog
+            risk_colors = {
+                'READ': '#4caf50',
+                'MODIFY': '#ff9800',
+                'DANGER': '#f44336',
+            }
+            risk_color = risk_colors.get(risk, '#ff9800')
+            
+            approval_dlg = QDialog(self)
+            approval_dlg.setWindowTitle("⚠️ Remote Command Request")
+            approval_dlg.setMinimumWidth(450)
+            approval_dlg.setStyleSheet("background: #1e1e2e; color: #eee;")
+            
+            a_layout = QVBoxLayout(approval_dlg)
+            a_layout.setSpacing(12)
+            
+            header = QLabel(f"👤 {pro_name} wants to run a command:")
+            header.setStyleSheet("font-size: 14px; font-weight: bold; color: #4fc3f7;")
+            a_layout.addWidget(header)
+            
+            # Command display frame
+            cmd_frame = QWidget()
+            cmd_frame.setStyleSheet(
+                f"background: #111; border: 1px solid {risk_color}; "
+                f"border-radius: 8px; padding: 12px;"
+            )
+            cmd_frame_layout = QVBoxLayout(cmd_frame)
+            
+            type_label = QLabel(f"Type: {title_text}")
+            type_label.setStyleSheet("color: #aaa; font-size: 11px;")
+            cmd_frame_layout.addWidget(type_label)
+            
+            cmd_display = QLabel(cmd_text)
+            cmd_display.setStyleSheet(
+                "font-size: 14px; color: #00ff41; font-family: Consolas; padding: 4px 0;"
+            )
+            cmd_display.setWordWrap(True)
+            cmd_frame_layout.addWidget(cmd_display)
+            
+            risk_label = QLabel(f"Risk Level: {risk}")
+            risk_label.setStyleSheet(f"font-size: 12px; color: {risk_color}; font-weight: bold; margin-top: 4px;")
+            cmd_frame_layout.addWidget(risk_label)
+            
+            a_layout.addWidget(cmd_frame)
+            
+            # Approve / Reject buttons
+            approval_btns = QHBoxLayout()
+            approval_btns.addStretch()
+            
+            reject_btn = QPushButton("🚫 Reject")
+            reject_btn.setStyleSheet("""
+                QPushButton {
+                    background: #333; color: #f44336;
+                    border: 1px solid #f44336; border-radius: 6px;
+                    padding: 8px 20px; font-weight: bold;
+                }
+                QPushButton:hover { background: #3a1a1a; }
+            """)
+            
+            approve_btn = QPushButton("✅ Approve")
+            approve_btn.setStyleSheet("""
+                QPushButton {
+                    background: #1b5e20; color: white;
+                    border: none; border-radius: 6px;
+                    padding: 8px 20px; font-weight: bold;
+                }
+                QPushButton:hover { background: #2e7d32; }
+            """)
+            
+            def on_approve():
+                if self._share_session:
+                    self._share_session.approve_command(command_id)
+                approval_dlg.accept()
+            
+            def on_reject():
+                if self._share_session:
+                    self._share_session.reject_command(command_id)
+                approval_dlg.accept()
+            
+            reject_btn.clicked.connect(on_reject)
+            approve_btn.clicked.connect(on_approve)
+            
+            approval_btns.addWidget(reject_btn)
+            approval_btns.addWidget(approve_btn)
+            a_layout.addLayout(approval_btns)
+            
+            # Auto-reject after 60 seconds
+            auto_reject_timer = QTimer(approval_dlg)
+            auto_reject_timer.setSingleShot(True)
+            auto_reject_timer.timeout.connect(on_reject)
+            auto_reject_timer.start(60000)
+            
+            approval_dlg.exec()
+        
+        # ═══════════════════════════════════════════════════════════════
+        # REMOTE PLAY — PROFESSIONAL METHODS
+        # ═══════════════════════════════════════════════════════════════
+        
+        def _connect_to_device(self):
+            """Professional: Connect to a Host's shared device."""
+            if self._active_device_session:
+                reply = QMessageBox.question(
+                    self, "Already Connected",
+                    f"Connected to {self._active_device_session.get('host_name', 'device')}.\n\n"
+                    "Disconnect first?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._disconnect_professional()
+                return
+            
+            username = ''
+            if hasattr(plugin_store_api, 'user') and plugin_store_api.user:
+                username = plugin_store_api.user.get('username', '')
+            if not username:
+                QMessageBox.warning(self, "Not Logged In", "Please log in first.")
+                return
+            
+            # Connect dialog
+            connect_dlg = QDialog(self)
+            connect_dlg.setWindowTitle("📱 Connect as Professional")
+            connect_dlg.setMinimumWidth(420)
+            connect_dlg.setStyleSheet("background: #1e1e2e; color: #eee;")
+            
+            c_layout = QVBoxLayout(connect_dlg)
+            c_layout.setSpacing(12)
+            
+            title = QLabel("Connect to a Shared Device")
+            title.setStyleSheet("font-size: 18px; font-weight: bold; color: #4fc3f7;")
+            c_layout.addWidget(title)
+            
+            desc = QLabel(
+                "Enter the session code shared by the Host, or browse "
+                "available sessions in your room."
+            )
+            desc.setWordWrap(True)
+            desc.setStyleSheet("color: #aaa; font-size: 12px;")
+            c_layout.addWidget(desc)
+            
+            # Session code input
+            code_group = QGroupBox("Session Code")
+            code_group.setStyleSheet("QGroupBox { color: #4fc3f7; }")
+            code_input_layout = QHBoxLayout(code_group)
+            
+            session_input = QLineEdit()
+            session_input.setPlaceholderText("Paste session code from Host...")
+            session_input.setStyleSheet("""
+                QLineEdit {
+                    background: #111; color: #eee;
+                    border: 1px solid #333; border-radius: 6px;
+                    padding: 10px; font-size: 13px; font-family: Consolas;
+                }
+            """)
+            code_input_layout.addWidget(session_input, 1)
+            c_layout.addWidget(code_group)
+            
+            status_label = QLabel("")
+            status_label.setStyleSheet("color: #888; font-size: 11px;")
+            c_layout.addWidget(status_label)
+            
+            # Buttons
+            connect_btn_row = QHBoxLayout()
+            connect_btn_row.addStretch()
+            
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.clicked.connect(connect_dlg.reject)
+            connect_btn_row.addWidget(cancel_btn)
+            
+            go_btn = QPushButton("🔌 Connect")
+            go_btn.setStyleSheet("""
+                QPushButton {
+                    background: #0d47a1; color: white;
+                    border: none; border-radius: 6px;
+                    padding: 10px 24px; font-size: 14px; font-weight: bold;
+                }
+                QPushButton:hover { background: #1565c0; }
+            """)
+            
+            def on_connect():
+                code = session_input.text().strip()
+                if not code:
+                    status_label.setText("⚠️ Enter a session code")
+                    status_label.setStyleSheet("color: #f44336; font-size: 11px;")
+                    return
+                status_label.setText("🔄 Connecting...")
+                status_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+                connect_dlg.accept()
+                # Show immediate feedback on the main tab
+                self._share_status.setText("🔄 Connecting to session...")
+                self._share_status.setStyleSheet("font-size: 11px; color: #ff9800; margin: 4px 0;")
+                self._join_professional_session(code, username)
+            
+            go_btn.clicked.connect(on_connect)
+            connect_btn_row.addWidget(go_btn)
+            c_layout.addLayout(connect_btn_row)
+            
+            connect_dlg.exec()
+        
+        def _join_professional_session(self, session_code, username):
+            """Professional: Join a Host's session via Socket.IO (non-blocking)."""
+            # Get JWT token
+            token = getattr(plugin_store_api, 'token', None)
+            if not token:
+                QMessageBox.warning(self, "Not Logged In",
+                    "Please log in via Plugin Store first.")
+                return
+            
+            try:
+                import socketio
+                import threading
+                
+                # Thread-safe GUI update via custom QEvent
+                class _CallableEvent(QEvent):
+                    EVENT_TYPE = QEvent.Type(QEvent.registerEventType())
+                    def __init__(self, fn):
+                        super().__init__(self.EVENT_TYPE)
+                        self.fn = fn
+                
+                class _CallableEventFilter(QObject):
+                    def event(self, e):
+                        if isinstance(e, _CallableEvent):
+                            try:
+                                e.fn()
+                            except Exception as ex:
+                                logging.error(f"[PRO] GUI callback error: {ex}")
+                            return True
+                        return super().event(e)
+                
+                _event_receiver = _CallableEventFilter()
+                self._pro_event_receiver = _event_receiver  # prevent GC
+                
+                def _gui(fn):
+                    """Thread-safe: post callable to GUI thread event loop."""
+                    QApplication.instance().postEvent(_event_receiver, _CallableEvent(fn))
+                
+                # Build HTTP session with CF auth (curl_cffi for Cloudflare bypass)
+                http_session = None
+                try:
+                    from curl_cffi.requests import Session as CurlSession
+                    http_session = CurlSession()
+                    http_session.headers.update(get_rc_cf_headers())
+                except ImportError:
+                    try:
+                        import requests
+                        http_session = requests.Session()
+                        http_session.headers.update(get_rc_cf_headers())
+                    except ImportError:
+                        QMessageBox.critical(
+                            self, "Missing Library",
+                            "No HTTP library available.\nInstall: pip install curl_cffi"
+                        )
+                        return
+                
+                sio = socketio.Client(
+                    reconnection=True,
+                    reconnection_attempts=5,
+                    reconnection_delay=2,
+                    reconnection_delay_max=15,
+                    logger=False,
+                    engineio_logger=False,
+                    http_session=http_session,
+                )
+                
+                _self = self  # capture for closures
+                
+                @sio.event
+                def connect():
+                    logging.info("[PRO] Connected to remote-ctl relay server")
+                    sio.emit('join_device_session', {
+                        'session_id': session_code,
+                        'professional_name': username,
+                    })
+                    logging.info(f"[PRO] Emitted join_device_session for session {session_code[:8]}...")
+                
+                @sio.event
+                def disconnect():
+                    logging.warning("[PRO] Disconnected from remote-ctl relay server")
+                    def _on_disconnect():
+                        _self._share_status.setText("🔴 Disconnected from relay")
+                        _self._share_status.setStyleSheet("font-size: 11px; color: #f44336; margin: 4px 0;")
+                    _gui(_on_disconnect)
+                
+                @sio.on('device_session_joined')
+                def on_joined(data):
+                    logging.info(f"[PRO] Received device_session_joined: {data}")
+                    host_name = data.get('owner_name', 'Host')
+                    caps = data.get('capabilities', [])
+                    def _update():
+                        logging.info(f"[PRO] GUI update: Connected to {host_name}, {len(caps)} capabilities")
+                        _self._active_device_session = {
+                            'session_id': session_code,
+                            'host_name': host_name,
+                            'capabilities': caps,
+                        }
+                        _self._share_status.setText(f"🔵 Connected to {host_name}")
+                        _self._share_status.setStyleSheet(
+                            "font-size: 11px; color: #2196f3; margin: 4px 0; font-weight: bold;"
+                        )
+                        _self.remote_connect_btn.setText("📱 Disconnect")
+                        # Notify user visibly
+                        QMessageBox.information(
+                            _self, "Connected!",
+                            f"✅ Connected to {host_name}'s device!\n\n"
+                            f"Capabilities: {len(caps)} plugin(s)\n"
+                            f"Opening master console..."
+                        )
+                        QTimer.singleShot(500, _self._show_master_console)
+                    _gui(_update)
+                
+                @sio.on('device_command_result')
+                def on_result(data):
+                    _gui(lambda: _self._on_console_result(data))
+                
+                @sio.on('device_command_log')
+                def on_log(data):
+                    _gui(lambda: _self._on_console_result(data))
+                
+                @sio.on('device_capabilities_update')
+                def on_caps_update(data):
+                    if _self._active_device_session:
+                        _self._active_device_session['capabilities'] = data.get('capabilities', [])
+                
+                @sio.on('device_share_ended')
+                def on_share_ended(data):
+                    logging.info(f"[PRO] Received device_share_ended: {data}")
+                    def _handle():
+                        _self._disconnect_professional()
+                        QMessageBox.information(
+                            _self, "Session Ended",
+                            "The Host has stopped sharing their device."
+                        )
+                    _gui(_handle)
+                
+                @sio.on('device_unshared')
+                def on_unshared(data):
+                    logging.info(f"[PRO] Received device_unshared: {data}")
+                    reason = data.get('reason', 'Host stopped sharing')
+                    def _handle():
+                        _self._disconnect_professional()
+                        QMessageBox.information(
+                            _self, "Session Ended",
+                            f"The Host has stopped sharing their device.\n\nReason: {reason}"
+                        )
+                    _gui(_handle)
+                
+                @sio.on('error')
+                def on_error(data):
+                    msg = data.get('message', str(data)) if isinstance(data, dict) else str(data)
+                    logging.error(f"[PRO] Socket error: {msg}")
+                    def _show_err():
+                        _self._share_status.setText(f"❌ {msg[:60]}")
+                        _self._share_status.setStyleSheet("font-size: 11px; color: #f44336; margin: 4px 0;")
+                    _gui(_show_err)
+                
+                # ── Screen Share handlers (Professional receives from relay) ──
+                @sio.on('screen_share_approved')
+                def on_screen_approved(data):
+                    ssid = data.get('screen_session_id', '')
+                    perms = data.get('permissions', {})
+                    def _open():
+                        _self._open_screen_viewer(ssid, perms)
+                    _gui(_open)
+
+                @sio.on('screen_share_denied')
+                def on_screen_denied(data):
+                    msg = data.get('message', 'Host denied the request')
+                    def _show():
+                        if hasattr(_self, '_console_output') and _self._console_output:
+                            _self._console_output.append(
+                                f'<span style="color:#ff9800">📺 Screen share denied: {msg}</span>'
+                            )
+                    _gui(_show)
+
+                @sio.on('screen_share_ended')
+                def on_screen_ended(data):
+                    reason = data.get('reason', 'Session ended')
+                    def _close():
+                        _self._close_screen_viewer()
+                        if hasattr(_self, '_console_output') and _self._console_output:
+                            _self._console_output.append(
+                                f'<span style="color:#ff9800">📺 Screen share ended: {reason}</span>'
+                            )
+                    _gui(_close)
+
+                @sio.on('screen_frame')
+                def on_screen_frame(data):
+                    if not data or len(data) < 20:
+                        return
+                    # Strip 16-byte UUID prefix, pass JPEG data to viewer
+                    jpeg_data = bytes(data[16:]) if not isinstance(data, bytes) else data[16:]
+                    viewer = getattr(_self, '_screen_viewer', None)
+                    if viewer and viewer.isVisible():
+                        _gui(lambda jd=jpeg_data: viewer.update_frame(jd))
+
+                @sio.on('screen_permissions_updated')
+                def on_screen_perms(data):
+                    perms = data.get('permissions', {})
+                    viewer = getattr(_self, '_screen_viewer', None)
+                    if viewer:
+                        _gui(lambda p=perms: viewer.update_permissions(p))
+
+                self._pro_socket = sio
+                
+                # Connect in background thread (blocks during HTTP handshake)
+                def _do_connect():
+                    try:
+                        sio.connect(
+                            REMOTE_CTL_URL,
+                            auth={'token': token},
+                            transports=['polling'],
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to connect as Professional: {e}")
+                        _gui(lambda: _self._share_status.setText(f"❌ {str(e)[:60]}"))
+                        _gui(lambda: _self._share_status.setStyleSheet("font-size: 11px; color: #f44336; margin: 4px 0;"))
+                
+                threading.Thread(target=_do_connect, daemon=True).start()
+                
+            except Exception as e:
+                logging.error(f"Failed to connect as Professional: {e}")
+                QMessageBox.critical(self, "Connection Failed", f"Could not connect:\n{e}")
+        
+        def _disconnect_professional(self):
+            """Professional: Disconnect from Host's session."""
+            if self._pro_socket:
+                try:
+                    self._pro_socket.disconnect()
+                except Exception:
+                    pass
+                self._pro_socket = None
+            
+            self._active_device_session = None
+            self._share_status.setText("⚫ Not sharing")
+            self._share_status.setStyleSheet("font-size: 11px; color: #888; margin: 4px 0;")
+            self.remote_connect_btn.setText("📱 Connect as Professional")
+            
+            if self._remote_console:
+                self._remote_console.close()
+                self._remote_console = None
+            
+            self._close_screen_viewer()
+        
+        # ═══════════════════════════════════════════════════════════════
+        # REMOTE PLAY — SCREEN SHARE UI (PROFESSIONAL + HOST)
+        # ═══════════════════════════════════════════════════════════════
+        
+        def _request_screen_share(self):
+            """Professional: Request screen share from Host."""
+            if not self._pro_socket or not self._active_device_session:
+                QMessageBox.warning(self, "Not Connected", "Connect to a device session first.")
+                return
+
+            session_id = self._active_device_session.get('session_id', '')
+            self._pro_socket.emit('screen_share_request', {
+                'session_id': session_id,
+            })
+            if hasattr(self, '_console_output') and self._console_output:
+                self._console_output.append(
+                    '<span style="color:#4fc3f7">📺 Screen share requested — waiting for Host approval...</span>'
+                )
+
+        def _open_screen_viewer(self, screen_session_id, permissions):
+            """Professional: Open the screen viewer widget."""
+            self._close_screen_viewer()
+            host_name = ''
+            if self._active_device_session:
+                host_name = self._active_device_session.get('host_name', '')
+
+            viewer = ScreenViewerWidget(
+                screen_session_id=screen_session_id,
+                host_name=host_name,
+                permissions=permissions,
+                parent=None,
+            )
+            viewer.closed.connect(self._on_screen_viewer_closed)
+            viewer.input_event.connect(self._send_screen_input)
+            viewer.show()
+            self._screen_viewer = viewer
+
+            # Start heartbeat timer — keeps relay from killing the session
+            self._screen_hb_timer = QTimer()
+            self._screen_hb_timer.timeout.connect(
+                lambda: self._send_screen_heartbeat(screen_session_id)
+            )
+            self._screen_hb_timer.start(2000)  # Every 2 seconds
+
+            if hasattr(self, '_console_output') and self._console_output:
+                self._console_output.append(
+                    '<span style="color:#4caf50">📺 Screen share started! Viewer opened.</span>'
+                )
+
+        def _close_screen_viewer(self):
+            """Close the screen viewer if open."""
+            hb = getattr(self, '_screen_hb_timer', None)
+            if hb:
+                hb.stop()
+                self._screen_hb_timer = None
+            viewer = getattr(self, '_screen_viewer', None)
+            if viewer:
+                viewer.close()
+                viewer.deleteLater()
+            self._screen_viewer = None
+
+        def _on_screen_viewer_closed(self):
+            """Called when viewer window is closed by Professional."""
+            if self._pro_socket:
+                ssid = ''
+                viewer = getattr(self, '_screen_viewer', None)
+                if viewer:
+                    ssid = viewer.screen_session_id
+                if ssid:
+                    self._pro_socket.emit('screen_viewer_disconnect', {
+                        'screen_session_id': ssid,
+                    })
+            self._screen_viewer = None
+
+        def _send_screen_input(self, data):
+            """Professional: Send touch/key input to relay → Host."""
+            if self._pro_socket:
+                self._pro_socket.emit('screen_input', data)
+
+        def _send_screen_heartbeat(self, screen_session_id):
+            """Professional: Send heartbeat to keep screen session alive."""
+            if self._pro_socket:
+                try:
+                    self._pro_socket.emit('screen_heartbeat', {
+                        'screen_session_id': screen_session_id,
+                    })
+                except Exception:
+                    pass
+
+        def _handle_screen_share_request(self, data):
+            """Host: Show screen share approval dialog."""
+            ssid = data.get('screen_session_id', '')
+            pro_name = data.get('professional_name', 'Unknown')
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("📺 Screen Share Request")
+            dlg.setMinimumWidth(420)
+            dlg.setStyleSheet("background: #1e1e2e; color: #eee;")
+            lay = QVBoxLayout(dlg)
+
+            lay.addWidget(QLabel(
+                f"<h3>📺 {pro_name} wants to see your device screen</h3>"
+            ))
+
+            # Privacy notice
+            privacy = QLabel(
+                "🔒 <b>Zero-Persistence Policy</b><br>"
+                "• No frames are stored on any server<br>"
+                "• No metadata persists after session ends<br>"
+                "• All data is RAM-only and purged immediately<br>"
+                '• Verify: <a href="https://github.com/vehoelite/image-anarchy">'
+                "github.com/vehoelite/image-anarchy</a>"
+            )
+            privacy.setOpenExternalLinks(True)
+            privacy.setStyleSheet(
+                "color: #aaa; font-size: 11px; padding: 8px; "
+                "background: #111; border-radius: 4px;"
+            )
+            privacy.setWordWrap(True)
+            lay.addWidget(privacy)
+
+            # Permissions checkboxes
+            perm_group = QGroupBox("Permissions")
+            perm_group.setStyleSheet("QGroupBox { color: #4fc3f7; }")
+            perm_lay = QVBoxLayout(perm_group)
+
+            view_cb = QCheckBox("👁️ View screen (required)")
+            view_cb.setChecked(True)
+            view_cb.setEnabled(False)
+            perm_lay.addWidget(view_cb)
+
+            touch_cb = QCheckBox("👆 Allow touch input (tap, swipe)")
+            perm_lay.addWidget(touch_cb)
+
+            kb_cb = QCheckBox("⌨️ Allow keyboard input")
+            perm_lay.addWidget(kb_cb)
+
+            lay.addWidget(perm_group)
+
+            # Banner warning
+            banner = QLabel("🔴 A persistent banner will show while your screen is shared")
+            banner.setStyleSheet("color: #ff9800; font-size: 11px; padding: 4px;")
+            lay.addWidget(banner)
+
+            # Buttons
+            btn_row = QHBoxLayout()
+            deny_btn = QPushButton("❌ Deny")
+            deny_btn.clicked.connect(lambda: (
+                self._share_session.deny_screen_share(ssid) if self._share_session else None,
+                dlg.reject(),
+            ))
+            btn_row.addWidget(deny_btn)
+
+            btn_row.addStretch()
+
+            approve_btn = QPushButton("✅ Share Screen")
+            approve_btn.setStyleSheet("""
+                QPushButton {
+                    background: #2e7d32; color: white; border: none;
+                    border-radius: 6px; padding: 10px 24px;
+                    font-size: 14px; font-weight: bold;
+                }
+                QPushButton:hover { background: #388e3c; }
+            """)
+
+            def on_approve():
+                perms = {
+                    'view': True,
+                    'touch': touch_cb.isChecked(),
+                    'keyboard': kb_cb.isChecked(),
+                }
+                if self._share_session:
+                    self._share_session.approve_screen_share(ssid, perms)
+                    self._share_status.setText("📺🔴 SCREEN IS BEING SHARED")
+                    self._share_status.setStyleSheet(
+                        "font-size: 12px; color: #f44336; margin: 4px 0; font-weight: bold;"
+                    )
+                dlg.accept()
+
+            approve_btn.clicked.connect(on_approve)
+            btn_row.addWidget(approve_btn)
+            lay.addLayout(btn_row)
+
+            dlg.exec()
+
+        # ═══════════════════════════════════════════════════════════════
+        # REMOTE PLAY — MASTER CONSOLE (PROFESSIONAL)
+        # ═══════════════════════════════════════════════════════════════
+        
+        def _show_master_console(self):
+            """Open the floating master console for raw command entry."""
+            if self._remote_console and self._remote_console.isVisible():
+                self._remote_console.raise_()
+                self._remote_console.activateWindow()
+                return
+            
+            host_name = ''
+            caps = []
+            if self._active_device_session:
+                host_name = self._active_device_session.get('host_name', '')
+                caps = self._active_device_session.get('capabilities', [])
+            
+            # Build prefix list from capabilities
+            prefixes = set()
+            for cap in caps:
+                pid = cap.get('plugin_id', '')
+                if pid:
+                    short = pid.replace('_toolkit', '').replace('_patcher', '')
+                    prefixes.add(short)
+            prefix_str = ' | '.join(sorted(prefixes)) or 'adb | fastboot | mtk'
+            
+            console = QWidget()
+            console.setWindowTitle(f"🖥️ Master Console — {host_name or 'Not Connected'}")
+            console.setWindowFlags(Qt.WindowType.Window)
+            console.resize(750, 520)
+            console.setMinimumSize(500, 300)
+            console.setStyleSheet("background: #0a0a0a;")
+            
+            con_layout = QVBoxLayout(console)
+            con_layout.setContentsMargins(8, 8, 8, 8)
+            con_layout.setSpacing(6)
+            
+            # Top bar with prefix hints
+            top_bar = QHBoxLayout()
+            hints = QLabel(f"⌨️ Prefixes: {prefix_str}")
+            hints.setStyleSheet("color: #4fc3f7; font-size: 11px; font-family: Consolas;")
+            top_bar.addWidget(hints)
+            top_bar.addStretch()
+            
+            caps_btn = QPushButton("📋 Capabilities")
+            caps_btn.setStyleSheet("""
+                QPushButton {
+                    background: #1a1a2a; color: #4fc3f7;
+                    border: 1px solid #333; border-radius: 4px;
+                    padding: 4px 10px; font-size: 11px;
+                }
+                QPushButton:hover { background: #2a2a3a; }
+            """)
+            caps_btn.clicked.connect(lambda: self._show_capabilities_popup(caps))
+            top_bar.addWidget(caps_btn)
+            
+            screen_btn = QPushButton("📺 View Screen")
+            screen_btn.setStyleSheet("""
+                QPushButton {
+                    background: #1a2a1a; color: #4caf50;
+                    border: 1px solid #333; border-radius: 4px;
+                    padding: 4px 10px; font-size: 11px;
+                }
+                QPushButton:hover { background: #2a3a2a; }
+            """)
+            screen_btn.clicked.connect(self._request_screen_share)
+            top_bar.addWidget(screen_btn)
+            con_layout.addLayout(top_bar)
+            
+            # Output area
+            self._console_output = QTextEdit()
+            self._console_output.setReadOnly(True)
+            self._console_output.setStyleSheet("""
+                QTextEdit {
+                    background: #0a0a0a; color: #00ff41;
+                    font-family: Consolas, 'Courier New', monospace;
+                    font-size: 12px;
+                    border: 1px solid #222; border-radius: 4px;
+                    padding: 8px;
+                    selection-background-color: #264f78;
+                }
+            """)
+            self._console_output.setHtml(
+                '<span style="color:#4fc3f7">&#9552;&#9552;&#9552; Image Anarchy Master Console &#9552;&#9552;&#9552;</span><br>'
+                f'<span style="color:#888">Connected to: <b>{host_name}</b></span><br>'
+                f'<span style="color:#888">Available prefixes: {prefix_str}</span><br>'
+                '<span style="color:#888">Type a command and press Enter. Examples:</span><br>'
+                '<span style="color:#555">  adb devices</span><br>'
+                '<span style="color:#555">  fastboot getvar all</span><br>'
+                '<span style="color:#555">  mtk read_imei</span><br>'
+                '<span style="color:#4fc3f7">&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;&#9552;</span><br>'
+            )
+            con_layout.addWidget(self._console_output, 1)
+            
+            # Input row
+            input_row = QHBoxLayout()
+            input_row.setSpacing(6)
+            
+            prompt_label = QLabel("IA$")
+            prompt_label.setStyleSheet(
+                "color: #c62828; font-size: 15px; font-family: Consolas; font-weight: bold;"
+            )
+            input_row.addWidget(prompt_label)
+            
+            self._console_input = QLineEdit()
+            self._console_input.setPlaceholderText(f"  {prefix_str} ...")
+            self._console_input.setStyleSheet("""
+                QLineEdit {
+                    background: #0d0d0d; color: #00ff41;
+                    font-family: Consolas, 'Courier New', monospace;
+                    font-size: 13px;
+                    border: 1px solid #333; border-radius: 4px;
+                    padding: 8px;
+                }
+                QLineEdit:focus { border-color: #4fc3f7; }
+            """)
+            self._console_input.returnPressed.connect(self._send_console_command)
+            input_row.addWidget(self._console_input, 1)
+            
+            send_btn = QPushButton("▶")
+            send_btn.setFixedWidth(40)
+            send_btn.setStyleSheet("""
+                QPushButton {
+                    background: #c62828; color: white;
+                    border: none; border-radius: 4px;
+                    font-size: 16px; padding: 8px;
+                }
+                QPushButton:hover { background: #d32f2f; }
+            """)
+            send_btn.clicked.connect(self._send_console_command)
+            input_row.addWidget(send_btn)
+            
+            con_layout.addLayout(input_row)
+            
+            self._remote_console = console
+            console.show()
+            self._console_input.setFocus()
+        
+        def _show_capabilities_popup(self, capabilities):
+            """Show dialog listing all capabilities from the Host."""
+            cap_dlg = QDialog(self._remote_console or self)
+            cap_dlg.setWindowTitle("📋 Host Capabilities")
+            cap_dlg.setMinimumWidth(500)
+            cap_dlg.setMinimumHeight(400)
+            cap_dlg.setStyleSheet("background: #1e1e2e; color: #eee;")
+            
+            cap_layout = QVBoxLayout(cap_dlg)
+            
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setStyleSheet("border: none;")
+            
+            content = QWidget()
+            content_layout = QVBoxLayout(content)
+            content_layout.setSpacing(4)
+            
+            risk_colors = {'READ': '#4caf50', 'MODIFY': '#ff9800', 'DANGER': '#f44336'}
+            
+            current_plugin = None
+            for cap in sorted(capabilities, key=lambda c: c.get('plugin_id', '')):
+                pid = cap.get('plugin_id', '')
+                if pid != current_plugin:
+                    current_plugin = pid
+                    plbl = QLabel(f"\n🔌 {pid}")
+                    plbl.setStyleSheet(
+                        "font-size: 14px; font-weight: bold; color: #4fc3f7; margin-top: 8px;"
+                    )
+                    content_layout.addWidget(plbl)
+                
+                op_id = cap.get('id', '')
+                op_name = cap.get('name', op_id)
+                risk = cap.get('risk', 'MODIFY')
+                op_desc = cap.get('description', '')
+                color = risk_colors.get(risk, '#ff9800')
+                
+                op_lbl = QLabel(
+                    f"  {op_name}  [{risk}]  — {op_desc}"
+                )
+                op_lbl.setStyleSheet(f"font-size: 11px; color: {color}; margin-left: 16px;")
+                content_layout.addWidget(op_lbl)
+            
+            if not capabilities:
+                empty = QLabel("No capabilities reported by Host")
+                empty.setStyleSheet("color: #888; font-style: italic;")
+                content_layout.addWidget(empty)
+            
+            content_layout.addStretch()
+            scroll.setWidget(content)
+            cap_layout.addWidget(scroll)
+            
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(cap_dlg.accept)
+            cap_layout.addWidget(close_btn)
+            
+            cap_dlg.exec()
+        
+        def _send_console_command(self):
+            """Professional: Send a raw command from the master console."""
+            if not hasattr(self, '_console_input') or not self._console_input:
+                return
+            cmd = self._console_input.text().strip()
+            if not cmd:
+                return
+            self._console_input.clear()
+            
+            # Echo command in output
+            self._console_output.append(
+                f'<span style="color:#4fc3f7">IA$ </span>'
+                f'<span style="color:#eee">{cmd}</span>'
+            )
+            
+            if not self._pro_socket or not self._active_device_session:
+                self._console_output.append(
+                    '<span style="color:#f44336">✗ Not connected to any device</span>'
+                )
+                return
+            
+            session_id = self._active_device_session.get('session_id', '')
+            pro_name = ''
+            if hasattr(plugin_store_api, 'user') and plugin_store_api.user:
+                pro_name = plugin_store_api.user.get('username', '')
+            
+            self._console_output.append(
+                '<span style="color:#888">⏳ Sending to Host for approval...</span>'
+            )
+            
+            try:
+                self._pro_socket.emit('raw_command', {
+                    'session_id': session_id,
+                    'raw_command': cmd,
+                    'professional_name': pro_name,
+                })
+            except Exception as e:
+                self._console_output.append(
+                    f'<span style="color:#f44336">✗ Send failed: {e}</span>'
+                )
+        
+        def _on_console_result(self, data):
+            """Professional: Handle command result from Host."""
+            if not hasattr(self, '_console_output') or not self._console_output:
+                return
+            
+            success = data.get('success', False)
+            output = data.get('output', data.get('result', ''))
+            error = data.get('error', '')
+            operation = data.get('operation', data.get('raw_command', ''))
+            
+            if success:
+                self._console_output.append(
+                    f'<span style="color:#4caf50">✓ {operation}</span>'
+                )
+                if output:
+                    safe = str(output).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    for line in safe.split('\n'):
+                        self._console_output.append(
+                            f'<span style="color:#00ff41">{line}</span>'
+                        )
+            else:
+                err_msg = error or output or 'Command failed'
+                safe_err = str(err_msg).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                self._console_output.append(
+                    f'<span style="color:#f44336">✗ {safe_err}</span>'
+                )
+            
+            self._console_output.append('')
+            sb = self._console_output.verticalScrollBar()
+            sb.setValue(sb.maximum())
+        
+        def _toggle_dock(self):
+            """Toggle between docked and floating chat window."""
+            if self._is_docked:
+                self._undock_chat()
+            else:
+                self._dock_chat()
+                
+        def _undock_chat(self):
+            """Undock chat into a floating window."""
+            if self._floating_window:
+                self._floating_window.show()
+                self._floating_window.raise_()
+                return
+                
+            self._floating_window = QWidget()
+            self._floating_window.setWindowTitle("💬 Image Anarchy Chat")
+            self._floating_window.setWindowFlags(Qt.WindowType.Window)
+            self._floating_window.resize(500, 700)
+            self._floating_window.setMinimumSize(350, 400)
+            
+            float_layout = QVBoxLayout(self._floating_window)
+            float_layout.setContentsMargins(0, 0, 0, 0)
+            
+            # Move chat widget to floating window
+            if self._chat_widget:
+                self._chat_widget.setParent(self._floating_window)
+                float_layout.addWidget(self._chat_widget)
+                self._chat_widget.setVisible(True)
+            
+            # Bottom bar with dock button
+            bottom_bar = QHBoxLayout()
+            bottom_bar.setContentsMargins(8, 4, 8, 4)
+            
+            dock_btn = QPushButton("📥 Dock Back")
+            dock_btn.clicked.connect(self._dock_chat)
+            bottom_bar.addWidget(dock_btn)
+            
+            bottom_bar.addStretch()
+            
+            self._float_stay_on_top = QPushButton("📌 Stay on Top")
+            self._float_stay_on_top.setCheckable(True)
+            self._float_stay_on_top.clicked.connect(self._toggle_stay_on_top)
+            bottom_bar.addWidget(self._float_stay_on_top)
+            
+            float_layout.addLayout(bottom_bar)
+            
+            self._floating_window.show()
+            self._is_docked = False
+            self.undock_btn.setText("📥 Dock Chat")
+            self.stay_on_top_btn.setEnabled(True)
+            
+            # Handle window close - dock back
+            def on_close(event):
+                self._dock_chat()
+                event.ignore()
+            self._floating_window.closeEvent = on_close
+            
+        def _dock_chat(self):
+            """Dock chat back into the main tab."""
+            if not self._floating_window:
+                return
+                
+            # Move chat widget back
+            if self._chat_widget:
+                self._chat_widget.setParent(self)
+                # Find the chat panel and add widget back
+                chat_panel = self.main_splitter.widget(1)
+                if chat_panel:
+                    chat_panel.layout().addWidget(self._chat_widget)
+                self._chat_widget.setVisible(True)
+            
+            self._floating_window.hide()
+            self._floating_window.deleteLater()
+            self._floating_window = None
+            self._is_docked = True
+            self.undock_btn.setText("📤 Undock Chat")
+            self.stay_on_top_btn.setEnabled(False)
+            self.stay_on_top_btn.setChecked(False)
+            
+        def _toggle_stay_on_top(self):
+            """Toggle stay-on-top for floating window."""
+            if self._floating_window:
+                is_on_top = self.stay_on_top_btn.isChecked()
+                flags = self._floating_window.windowFlags()
+                
+                if is_on_top:
+                    flags |= Qt.WindowType.WindowStaysOnTopHint
+                else:
+                    flags &= ~Qt.WindowType.WindowStaysOnTopHint
+                
+                self._floating_window.setWindowFlags(flags)
+                self._floating_window.show()  # Need to show again after changing flags
+                
+                if hasattr(self, '_float_stay_on_top'):
+                    self._float_stay_on_top.setChecked(is_on_top)
+
+    return QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab, PreReadyChecklistDialog, ForumTab, ChatTab
 
 
 # =============================================================================
@@ -22166,7 +30437,8 @@ def run_cli(args):
                         handler.process(op, out_file, old_file)
                         sys.stdout.write(".")
                         sys.stdout.flush()
-                print(" Done")
+                sys.stdout.write(" Done\n")
+                sys.stdout.flush()
             finally:
                 if old_file:
                     old_file.close()
@@ -22247,6 +30519,17 @@ def _extract_super_cli(super_path: str, output_dir: str):
 # =============================================================================
 
 def main():
+    # Check for admin privileges on Windows (required for USB device access)
+    if sys.platform == 'win32' and not is_admin():
+        print("⚠️  Image Anarchy requires Administrator privileges for USB device access.")
+        print("🔄 Requesting elevation...")
+        if run_as_admin():
+            # Elevation requested, exit this instance
+            sys.exit(0)
+        else:
+            print("⚠️  Could not elevate to admin. Some features may not work.")
+            print("💡 Try right-clicking and selecting 'Run as Administrator'")
+    
     parser = argparse.ArgumentParser(
         description='Image Anarchy - Android Image Swiss Army Knife | https://github.com/vehoelite/image-anarchy',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -22398,7 +30681,7 @@ Examples:
     else:
         # GUI mode
         try:
-            QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab, PreReadyChecklistDialog = create_gui_app()
+            QApplication, ImageAnarchyGUI, QPalette, QColor, PluginsTab, PreReadyChecklistDialog, ForumTab, ChatTab = create_gui_app()
         except ImportError:
             print("PyQt6 is required for GUI mode. Install with: pip install PyQt6")
             print("Or use CLI mode: python image_anarchy.py --cli payload.bin")
@@ -22423,13 +30706,27 @@ Examples:
         
         # Show Pre-Ready Checklist splash screen
         splash = PreReadyChecklistDialog()
-        splash.exec()
+        result = splash.exec()
+        
+        # Clean up splash dialog explicitly
+        splash.deleteLater()
+        
+        # Process pending events to ensure clean state before creating main window
+        app.processEvents()
         
         window = ImageAnarchyGUI()
         
         # Add Plugins tab
         plugins_tab = PluginsTab(window)
         window.tab_widget.addTab(plugins_tab, "🔌 Plugins")
+        
+        # Add Chat tab
+        chat_tab = ChatTab(window)
+        window.tab_widget.addTab(chat_tab, "💬 Chat")
+        
+        # Add Forum tab
+        forum_tab = ForumTab(window)
+        window.tab_widget.addTab(forum_tab, "🌐 Forum")
         
         window.show()
         
