@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Anarchy - Android Image Swiss Army Knife</title>
+    <link rel="icon" type="image/png" href="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --primary-red: #c62828;
+            --primary-red-hover: #e53935;
+            --primary-cyan: #4fc3f7;
+            --dark-bg: #1e1e1e;
+            --darker-bg: #121212;
+            --card-bg: #2a2a2a;
+            --text-primary: #ffffff;
+            --text-secondary: #b0b0b0;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--darker-bg);
+            color: var(--text-primary);
+            line-height: 1.6;
+        }
+        
+        /* Header */
+        header {
+            background: linear-gradient(135deg, var(--dark-bg) 0%, var(--darker-bg) 100%);
+            padding: 1rem 2rem;
+            position: fixed;
+            width: 100%;
+            top: 0;
+            z-index: 1000;
+            border-bottom: 2px solid var(--primary-red);
+        }
+        
+        nav {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: var(--primary-red);
+        }
+        
+        .logo img {
+            width: 40px;
+            height: 40px;
+        }
+        
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+        
+        .nav-links a {
+            color: var(--text-primary);
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+        
+        .nav-links a:hover {
+            color: var(--primary-cyan);
+        }
+        
+        /* Hero Section */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+            background: radial-gradient(ellipse at center, var(--dark-bg) 0%, var(--darker-bg) 100%);
+        }
+        
+        .hero-content {
+            max-width: 800px;
+        }
+        
+        .hero h1 {
+            font-size: 3.5rem;
+            margin-bottom: 1rem;
+            background: linear-gradient(45deg, var(--primary-red), var(--primary-cyan));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .hero .tagline {
+            font-size: 1.5rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.5rem;
+        }
+        
+        .hero .version {
+            font-size: 1.2rem;
+            color: var(--primary-cyan);
+            margin-bottom: 2rem;
+        }
+        
+        .hero .version-badge {
+            display: inline-block;
+            background: linear-gradient(45deg, var(--primary-red), #ff5252);
+            color: white;
+            padding: 0.25rem 0.75rem;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-left: 0.5rem;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+        
+        .cta-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 1rem 2rem;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            text-decoration: none;
+            transition: all 0.3s;
+            cursor: pointer;
+            border: none;
+        }
+        
+        .btn-primary {
+            background: var(--primary-red);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: var(--primary-red-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(198, 40, 40, 0.3);
+        }
+        
+        .btn-secondary {
+            background: transparent;
+            color: var(--primary-cyan);
+            border: 2px solid var(--primary-cyan);
+        }
+        
+        .btn-secondary:hover {
+            background: var(--primary-cyan);
+            color: var(--darker-bg);
+        }
+        
+        /* Features Section */
+        .features {
+            padding: 5rem 2rem;
+            background: var(--dark-bg);
+        }
+        
+        .section-title {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 3rem;
+            color: var(--primary-red);
+        }
+        
+        .features-grid {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+        
+        .feature-card {
+            background: var(--card-bg);
+            padding: 2rem;
+            border-radius: 12px;
+            border: 1px solid #333;
+            transition: all 0.3s;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--primary-red);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+        
+        .feature-card h3 {
+            color: var(--primary-cyan);
+            margin-bottom: 1rem;
+            font-size: 1.3rem;
+        }
+        
+        .feature-card p {
+            color: var(--text-secondary);
+        }
+        
+        /* New in 3.0 Section */
+        .new-features {
+            padding: 5rem 2rem;
+            background: linear-gradient(135deg, var(--darker-bg) 0%, #1a1a2e 100%);
+        }
+        
+        .new-features .section-title {
+            color: #ff5252;
+        }
+        
+        .new-feature-highlight {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 2rem;
+        }
+        
+        .highlight-card {
+            background: linear-gradient(135deg, var(--card-bg) 0%, #1e1e3a 100%);
+            padding: 2.5rem;
+            border-radius: 16px;
+            border: 2px solid var(--primary-red);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .highlight-card::before {
+            content: 'NEW';
+            position: absolute;
+            top: 15px;
+            right: -30px;
+            background: var(--primary-red);
+            color: white;
+            padding: 5px 40px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            transform: rotate(45deg);
+        }
+        
+        .highlight-card.coming-soon::before {
+            content: 'COMING SOON';
+            background: linear-gradient(45deg, #ff9800, #ff5722);
+            right: -45px;
+        }
+        
+        .highlight-card.coming-soon {
+            border-color: #ff9800;
+            opacity: 0.9;
+        }
+        
+        .coming-soon-section {
+            padding: 5rem 2rem;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        }
+        
+        .coming-soon-section .section-title {
+            color: #ff9800;
+        }
+        
+        .highlight-card h3 {
+            color: var(--primary-cyan);
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .highlight-card .subtitle {
+            color: var(--primary-red);
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+            font-weight: bold;
+        }
+        
+        .highlight-card ul {
+            list-style: none;
+            color: var(--text-secondary);
+        }
+        
+        .highlight-card ul li {
+            padding: 0.5rem 0;
+            padding-left: 1.5rem;
+            position: relative;
+        }
+        
+        .highlight-card ul li::before {
+            content: '🔥';
+            position: absolute;
+            left: 0;
+        }
+        
+        /* Plugins Section */
+        .plugins {
+            padding: 5rem 2rem;
+            background: var(--dark-bg);
+        }
+        
+        .plugins-grid {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+        }
+        
+        .plugin-card {
+            background: var(--card-bg);
+            padding: 1.5rem;
+            border-radius: 12px;
+            border: 1px solid #333;
+            transition: all 0.3s;
+        }
+        
+        .plugin-card:hover {
+            border-color: var(--primary-cyan);
+        }
+        
+        .plugin-card.new-plugin {
+            border-color: var(--primary-red);
+            position: relative;
+        }
+        
+        .plugin-card.new-plugin::after {
+            content: 'v3.2';
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: var(--primary-red);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+        
+        .plugin-card.coming-soon {
+            border-color: #ff9800;
+            position: relative;
+            opacity: 0.85;
+        }
+        
+        .plugin-card.coming-soon::after {
+            content: 'SOON';
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: linear-gradient(45deg, #ff9800, #ff5722);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+        }
+        
+        .plugin-card h4 {
+            color: var(--primary-cyan);
+            margin-bottom: 0.5rem;
+        }
+        
+        .plugin-card p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        
+        /* Screenshots */
+        .screenshots {
+            padding: 5rem 2rem;
+            background: var(--darker-bg);
+        }
+        
+        .screenshot-container {
+            max-width: 1000px;
+            margin: 0 auto;
+            display: flex;
+            flex-direction: column;
+            gap: 2rem;
+            align-items: center;
+        }
+        
+        .screenshot-container img {
+            max-width: 100%;
+            border-radius: 12px;
+            border: 2px solid var(--primary-red);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+        }
+        
+        .screenshot-gallery {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .screenshot-category {
+            margin-bottom: 3rem;
+        }
+        
+        .screenshot-category h3 {
+            color: var(--primary-cyan);
+            margin-bottom: 1.5rem;
+            font-size: 1.5rem;
+            text-align: center;
+        }
+        
+        .screenshot-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1.5rem;
+        }
+        
+        .screenshot-grid img {
+            width: 100%;
+            border-radius: 8px;
+            border: 2px solid #333;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        
+        .screenshot-grid img:hover {
+            border-color: var(--primary-red);
+            transform: scale(1.02);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        }
+        
+        /* Download Section */
+        .download {
+            padding: 5rem 2rem;
+            background: linear-gradient(135deg, var(--primary-red) 0%, #7b1a1a 100%);
+            text-align: center;
+        }
+        
+        .download h2 {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .download p {
+            font-size: 1.2rem;
+            margin-bottom: 2rem;
+            opacity: 0.9;
+        }
+        
+        .download .btn-secondary {
+            border-color: white;
+            color: white;
+        }
+        
+        .download .btn-secondary:hover {
+            background: white;
+            color: var(--primary-red);
+        }
+        
+        /* Footer */
+        footer {
+            background: var(--darker-bg);
+            padding: 3rem 2rem;
+            text-align: center;
+            border-top: 1px solid #333;
+        }
+        
+        footer p {
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+        }
+        
+        .crypto {
+            background: var(--card-bg);
+            padding: 1rem 2rem;
+            border-radius: 8px;
+            display: inline-block;
+            margin-top: 1rem;
+        }
+        
+        .crypto code {
+            color: var(--primary-cyan);
+            word-break: break-all;
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+            
+            .nav-links {
+                display: none;
+            }
+            
+            .section-title {
+                font-size: 2rem;
+            }
+            
+            .hero-video-container video {
+                max-width: 100%;
+            }
+        }
+        
+        /* Hero Video Banner */
+        .hero-video-container {
+            margin-bottom: 2rem;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 20px 60px rgba(198, 40, 40, 0.3);
+            max-width: 800px;
+        }
+        
+        .hero-video-container video {
+            width: 100%;
+            display: block;
+            border-radius: 12px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <nav>
+            <div class="logo">
+                <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Logo">
+                Ⓐ Image Anarchy
+            </div>
+            <ul class="nav-links">
+                <li><a href="#features">Features</a></li>
+                <li><a href="#new-features">What's New</a></li>
+                <li><a href="#plugins">Plugins</a></li>
+                <li><a href="#screenshots">Screenshots</a></li>
+                <li><a href="#download">Download</a></li>
+                <li><a href="https://forum.imageanarchy.com">Forum</a></li>
+                <li><a href="https://github.com/vehoelite/image-anarchy">GitHub</a></li>
+            </ul>
+        </nav>
+    </header>
+    
+    <section class="hero">
+        <div class="hero-content">
+            <div class="hero-video-container">
+                <video autoplay muted loop playsinline>
+                    <source src="images/imageanarchy.mp4" type="video/mp4">
+                </video>
+            </div>
+            <p class="tagline">Android Image Swiss Army Knife</p>
+            <p class="version">
+                Version 3.2 
+                <span class="version-badge">🔥 REVOLUTIONARY RELEASE</span>
+            </p>
+            <p style="color: var(--text-secondary); margin-bottom: 2rem;">
+                Break free from restrictive tools. Extract, create, and manipulate Android images with anarchic freedom.
+                <br><br>
+                <strong style="color: var(--primary-cyan);">NEW: Community Chat, Remote Play, Screen Share & Professional Support!</strong>
+            </p>
+            <div style="background: var(--card-bg); border: 2px solid var(--primary-red); border-radius: 12px; padding: 1.5rem 2rem; margin-bottom: 2rem; max-width: 600px; margin-left: auto; margin-right: auto;">
+                <p style="color: var(--primary-cyan); font-size: 0.9rem; margin-bottom: 0.5rem;">Now on PyPI — install with one command:</p>
+                <code style="color: #ff5252; font-size: 1.3rem; font-weight: bold; letter-spacing: 0.5px;">pip install image-anarchy</code>
+                <p style="color: var(--text-secondary); font-size: 0.8rem; margin-top: 0.5rem;">Want everything? <code style="color: var(--primary-cyan);">pip install image-anarchy[all]</code></p>
+            </div>
+            <div class="cta-buttons">
+                <a href="https://pypi.org/project/image-anarchy/" class="btn btn-primary" style="background: linear-gradient(45deg, #c62828, #ff5252);">
+                    📦 pip install image-anarchy
+                </a>
+                <a href="https://github.com/vehoelite/image-anarchy/releases/download/v3.2/ImageAnarchy.exe" class="btn btn-primary">
+                    📥 Download v3.2 (Windows)
+                </a>
+                <a href="https://github.com/vehoelite/image-anarchy" class="btn btn-secondary">
+                    ⭐ Star on GitHub
+                </a>
+            </div>
+        </div>
+    </section>
+    
+    <section class="new-features" id="new-features">
+        <h2 class="section-title">🔥 New in v3.2</h2>
+        <div class="new-feature-highlight">
+            <div class="highlight-card">
+                <h3>💬 Integrated Community Chat</h3>
+                <p class="subtitle">Real-Time Chatrooms</p>
+                <ul>
+                    <li>Dedicated Chat tab — chat without leaving the app</li>
+                    <li>Create public or private rooms</li>
+                    <li>Invite anyone via email with auto account creation</li>
+                    <li>File attachments with inline image previews</li>
+                    <li>Moderation tools: mute, kick, ban, delete messages</li>
+                    <li>Dock/undock into floating window</li>
+                </ul>
+            </div>
+            <div class="highlight-card">
+                <h3>🛠️ Professional Remote Support</h3>
+                <p class="subtitle">Host & Professional System</p>
+                <ul>
+                    <li>Share your device tools with a Professional</li>
+                    <li>Master Console — raw command terminal for experts</li>
+                    <li>3-tier trust mode: Ask, Auto-read, Trust All</li>
+                    <li>Auto-routing to ADB, Fastboot, and MTK plugins</li>
+                    <li>Blocked dangerous operations list for safety</li>
+                    <li>End-to-end encrypted via Cloudflare Zero Trust</li>
+                </ul>
+            </div>
+            <div class="highlight-card">
+                <h3>📺 Remote Screen Share</h3>
+                <p class="subtitle">Zero-Persistence Screen Sharing</p>
+                <ul>
+                    <li>Live ADB screen capture streamed through relay</li>
+                    <li>Touch injection — tap and swipe on remote device</li>
+                    <li>Keyboard input to remote device</li>
+                    <li>Granular permissions: View, Touch, Keyboard</li>
+                    <li>Configurable FPS, quality, and resolution</li>
+                    <li>ZERO recording — all RAM-only, purged after session</li>
+                </ul>
+            </div>
+            <div class="highlight-card">
+                <h3>🔥 MTK Toolkit Enhancements</h3>
+                <p class="subtitle">Network Unlock & META Mode</p>
+                <ul>
+                    <li>Network unlock via modem patch — confirmed effective</li>
+                    <li>META Mode Switch v4 — universal BROM register method</li>
+                    <li>Mode-aware buttons auto-enable/disable</li>
+                    <li>IMEI Read/Write with encryption support</li>
+                    <li>RPMB, eFuse reader, memory dumps</li>
+                    <li>Full Remote Play support (30+ operations)</li>
+                </ul>
+            </div>
+        </div>
+    </section>
+    
+    <section class="features" id="v3-features" style="background: linear-gradient(135deg, var(--darker-bg) 0%, #1a1a2e 100%); padding: 5rem 2rem;">
+        <h2 class="section-title" style="color: #ff5252;">🔥 Also in v3.x</h2>
+        <div class="new-feature-highlight" style="max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 2rem;">
+            <div class="highlight-card">
+                <h3>📋 Community Forum</h3>
+                <p class="subtitle">Full phpBB Forum Integration</p>
+                <ul>
+                    <li>Dedicated Forum tab in the app</li>
+                    <li>Unified login (same as app & chat)</li>
+                    <li>Device-specific support sections</li>
+                    <li>Community guides and tutorials</li>
+                    <li>Share your knowledge</li>
+                    <li>Never leave the app for help</li>
+                </ul>
+            </div>
+            <div class="highlight-card">
+                <h3>🗄️ Backend Overhaul</h3>
+                <p class="subtitle">SQLite3 → MySQL + Redis</p>
+                <ul>
+                    <li>Migrated to MySQL for scalability</li>
+                    <li>Redis integration for lightning-fast caching</li>
+                    <li>Unified auth across all services</li>
+                    <li>Email-based invites & notifications</li>
+                    <li>Faster plugin store & searches</li>
+                    <li>Enterprise-grade infrastructure</li>
+                </ul>
+            </div>
+            <div class="highlight-card">
+                <h3>💾 IAABS - Android Backup Solution</h3>
+                <p class="subtitle">WORLD FIRST: Live Root Filesystem Backup</p>
+                <ul>
+                    <li>Backup your entire device while it's running</li>
+                    <li>No recovery mode or TWRP needed</li>
+                    <li>Multiple profiles: Full, Apps, User Data, System</li>
+                    <li>SELinux context preservation & restoration</li>
+                    <li>3-phase tar backup with progress tracking</li>
+                    <li>Full restore with all metadata intact</li>
+                </ul>
+            </div>
+            <div class="highlight-card">
+                <h3>🔓 Root Patcher Plugin</h3>
+                <p class="subtitle">One-Click Automated Root Patching</p>
+                <ul>
+                    <li>Fully automated Magisk patching on device</li>
+                    <li>KernelSU support for GKI kernels</li>
+                    <li>APatch support with KernelPatch</li>
+                    <li>Extract boot.img directly from device</li>
+                    <li>Safety checks before patching</li>
+                    <li>Bundled latest APKs (Magisk, KernelSU, APatch)</li>
+                </ul>
+            </div>
+        </div>
+    </section>
+    
+    <section class="features" id="features">
+        <h2 class="section-title">⚡ Core Features</h2>
+        <div class="features-grid">
+            <div class="feature-card">
+                <h3>📦 Payload Operations</h3>
+                <p>Extract and create payload.bin OTA files. Support for incremental updates, multiple compression formats (ZSTD, XZ, BZ2, Brotli), and remote file access.</p>
+            </div>
+            <div class="feature-card">
+                <h3>🔍 Image Extraction</h3>
+                <p>Extract boot, recovery, super, vbmeta, sparse, EROFS, ext4, FAT images. Full support for Android 13+ EROFS with LZ4/LZMA decompression.</p>
+            </div>
+            <div class="feature-card">
+                <h3>🔨 Image Repacking</h3>
+                <p>Create boot images (v0-v4), vendor boot, sparse, EROFS, vbmeta, and ramdisks. Full control over your Android images.</p>
+            </div>
+            <div class="feature-card">
+                <h3>🔄 Recovery Porter</h3>
+                <p>Port TWRP, OrangeFox, and other recoveries between devices. Swap kernels, modify cmdline, browse ramdisk contents.</p>
+            </div>
+            <div class="feature-card">
+                <h3>🔐 Security Tools</h3>
+                <p>Patch vbmeta to disable dm-verity and AVB. Generate custom AVB keys (RSA-2048/4096/8192) and re-sign images.</p>
+            </div>
+            <div class="feature-card">
+                <h3>🌞 Vendor Support</h3>
+                <p>Allwinner and Rockchip firmware unpack/repack. OPPO/OnePlus/Realme firmware decryption with CPU-based keygen.</p>
+            </div>
+        </div>
+    </section>
+    
+    <section class="plugins" id="plugins">
+        <h2 class="section-title">🔌 Features & Plugins</h2>
+        <div class="plugins-grid">
+            <div class="plugin-card new-plugin">
+                <h4>💬 Community Chat</h4>
+                <p>Real-time chat with the community. Create public/private rooms, invite via email, file sharing, moderation tools.</p>
+            </div>
+            <div class="plugin-card new-plugin">
+                <h4>🛠️ Remote Play</h4>
+                <p>Host/Professional remote device support. Screen sharing, touch injection, master console, trust modes.</p>
+            </div>
+            <div class="plugin-card new-plugin">
+                <h4>📋 Forum</h4>
+                <p>Full phpBB forum integration. Get device help, share guides, and connect with the community.</p>
+            </div>
+            <div class="plugin-card new-plugin">
+                <h4>💾 IAABS - Android Backup</h4>
+                <p>Revolutionary live root filesystem backup. Backup and restore your entire device without recovery mode.</p>
+            </div>
+            <div class="plugin-card new-plugin">
+                <h4>🔓 Root Patcher</h4>
+                <p>One-click automated boot.img patching with Magisk, KernelSU, and APatch. Extract and flash boot directly.</p>
+            </div>
+            <div class="plugin-card">
+                <h4>📱 ADB Toolkit</h4>
+                <p>Complete ADB management: device info, partition backup, file management, app management, shell access.</p>
+            </div>
+            <div class="plugin-card">
+                <h4>⚡ Fastboot Toolkit</h4>
+                <p>Full bootloader operations: flash, boot, erase, OEM commands, slot management, partition fetching.</p>
+            </div>
+            <div class="plugin-card">
+                <h4>🔥 MTK Toolkit</h4>
+                <p>MediaTek device support: BROM mode, partition read/write, DA authentication bypass, device info.</p>
+            </div>
+            <div class="plugin-card">
+                <h4>📺 Scrcpy Toolkit</h4>
+                <p>Screen mirroring, screenshot capture, screen recording with customizable quality and WiFi mode.</p>
+            </div>
+        </div>
+    </section>
+    
+    <section class="screenshots" id="screenshots">
+        <h2 class="section-title">📸 Screenshots</h2>
+        <div class="screenshot-gallery">
+            
+            <div class="screenshot-category">
+                <h3>🔓 Root Patcher</h3>
+                <div class="screenshot-grid">
+                    <img src="images/root_patcher/rootp1.png" alt="Root Patcher - Main">
+                    <img src="images/root_patcher/rootp2.png" alt="Root Patcher - Selection">
+                    <img src="images/root_patcher/rootp3.png" alt="Root Patcher - Patching">
+                    <img src="images/root_patcher/rootp4.png" alt="Root Patcher - Progress">
+                    <img src="images/root_patcher/rootp5.png" alt="Root Patcher - Complete">
+                </div>
+            </div>
+            
+            <div class="screenshot-category">
+                <h3>💾 IAABS - Live Backup</h3>
+                <div class="screenshot-grid">
+                    <img src="images/IAABS/iaabs1.png" alt="IAABS - Backup Interface">
+                    <img src="images/IAABS/iaabs2.png" alt="IAABS - Restore">
+                </div>
+            </div>
+            
+            <div class="screenshot-category">
+                <h3>📱 ADB Toolkit</h3>
+                <div class="screenshot-grid">
+                    <img src="images/adb/adb.png" alt="ADB Toolkit - Main">
+                    <img src="images/adb/shell.png" alt="ADB Shell">
+                    <img src="images/adb/adbpull.png" alt="ADB Pull Files">
+                    <img src="images/adb/makedir.png" alt="ADB Make Directory">
+                    <img src="images/adb/oem.png" alt="ADB OEM Commands">
+                </div>
+            </div>
+            
+            <div class="screenshot-category">
+                <h3>⚡ Fastboot Toolkit</h3>
+                <div class="screenshot-grid">
+                    <img src="images/fastboot/fastboot1.png" alt="Fastboot - Main">
+                    <img src="images/fastboot/fastboot2.png" alt="Fastboot - Flash">
+                    <img src="images/fastboot/fastboot3.png" alt="Fastboot - Partitions">
+                    <img src="images/fastboot/fastboot4.png" alt="Fastboot - OEM">
+                    <img src="images/fastboot/fastboot5.png" alt="Fastboot - Info">
+                </div>
+            </div>
+            
+            <div class="screenshot-category">
+                <h3>🔥 MTK Toolkit</h3>
+                <div class="screenshot-grid">
+                    <img src="images/mtkclient/mtk1.png" alt="MTK Client - Main">
+                    <img src="images/mtkclient/mtk2.png" alt="MTK Client - Read">
+                    <img src="images/mtkclient/mtk3.png" alt="MTK Client - Write">
+                    <img src="images/mtkclient/mtk4.png" alt="MTK Client - Info">
+                    <img src="images/mtkclient/mtk5.png" alt="MTK Client - Advanced">
+                </div>
+            </div>
+            
+            <div class="screenshot-category">
+                <h3>📺 Scrcpy Toolkit</h3>
+                <div class="screenshot-grid">
+                    <img src="images/scrcpy/scrcpy1.png" alt="Scrcpy - Mirror">
+                    <img src="images/scrcpy/scrcpy2.png" alt="Scrcpy - Settings">
+                    <img src="images/scrcpy/scrcpy3.png" alt="Scrcpy - Recording">
+                </div>
+            </div>
+            
+        </div>
+    </section>
+    
+    <section class="download" id="download">
+        <h2>🚀 Join the Rebellion</h2>
+        <p>Image Anarchy is on PyPI. No more downloading sketchy EXEs from strangers on the internet.</p>
+        <div style="background: rgba(0,0,0,0.3); border-radius: 12px; padding: 2rem; max-width: 700px; margin: 0 auto 2rem; text-align: left;">
+            <table style="width: 100%; border-collapse: collapse; color: white;">
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.2);">
+                    <td style="padding: 0.6rem 0; font-weight: bold; color: #4fc3f7;">Core</td>
+                    <td style="padding: 0.6rem 0;"><code style="color: #ff5252;">pip install image-anarchy</code></td>
+                </tr>
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.2);">
+                    <td style="padding: 0.6rem 0; font-weight: bold; color: #4fc3f7;">+ AVB Signing</td>
+                    <td style="padding: 0.6rem 0;"><code style="color: #ff5252;">pip install image-anarchy[signing]</code></td>
+                </tr>
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.2);">
+                    <td style="padding: 0.6rem 0; font-weight: bold; color: #4fc3f7;">+ Chat</td>
+                    <td style="padding: 0.6rem 0;"><code style="color: #ff5252;">pip install image-anarchy[chat]</code></td>
+                </tr>
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.2);">
+                    <td style="padding: 0.6rem 0; font-weight: bold; color: #4fc3f7;">+ Forum</td>
+                    <td style="padding: 0.6rem 0;"><code style="color: #ff5252;">pip install image-anarchy[webengine]</code></td>
+                </tr>
+                <tr>
+                    <td style="padding: 0.6rem 0; font-weight: bold; color: #ff5252; font-size: 1.1rem;">🏴 Everything</td>
+                    <td style="padding: 0.6rem 0;"><code style="color: #ff5252; font-size: 1.1rem;">pip install image-anarchy[all]</code></td>
+                </tr>
+            </table>
+        </div>
+        <div class="cta-buttons">
+            <a href="https://pypi.org/project/image-anarchy/" class="btn btn-primary" style="background: linear-gradient(45deg, #c62828, #ff5252);">
+                📦 View on PyPI
+            </a>
+            <a href="https://github.com/vehoelite/image-anarchy/releases/download/v3.2/ImageAnarchy.exe" class="btn btn-primary">
+                📥 Windows EXE
+            </a>
+            <a href="https://github.com/vehoelite/image-anarchy" class="btn btn-secondary">
+                📖 View Source
+            </a>
+        </div>
+    </section>
+    
+    <footer>
+        <p>Ⓐ Break the chains. Free your images. Join the rebellion. Ⓐ</p>
+        <p style="color: var(--text-secondary); font-size: 0.9rem;">Made with ☕ and rebellion</p>
+        <div class="crypto">
+            <p style="font-size: 0.9rem; margin-bottom: 0.5rem;">Support Development:</p>
+            <code>bc1qx5kp5sx67qe2fd32h6ne7jvw6xpzy2xhnph0rs</code>
+        </div>
+        <p style="margin-top: 2rem; font-size: 0.8rem; color: #666;">
+            MIT License | © 2026 Image Anarchy
+        </p>
+    </footer>
+</body>
+</html>

@@ -4,8 +4,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-3.2-red" alt="Version">
-  <img src="https://img.shields.io/badge/REVOLUTIONARY-Release-orange" alt="REVOLUTIONARY">
+  <a href="https://pypi.org/project/image-anarchy/"><img src="https://img.shields.io/pypi/v/image-anarchy?color=red&label=PyPI" alt="PyPI"></a>
+  <a href="https://pypi.org/project/image-anarchy/"><img src="https://img.shields.io/pypi/dm/image-anarchy?color=orange&label=Downloads" alt="Downloads"></a>
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue" alt="Platform">
   <img src="https://img.shields.io/badge/Python-3.9+-green" alt="Python">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
@@ -387,11 +387,39 @@ Interactive tutorial showing how to create your own plugins with:
 
 ## 📥 Installation
 
-### Prerequisites
-- Python 3.9 or higher
-- pip (Python package manager)
+### 🏴 Install from PyPI (Recommended)
 
-### Quick Install
+Image Anarchy is on [PyPI](https://pypi.org/project/image-anarchy/). One command. Done.
+
+```bash
+# Core install
+pip install image-anarchy
+
+# Or get everything — signing, chat, LZ4, the whole arsenal:
+pip install image-anarchy[all]
+```
+
+Then launch it:
+```bash
+image-anarchy
+```
+
+#### Install Extras
+
+| Command | What You Get |
+|---------|-------------|
+| `pip install image-anarchy` | Core — extract, repack, flash, all image operations |
+| `pip install image-anarchy[signing]` | + AVB key signing (cryptography) |
+| `pip install image-anarchy[chat]` | + Community chat (Socket.IO, WebSocket) |
+| `pip install image-anarchy[webengine]` | + Embedded forum browser (PyQt6-WebEngine) |
+| `pip install image-anarchy[lz4]` | + LZ4 ramdisk compression |
+| `pip install image-anarchy[all]` | Everything above |
+
+### 🪟 Windows EXE (No Python Required)
+
+Download the standalone executable from the [Releases page](https://github.com/vehoelite/image-anarchy/releases/latest).
+
+### 🔧 Install from Source
 
 ```bash
 # Clone the repository
@@ -409,30 +437,6 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
-```
-
-### Dependencies
-
-**Required:**
-```bash
-pip install PyQt6 bsdiff4 brotli zstandard fsspec protobuf
-```
-
-**Optional (for AVB signing & LZ4 ramdisks):**
-```bash
-pip install cryptography lz4
-```
-
-### requirements.txt
-```
-PyQt6>=6.4.0
-bsdiff4>=1.2.0
-brotli>=1.0.9
-zstandard>=0.19.0
-fsspec>=2023.1.0
-protobuf>=4.21.0
-cryptography>=40.0.0  # Optional: for AVB key signing
-lz4>=4.0.0            # Optional: for LZ4 ramdisk compression
 ```
 
 ---
