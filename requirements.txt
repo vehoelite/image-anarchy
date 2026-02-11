@@ -17,3 +17,16 @@ cryptography>=40.0.0
 
 # For LZ4 ramdisk compression (some devices use this)
 lz4>=4.0.0
+
+# For Plugin Store real-time chat
+python-socketio[client]>=5.10.0
+websocket-client>=1.6.0
+curl_cffi>=0.5.0  # Bypasses Cloudflare TLS fingerprinting
+
+# For embedded browser in Forum tab (optional - falls back to external browser)
+PyQt6-WebEngine>=6.4.0
+
+# === Build Dependencies ===
+# For building the exe (not required for running from source)
+pyinstaller>=6.0.0
+Pillow>=10.0.0  # For icon.png to icon.ico conversion during build
