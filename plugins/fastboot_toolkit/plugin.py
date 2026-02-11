@@ -482,6 +482,10 @@ class FastbootWorkerThread(QThread):
         partition = self.kwargs.get('partition')
         output_path = self.kwargs.get('output_path')
         
+        # Ensure partition subfolder exists (UI should have created it, but be safe)
+        output_dir = os.path.dirname(output_path)
+        os.makedirs(output_dir, exist_ok=True)
+
         self.log.emit(f"Fetching {partition}...")
         self.progress.emit(0, 100, f"Fetching {partition}...")
         
@@ -682,6 +686,7 @@ class FastbootToolkitPlugin:
         self.tabs.addTab(self._create_patch_tab(), "🔧 Patch")
         self.tabs.addTab(self._create_oem_tab(), "🔓 OEM")
         self.tabs.addTab(self._create_slot_tab(), "🔀 Slot")
+        self.tabs.addTab(self._create_shell_tab(), "💻 Shell")
         self.tabs.addTab(self._create_reboot_tab(), "🔄 Reboot")
         
         main_layout.addWidget(self.tabs)
@@ -1240,15 +1245,15 @@ class FastbootToolkitPlugin:
         if not device or not partition:
             return
         
-        # Determine output directory based on setup mode
+        # Determine base output directory
         if hasattr(self, '_fb_setup_base_dir') and self._fb_setup_base_dir:
-            # Setup directories mode - each partition goes to its own folder
-            output_dir = os.path.join(self._fb_setup_base_dir, partition)
-            os.makedirs(output_dir, exist_ok=True)
+            base_output_dir = self._fb_setup_base_dir
         else:
-            # Manual output directory mode
-            output_dir = self.fetch_output.text()
-            os.makedirs(output_dir, exist_ok=True)
+            base_output_dir = self.fetch_output.text()
+        
+        # Always create partition-specific subfolder (e.g., output/boot/ for boot.img)
+        output_dir = os.path.join(base_output_dir, partition)
+        os.makedirs(output_dir, exist_ok=True)
         
         output_path = os.path.join(output_dir, f"{partition}.img")
         
@@ -1819,6 +1824,348 @@ class FastbootToolkitPlugin:
         self.worker.finished_signal.connect(lambda s, m: self._log(m))
         self.worker.start()
     
+    # ===== SHELL TAB =====
+    def _create_shell_tab(self):
+        """Create fastboot shell tab for custom commands."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        
+        # Info header
+        info_label = QLabel(
+            "💻 <b>Fastboot Shell</b> - Run custom fastboot commands<br>"
+            "<span style='color: #888;'>Enter commands without 'fastboot' prefix. Device is auto-selected.</span>"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Quick commands
+        quick_group = QGroupBox("Quick Commands")
+        quick_layout = QVBoxLayout(quick_group)
+        
+        # Row 1: Common safe commands
+        row1 = QHBoxLayout()
+        quick_cmds = [
+            ("getvar product", "getvar product"),
+            ("getvar serialno", "getvar serialno"),
+            ("getvar unlocked", "getvar unlocked"),
+            ("getvar slot-count", "getvar slot-count"),
+        ]
+        for label, cmd in quick_cmds:
+            btn = QPushButton(label)
+            btn.setMaximumWidth(150)
+            btn.clicked.connect(lambda c, cmd=cmd: self._run_shell_command(cmd))
+            row1.addWidget(btn)
+        quick_layout.addLayout(row1)
+        
+        # Row 2: Flash with flags (the important one for vbmeta!)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Flash vbmeta with flags:"))
+        self.shell_vbmeta_path = QLineEdit()
+        self.shell_vbmeta_path.setPlaceholderText("Select vbmeta.img...")
+        row2.addWidget(self.shell_vbmeta_path, 1)
+        
+        browse_btn = QPushButton("📁")
+        browse_btn.setMaximumWidth(40)
+        browse_btn.clicked.connect(lambda: self._browse_file(self.shell_vbmeta_path, "Image Files (*.img);;All Files (*)"))
+        row2.addWidget(browse_btn)
+        
+        flash_flags_btn = QPushButton("⚡ Flash --disable-verity --disable-verification")
+        flash_flags_btn.setStyleSheet("background-color: #4a6; color: white; font-weight: bold;")
+        flash_flags_btn.setToolTip("Flash vbmeta with bootloader flags - use ORIGINAL unpatched vbmeta!")
+        flash_flags_btn.clicked.connect(self._flash_vbmeta_with_flags)
+        row2.addWidget(flash_flags_btn)
+        quick_layout.addLayout(row2)
+        
+        # Row 3: Create and flash blank vbmeta
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Blank vbmeta (for stubborn MTK devices):"))
+        
+        create_blank_btn = QPushButton("📝 Create Blank vbmeta")
+        create_blank_btn.setToolTip("Create a minimal valid vbmeta with flags already disabled")
+        create_blank_btn.clicked.connect(self._create_blank_vbmeta)
+        row3.addWidget(create_blank_btn)
+        
+        flash_blank_btn = QPushButton("⚡ Create && Flash Blank")
+        flash_blank_btn.setStyleSheet("background-color: #a64; color: white;")
+        flash_blank_btn.setToolTip("Create blank vbmeta and flash it immediately")
+        flash_blank_btn.clicked.connect(self._create_and_flash_blank_vbmeta)
+        row3.addWidget(flash_blank_btn)
+        row3.addStretch()
+        quick_layout.addLayout(row3)
+        
+        layout.addWidget(quick_group)
+        
+        # Custom command input
+        cmd_group = QGroupBox("Custom Command")
+        cmd_layout = QVBoxLayout(cmd_group)
+        
+        input_row = QHBoxLayout()
+        input_row.addWidget(QLabel("fastboot"))
+        
+        self.shell_input = QLineEdit()
+        self.shell_input.setPlaceholderText("Enter command arguments (e.g., 'getvar all' or 'flash boot boot.img')")
+        self.shell_input.returnPressed.connect(self._execute_shell_command)
+        input_row.addWidget(self.shell_input, 1)
+        
+        exec_btn = QPushButton("▶ Execute")
+        exec_btn.clicked.connect(self._execute_shell_command)
+        input_row.addWidget(exec_btn)
+        cmd_layout.addLayout(input_row)
+        
+        # Command history
+        history_label = QLabel("Command History (double-click to reuse):")
+        history_label.setStyleSheet("color: #888; margin-top: 5px;")
+        cmd_layout.addWidget(history_label)
+        
+        self.shell_history = QListWidget()
+        self.shell_history.setMaximumHeight(80)
+        self.shell_history.itemDoubleClicked.connect(self._reuse_history_command)
+        cmd_layout.addWidget(self.shell_history)
+        
+        layout.addWidget(cmd_group)
+        
+        # Output
+        output_group = QGroupBox("Output")
+        output_layout = QVBoxLayout(output_group)
+        
+        self.shell_output = QTextEdit()
+        self.shell_output.setReadOnly(True)
+        self.shell_output.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background-color: #1e1e1e; color: #ddd;")
+        self.shell_output.setMinimumHeight(150)
+        output_layout.addWidget(self.shell_output)
+        
+        clear_btn = QPushButton("🗑️ Clear Output")
+        clear_btn.clicked.connect(lambda: self.shell_output.clear())
+        output_layout.addWidget(clear_btn)
+        
+        layout.addWidget(output_group)
+        
+        # Warning
+        warning = QLabel(
+            "⚠️ <b>Warning:</b> Some commands can brick your device. "
+            "Commands are only executed when you press Enter or click Execute."
+        )
+        warning.setStyleSheet("color: #f84;")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        
+        # Initialize history
+        self.shell_command_history = []
+        
+        return tab
+    
+    def _run_shell_command(self, cmd: str):
+        """Run a predefined shell command."""
+        self.shell_input.setText(cmd)
+        self._execute_shell_command()
+    
+    def _execute_shell_command(self):
+        """Execute the command in the shell input - ONLY when explicitly triggered."""
+        cmd_text = self.shell_input.text().strip()
+        if not cmd_text:
+            return
+        
+        device = self._get_device()
+        if not device:
+            self.shell_output.append("<span style='color: #f44;'>❌ No device connected</span>")
+            return
+        
+        # Add to history
+        if cmd_text not in self.shell_command_history:
+            self.shell_command_history.insert(0, cmd_text)
+            self.shell_history.insertItem(0, cmd_text)
+            # Keep only last 20 commands
+            if len(self.shell_command_history) > 20:
+                self.shell_command_history.pop()
+                self.shell_history.takeItem(20)
+        
+        # Parse command arguments
+        args = cmd_text.split()
+        
+        # Show what we're running
+        self.shell_output.append(f"<span style='color: #4af;'>$ fastboot -s {device} {cmd_text}</span>")
+        
+        # Run the command
+        self._log(f"Shell: fastboot {cmd_text}")
+        success, output = run_fastboot(args, device, timeout=120)
+        
+        # Display output
+        if output:
+            # Escape HTML and preserve formatting
+            escaped = output.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            color = "#4f4" if success else "#f84"
+            self.shell_output.append(f"<pre style='color: {color}; margin: 0;'>{escaped}</pre>")
+        
+        if success:
+            self.shell_output.append("<span style='color: #4f4;'>✓ Command completed</span>")
+        else:
+            self.shell_output.append("<span style='color: #f44;'>✗ Command failed</span>")
+        
+        self.shell_output.append("")  # Blank line
+        
+        # Clear input for next command
+        self.shell_input.clear()
+        self.shell_input.setFocus()
+    
+    def _reuse_history_command(self, item):
+        """Reuse a command from history."""
+        self.shell_input.setText(item.text())
+        self.shell_input.setFocus()
+    
+    def _flash_vbmeta_with_flags(self):
+        """Flash vbmeta with --disable-verity --disable-verification flags."""
+        vbmeta_path = self.shell_vbmeta_path.text().strip()
+        if not vbmeta_path or not os.path.isfile(vbmeta_path):
+            QMessageBox.warning(self.parent_window, "Error", "Please select a valid vbmeta.img file")
+            return
+        
+        device = self._get_device()
+        if not device:
+            QMessageBox.warning(self.parent_window, "Error", "No device connected")
+            return
+        
+        # Confirm
+        reply = QMessageBox.question(
+            self.parent_window,
+            "Flash vbmeta with Flags",
+            f"Flash vbmeta with verification disabled?\n\n"
+            f"File: {os.path.basename(vbmeta_path)}\n"
+            f"Device: {device}\n\n"
+            f"Command: fastboot --disable-verity --disable-verification flash vbmeta {vbmeta_path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        self.shell_output.append(f"<span style='color: #4af;'>$ fastboot --disable-verity --disable-verification flash vbmeta {vbmeta_path}</span>")
+        self._log(f"Flashing vbmeta with flags: {vbmeta_path}")
+        
+        # Run with the flags BEFORE the flash command
+        success, output = run_fastboot(
+            ["--disable-verity", "--disable-verification", "flash", "vbmeta", vbmeta_path],
+            device,
+            timeout=120
+        )
+        
+        escaped = output.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        color = "#4f4" if success else "#f84"
+        self.shell_output.append(f"<pre style='color: {color};'>{escaped}</pre>")
+        
+        if success:
+            self._log("✓ vbmeta flashed with flags")
+            self.shell_output.append("<span style='color: #4f4;'>✓ vbmeta flashed successfully with verification disabled</span>")
+        else:
+            self._log("✗ Failed to flash vbmeta")
+            self.shell_output.append("<span style='color: #f44;'>✗ Failed to flash vbmeta</span>")
+    
+    def _create_blank_vbmeta(self):
+        """Create a blank/minimal vbmeta image with flags disabled."""
+        # Ask where to save
+        path, _ = QFileDialog.getSaveFileName(
+            self.parent_window,
+            "Save Blank vbmeta",
+            "vbmeta_blank.img",
+            "Image Files (*.img)"
+        )
+        
+        if not path:
+            return
+        
+        try:
+            self._write_blank_vbmeta(path)
+            self._log(f"✓ Created blank vbmeta: {path}")
+            self.shell_output.append(f"<span style='color: #4f4;'>✓ Created blank vbmeta: {path}</span>")
+            QMessageBox.information(self.parent_window, "Success", f"Blank vbmeta created:\n{path}")
+        except Exception as e:
+            self._log(f"✗ Failed to create blank vbmeta: {e}")
+            QMessageBox.critical(self.parent_window, "Error", f"Failed to create blank vbmeta:\n{e}")
+    
+    def _create_and_flash_blank_vbmeta(self):
+        """Create blank vbmeta and flash it immediately."""
+        device = self._get_device()
+        if not device:
+            QMessageBox.warning(self.parent_window, "Error", "No device connected")
+            return
+        
+        # Confirm
+        reply = QMessageBox.question(
+            self.parent_window,
+            "Create and Flash Blank vbmeta",
+            "This will create a minimal vbmeta image with verification disabled\n"
+            "and flash it to your device.\n\n"
+            "This is useful for MTK devices that don't accept patched vbmeta.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            # Create temp file
+            import tempfile
+            temp_path = os.path.join(tempfile.gettempdir(), "vbmeta_blank.img")
+            self._write_blank_vbmeta(temp_path)
+            
+            self._log(f"Created blank vbmeta, flashing...")
+            self.shell_output.append("<span style='color: #4af;'>$ fastboot flash vbmeta vbmeta_blank.img</span>")
+            
+            # Flash it
+            success, output = run_fastboot(["flash", "vbmeta", temp_path], device, timeout=120)
+            
+            escaped = output.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            color = "#4f4" if success else "#f84"
+            self.shell_output.append(f"<pre style='color: {color};'>{escaped}</pre>")
+            
+            if success:
+                self._log("✓ Blank vbmeta flashed successfully")
+                self.shell_output.append("<span style='color: #4f4;'>✓ Blank vbmeta flashed successfully</span>")
+            else:
+                self._log("✗ Failed to flash blank vbmeta")
+                self.shell_output.append("<span style='color: #f44;'>✗ Failed to flash blank vbmeta</span>")
+            
+            # Clean up
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+                
+        except Exception as e:
+            self._log(f"✗ Error: {e}")
+            QMessageBox.critical(self.parent_window, "Error", str(e))
+    
+    def _write_blank_vbmeta(self, path: str):
+        """Write a minimal valid vbmeta image with flags disabled."""
+        # Create a minimal AVB vbmeta header (256 bytes)
+        # This is the smallest valid vbmeta that will pass basic checks
+        header = bytearray(256)
+        
+        # Magic: "AVB0"
+        header[0:4] = b'AVB0'
+        
+        # Version: 1.0 (major=1, minor=0)
+        header[4:8] = struct.pack('>I', 1)   # major
+        header[8:12] = struct.pack('>I', 0)  # minor
+        
+        # Auth block size: 0 (no signature)
+        header[12:20] = struct.pack('>Q', 0)
+        
+        # Aux block size: 0 (no descriptors)
+        header[20:28] = struct.pack('>Q', 0)
+        
+        # Algorithm: 0 (none/unsigned)
+        header[28:32] = struct.pack('>I', 0)
+        
+        # Flags at offset 120: 0x03 (both verity and verification disabled)
+        header[120:124] = struct.pack('>I', 0x03)
+        
+        # Write to file (some devices need padding to 4096 or larger)
+        with open(path, 'wb') as f:
+            f.write(header)
+            # Pad to 4096 bytes (common partition alignment)
+            f.write(b'\x00' * (4096 - 256))
+    
     # ===== HELPERS =====
     def _browse_file(self, line_edit, filter="All Files (*)"):
         path, _ = QFileDialog.getOpenFileName(self.parent_window, "Select File", "", filter)
@@ -1832,3 +2179,72 @@ class FastbootToolkitPlugin:
 
 
 Plugin = FastbootToolkitPlugin
+
+# Add remote control methods to the plugin class
+FastbootToolkitPlugin.get_remote_operations = lambda self: [
+    {'id': 'list_devices',  'name': 'List Devices',     'risk': 'READ',   'description': 'List connected Fastboot devices',       'params': []},
+    {'id': 'device_info',   'name': 'Device Info',      'risk': 'READ',   'description': 'Get device variables (getvar all)',     'params': []},
+    {'id': 'getvar',        'name': 'Get Variable',     'risk': 'READ',   'description': 'Read a specific fastboot variable',    'params': ['var_name']},
+    {'id': 'reboot',        'name': 'Reboot',           'risk': 'MODIFY', 'description': 'Reboot device',                        'params': []},
+    {'id': 'reboot_bootloader','name': 'Reboot Bootloader','risk': 'MODIFY','description': 'Reboot into bootloader',             'params': []},
+    {'id': 'oem_unlock',    'name': 'OEM Unlock',       'risk': 'DANGER', 'description': 'Unlock bootloader via OEM',            'params': []},
+    {'id': 'oem_lock',      'name': 'OEM Lock',         'risk': 'DANGER', 'description': 'Lock bootloader via OEM',              'params': []},
+    {'id': 'flash',         'name': 'Flash Partition',   'risk': 'DANGER', 'description': 'Flash image to partition',             'params': ['partition', 'image_path']},
+    {'id': 'erase',         'name': 'Erase Partition',   'risk': 'DANGER', 'description': 'Erase a partition',                   'params': ['partition']},
+    {'id': 'boot',          'name': 'Boot Image',        'risk': 'DANGER', 'description': 'Boot from image without flashing',    'params': ['image_path']},
+]
+
+FastbootToolkitPlugin.get_command_prefixes = lambda self: ['fastboot']
+
+def _fb_execute_raw_command(self, command: str, log_callback=None) -> dict:
+    """Execute a raw Fastboot command from the master console.
+    
+    The Professional types 'fastboot devices', 'fastboot getvar all', etc.
+    """
+    import subprocess as _sp
+    
+    parts = command.strip().split()
+    if not parts:
+        return {'success': False, 'output': '', 'error': 'Empty command'}
+    
+    # Remove 'fastboot' prefix if present
+    if parts[0].lower() == 'fastboot':
+        parts = parts[1:]
+    if not parts:
+        return {'success': False, 'output': '', 'error': 'Usage: fastboot <command>\nExample: fastboot devices'}
+    
+    # Security: block format/update commands
+    blocked = {'update', 'format'}
+    if parts[0] in blocked:
+        return {'success': False, 'output': '', 'error': f"Command 'fastboot {parts[0]}' is blocked for remote use"}
+    
+    fb_path = find_fastboot()
+    if not fb_path:
+        return {'success': False, 'output': '', 'error': 'Fastboot not found on Host machine'}
+    
+    cmd = [fb_path] + parts
+    
+    try:
+        if log_callback:
+            log_callback(f"$ fastboot {' '.join(parts)}")
+        
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=120)
+        output = result.stdout + result.stderr
+        
+        if log_callback:
+            for line in output.strip().split('\n'):
+                if line.strip():
+                    log_callback(line)
+        
+        success = result.returncode == 0 or "OKAY" in output or "Finished" in output
+        return {
+            'success': success,
+            'output': output.strip(),
+            'error': None if success else f"Exit code: {result.returncode}"
+        }
+    except _sp.TimeoutExpired:
+        return {'success': False, 'output': '', 'error': 'Command timed out (120s)'}
+    except Exception as e:
+        return {'success': False, 'output': '', 'error': str(e)}
+
+FastbootToolkitPlugin.execute_raw_command = _fb_execute_raw_command

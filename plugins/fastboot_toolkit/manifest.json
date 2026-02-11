@@ -9,7 +9,10 @@
     "website": "https://github.com/vehoelite/image-anarchy",
     "support_url": "https://github.com/vehoelite/image-anarchy/issues",
     "min_version": "1.0",
+    "git_clone": null,
     "requirements": [],
-    "bundled_binaries": ["platform-tools/fastboot.exe", "platform-tools/AdbWinApi.dll", "platform-tools/AdbWinUsbApi.dll", "platform-tools/libwinpthread-1.dll", "platform-tools/mke2fs.exe", "platform-tools/mke2fs.conf", "platform-tools/make_f2fs.exe"],
-    "enabled": true
+    "bundled_binaries": ["https://imageanarchy.com/platform-tools/fastboot.exe", "https://imageanarchy.com/platform-tools/AdbWinApi.dll", "https://imageanarchy.com/platform-tools/AdbWinUsbApi.dll", "https://imageanarchy.com/platform-tools/libwinpthread-1.dll", "https://imageanarchy.com/platform-tools/mke2fs.exe", "https://imageanarchy.com/platform-tools/mke2fs.conf", "https://imageanarchy.com/platform-tools/make_f2fs.exe"],
+    "setup_commands": [],
+    "enabled": true,
+    "remote_capable": true
 }
