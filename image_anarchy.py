@@ -379,7 +379,8 @@ def _get_python_executable() -> Optional[str]:
         # Running as frozen exe
         # First check for bundled python_embedded
         base_dir = os.path.dirname(sys.executable)
-        embedded_python = os.path.join(base_dir, 'python_embedded', 'python.exe')
+        py_name = 'python.exe' if sys.platform == 'win32' else 'python3'
+        embedded_python = os.path.join(base_dir, 'python_embedded', py_name)
         
         # Check if embedded Python exists and is valid
         if os.path.isfile(embedded_python):
@@ -453,7 +454,8 @@ def _get_clean_python_env() -> dict:
     if os.path.exists(embedded_dir):
         # Prepend embedded Python paths to PATH
         current_path = env.get('PATH', '')
-        new_path = f"{embedded_dir};{embedded_scripts};{current_path}"
+        sep = os.pathsep  # ';' on Windows, ':' on Linux/macOS
+        new_path = f"{embedded_dir}{sep}{embedded_scripts}{sep}{current_path}"
         env['PATH'] = new_path
     
     return env
@@ -9143,6 +9145,118 @@ class PluginManager:
         
         return None
     
+    def _clone_via_tarball(self, repo_url: str, clone_dir: str, progress_callback=None) -> Tuple[bool, str]:
+        """Download a GitHub/GitLab repo as a tarball when git is not available.
+        
+        Converts a git clone URL to a GitHub archive URL, downloads and extracts.
+        Works without git installed — only needs urllib and tarfile (stdlib).
+        
+        Args:
+            repo_url: Git repository URL (e.g., https://github.com/user/repo.git)
+            clone_dir: Target directory to extract into
+            progress_callback: Optional callback(phase: str, status: str, progress: int)
+            
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        import urllib.request
+        import urllib.error
+        import tarfile
+        import tempfile
+        
+        # Convert git URL to GitHub tarball URL
+        # https://github.com/user/repo.git -> https://github.com/user/repo/archive/refs/heads/main.tar.gz
+        clean_url = repo_url.rstrip('/').replace('.git', '')
+        
+        # Try common default branch names
+        tarball_urls = [
+            f"{clean_url}/archive/refs/heads/main.tar.gz",
+            f"{clean_url}/archive/refs/heads/master.tar.gz",
+        ]
+        
+        # Also support GitLab-style URLs
+        if 'gitlab' in clean_url:
+            tarball_urls = [
+                f"{clean_url}/-/archive/main/{clean_url.split('/')[-1]}-main.tar.gz",
+                f"{clean_url}/-/archive/master/{clean_url.split('/')[-1]}-master.tar.gz",
+            ]
+        
+        tarball_path = None
+        used_url = None
+        
+        for url in tarball_urls:
+            try:
+                if progress_callback:
+                    progress_callback("Downloading archive", f"Trying {url.split('/')[-2]}...", 0)
+                
+                tarball_path = os.path.join(tempfile.gettempdir(), f"ia_repo_{os.getpid()}.tar.gz")
+                urllib.request.urlretrieve(url, tarball_path)
+                used_url = url
+                break
+            except (urllib.error.HTTPError, urllib.error.URLError):
+                if tarball_path and os.path.exists(tarball_path):
+                    os.remove(tarball_path)
+                tarball_path = None
+                continue
+        
+        if not tarball_path or not os.path.exists(tarball_path):
+            return False, (
+                f"Could not download repository archive from {clean_url}. "
+                f"Install git to clone directly: sudo apt install git"
+            )
+        
+        try:
+            if progress_callback:
+                progress_callback("Extracting archive", "Extracting...", 50)
+            
+            # Extract tarball — GitHub archives have a top-level folder like repo-main/
+            os.makedirs(clone_dir, exist_ok=True)
+            
+            with tarfile.open(tarball_path, 'r:gz') as tar:
+                # Get the top-level directory name (e.g., "mtkclient-main")
+                members = tar.getmembers()
+                if not members:
+                    return False, "Downloaded archive is empty"
+                
+                top_dir = members[0].name.split('/')[0]
+                
+                # Extract all members, stripping the top-level directory
+                for member in members:
+                    if member.name == top_dir:
+                        continue  # Skip the top-level dir itself
+                    
+                    # Strip the top-level directory from the path
+                    member.name = member.name[len(top_dir) + 1:]
+                    if not member.name:
+                        continue
+                    
+                    # Security: prevent path traversal
+                    if member.name.startswith('..') or member.name.startswith('/'):
+                        continue
+                    
+                    tar.extract(member, clone_dir)
+            
+            if progress_callback:
+                progress_callback("Archive extracted", "Complete ✓", 100)
+            
+            return True, f"Downloaded and extracted from {used_url}"
+            
+        except Exception as e:
+            # Clean up partial extraction on failure
+            if os.path.exists(clone_dir):
+                try:
+                    shutil.rmtree(clone_dir)
+                except Exception:
+                    pass
+            return False, f"Failed to extract archive: {str(e)}"
+        finally:
+            # Clean up tarball
+            if tarball_path and os.path.exists(tarball_path):
+                try:
+                    os.remove(tarball_path)
+                except Exception:
+                    pass
+    
     def run_post_install(self, plugin_id: str, progress_callback=None) -> Tuple[bool, str]:
         """Run post-install steps for a plugin.
         
@@ -9245,32 +9359,37 @@ class PluginManager:
                     
                     # Find git executable
                     git_exe = self.get_git_executable()
-                    if not git_exe:
-                        msg = "Git not found. Please install Git or ensure portable Git is bundled."
-                        if optional:
-                            if progress_callback:
-                                progress_callback(step_name, f"skipped: {msg}")
-                            continue
-                        else:
-                            errors.append(msg)
-                            continue
-                    
-                    # Clone the repository
-                    result = subprocess.run(
-                        [git_exe, 'clone', '--depth', '1', repo, clone_dir],
-                        capture_output=True, text=True, timeout=600,
-                        cwd=plugin_dir
-                    )
-                    
-                    if result.returncode != 0:
-                        msg = f"Git clone failed: {result.stderr}"
-                        if optional:
-                            if progress_callback:
-                                progress_callback(step_name, f"failed (optional): {msg}")
-                            continue
-                        else:
-                            errors.append(msg)
-                            continue
+                    if git_exe:
+                        # Clone the repository
+                        result = subprocess.run(
+                            [git_exe, 'clone', '--depth', '1', repo, clone_dir],
+                            capture_output=True, text=True, timeout=600,
+                            cwd=plugin_dir
+                        )
+                        
+                        if result.returncode != 0:
+                            msg = f"Git clone failed: {result.stderr}"
+                            if optional:
+                                if progress_callback:
+                                    progress_callback(step_name, f"failed (optional): {msg}")
+                                continue
+                            else:
+                                errors.append(msg)
+                                continue
+                    else:
+                        # No git — fall back to tarball download
+                        if progress_callback:
+                            progress_callback(step_name, "Git not found, downloading archive...")
+                        
+                        success, msg = self._clone_via_tarball(repo, clone_dir)
+                        if not success:
+                            if optional:
+                                if progress_callback:
+                                    progress_callback(step_name, f"skipped: {msg}")
+                                continue
+                            else:
+                                errors.append(msg)
+                                continue
                     
                     # Apply known fixes for cloned repositories
                     self._apply_repo_fixes(clone_dir, repo)
@@ -9532,9 +9651,7 @@ class PluginManager:
                     progress_callback(phase_label, "Already cloned ✓", get_phase_progress(phase_idx, 1.0))
             else:
                 git_exe = self.get_git_executable()
-                if not git_exe:
-                    errors.append("Git not found. Please install Git to complete setup.")
-                else:
+                if git_exe:
                     try:
                         if progress_callback:
                             progress_callback(phase_label, f"Cloning {repo.split('/')[-1]}...", get_phase_progress(phase_idx, 0.3))
@@ -9555,6 +9672,18 @@ class PluginManager:
                         errors.append("Git clone timed out")
                     except Exception as e:
                         errors.append(f"Git clone error: {str(e)}")
+                else:
+                    # No git available — fall back to tarball download
+                    if progress_callback:
+                        progress_callback(phase_label, "Git not found, downloading archive...", get_phase_progress(phase_idx, 0.2))
+                    
+                    success, msg = self._clone_via_tarball(repo, clone_dir, progress_callback=None)
+                    if success:
+                        self._apply_repo_fixes(clone_dir, repo)
+                        if progress_callback:
+                            progress_callback(phase_label, "Archive download complete ✓", get_phase_progress(phase_idx, 1.0))
+                    else:
+                        errors.append(msg)
             
             phase_idx += 1
         
@@ -9570,11 +9699,32 @@ class PluginManager:
             
             # Filter to only URL-based binaries
             url_binaries = []
+            is_linux = sys.platform != 'win32'
+            _win_only_exts = ('.exe', '.dll', '.msi')
+            skipped_win_binaries = []
             for binary in manifest.bundled_binaries:
                 if isinstance(binary, str) and binary.startswith(('http://', 'https://')):
-                    url_binaries.append({'url': binary, 'target_path': os.path.basename(binary)})
+                    bname = os.path.basename(binary)
+                    # On Linux, skip Windows-only binaries (.exe, .dll, .msi)
+                    if is_linux and bname.lower().endswith(_win_only_exts):
+                        skipped_win_binaries.append(bname)
+                        continue
+                    url_binaries.append({'url': binary, 'target_path': bname})
                 elif isinstance(binary, dict) and binary.get('url', '').startswith(('http://', 'https://')):
+                    bname = os.path.basename(binary.get('url', ''))
+                    if is_linux and bname.lower().endswith(_win_only_exts):
+                        skipped_win_binaries.append(bname)
+                        continue
                     url_binaries.append(binary)
+                elif isinstance(binary, str) and not binary.startswith(('http://', 'https://')):
+                    # Local path reference (e.g. "platform-tools/adb.exe") — skip .exe/.dll on Linux
+                    bname = os.path.basename(binary)
+                    if is_linux and bname.lower().endswith(_win_only_exts):
+                        skipped_win_binaries.append(bname)
+                        continue
+            if is_linux and skipped_win_binaries:
+                logging.info(f"[PLUGIN] Skipped {len(skipped_win_binaries)} Windows-only binaries on Linux: {', '.join(skipped_win_binaries[:5])}")
+                logging.info(f"[PLUGIN] Linux users: install platform tools via package manager (e.g. sudo apt install android-tools-adb scrcpy)")
             
             if not url_binaries:
                 if progress_callback:
@@ -10969,7 +11119,8 @@ def create_gui_app():
             try:
                 from curl_cffi import requests as cffi_requests
 
-                url = f"{PLUGIN_STORE_URL}/api/updates/check?current_version={APP_VERSION}&platform=windows"
+                _platform = 'windows' if sys.platform == 'win32' else ('macos' if sys.platform == 'darwin' else 'linux')
+                url = f"{PLUGIN_STORE_URL}/api/updates/check?current_version={APP_VERSION}&platform={_platform}"
                 headers = get_cf_headers()
 
                 session = cffi_requests.Session(impersonate='chrome')
@@ -11156,12 +11307,14 @@ def create_gui_app():
             if getattr(sys, 'frozen', False):
                 app_dir = os.path.dirname(sys.executable)
                 exe_name = os.path.basename(sys.executable)
+                ext = '.exe' if sys.platform == 'win32' else ''
                 # Download to temp name first
-                download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}.exe.download")
+                download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}{ext}.download")
             else:
-                # Running from source - just download to current directory
+                # Running from source — pip users should use pip install --upgrade
                 app_dir = os.path.dirname(os.path.abspath(__file__))
-                download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}.exe")
+                ext = '.exe' if sys.platform == 'win32' else ''
+                download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}{ext}")
 
             self.download_path = download_path
             self.final_path = download_path.replace('.download', '')
@@ -12817,6 +12970,16 @@ def create_gui_app():
             )
             aw_info.setStyleSheet("padding: 10px; background: #1a3a1a; border-radius: 5px;")
             allwinner_layout.addWidget(aw_info)
+
+            # Linux unavailability warning
+            if sys.platform != 'win32':
+                aw_linux_warn = QLabel(
+                    "⚠️ <b>imgRePacker is a Windows-only tool</b> (closed-source, by HeDgE). "
+                    "No Linux build is available. You can still use this tab if you have the tool installed via Wine."
+                )
+                aw_linux_warn.setWordWrap(True)
+                aw_linux_warn.setStyleSheet("padding: 10px; background: #3a2a00; color: #ffcc00; border-radius: 5px;")
+                allwinner_layout.addWidget(aw_linux_warn)
             
             # Input firmware
             aw_input_group = QGroupBox("Firmware Image")
@@ -12909,6 +13072,16 @@ def create_gui_app():
             )
             rk_info.setStyleSheet("padding: 10px; background: #1a2a3a; border-radius: 5px;")
             rockchip_layout.addWidget(rk_info)
+
+            # Linux unavailability warning
+            if sys.platform != 'win32':
+                rk_linux_warn = QLabel(
+                    "⚠️ <b>imgRePackerRK is a Windows-only tool</b> (closed-source, by HeDgE). "
+                    "No Linux build is available. You can still use this tab if you have the tool installed via Wine."
+                )
+                rk_linux_warn.setWordWrap(True)
+                rk_linux_warn.setStyleSheet("padding: 10px; background: #3a2a00; color: #ffcc00; border-radius: 5px;")
+                rockchip_layout.addWidget(rk_linux_warn)
             
             # Input firmware
             rk_input_group = QGroupBox("Firmware Image")
@@ -13778,7 +13951,8 @@ def create_gui_app():
                     self.erofs_tool_label.setText(f"✅ mkfs.erofs available: {Path(tool_path).name}")
                     self.erofs_tool_label.setStyleSheet("color: #4CAF50;")
             else:
-                self.erofs_tool_label.setText("❌ mkfs.erofs not found - place mkfs.erofs.exe in Tools/ folder")
+                exe = '.exe' if sys.platform == 'win32' else ''
+                self.erofs_tool_label.setText(f"❌ mkfs.erofs not found - place mkfs.erofs{exe} in Tools/ folder or install via package manager")
                 self.erofs_tool_label.setStyleSheet("color: #F44336;")
         
         def _browse_repack_output_file(self):
@@ -14633,14 +14807,17 @@ def create_gui_app():
             """Find the imgRePacker tool."""
             base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
             
-            # Check tools folder
-            tool_path = base / 'tools' / 'Allwinner' / 'imgRePacker.exe'
-            if tool_path.exists():
-                return str(tool_path)
+            # Check tools folder (both .exe and bare name for cross-platform)
+            for name in ['imgRePacker.exe', 'imgRePacker']:
+                tool_path = base / 'tools' / 'Allwinner' / name
+                if tool_path.exists():
+                    return str(tool_path)
             
             # Check if it's in PATH
-            if shutil.which('imgRePacker.exe'):
-                return shutil.which('imgRePacker.exe')
+            for name in ['imgRePacker', 'imgRePacker.exe']:
+                found = shutil.which(name)
+                if found:
+                    return found
             
             return None
         
@@ -14669,10 +14846,11 @@ def create_gui_app():
             """Unpack Allwinner firmware using imgRePacker."""
             tool = self._get_allwinner_tool()
             if not tool:
+                exe = '.exe' if sys.platform == 'win32' else ''
                 QMessageBox.critical(self, "Error", 
-                    "imgRePacker.exe not found!\n\n"
-                    "Please ensure the tool is in:\n"
-                    "tools/Allwinner/imgRePacker.exe")
+                    f"imgRePacker{exe} not found!\n\n"
+                    f"Please ensure the tool is in:\n"
+                    f"tools/Allwinner/imgRePacker{exe}")
                 return
             
             firmware = self.aw_firmware_path.text().strip()
@@ -14752,10 +14930,11 @@ def create_gui_app():
             """Repack Allwinner firmware using imgRePacker."""
             tool = self._get_allwinner_tool()
             if not tool:
+                exe = '.exe' if sys.platform == 'win32' else ''
                 QMessageBox.critical(self, "Error", 
-                    "imgRePacker.exe not found!\n\n"
-                    "Please ensure the tool is in:\n"
-                    "tools/Allwinner/imgRePacker.exe")
+                    f"imgRePacker{exe} not found!\n\n"
+                    f"Please ensure the tool is in:\n"
+                    f"tools/Allwinner/imgRePacker{exe}")
                 return
             
             # Check for .dump directory
@@ -14836,14 +15015,17 @@ def create_gui_app():
             """Find the imgRePackerRK tool."""
             base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
             
-            # Check tools folder
-            tool_path = base / 'tools' / 'Rockchip' / 'imgRePackerRK.exe'
-            if tool_path.exists():
-                return str(tool_path)
+            # Check tools folder (both .exe and bare name for cross-platform)
+            for name in ['imgRePackerRK.exe', 'imgRePackerRK']:
+                tool_path = base / 'tools' / 'Rockchip' / name
+                if tool_path.exists():
+                    return str(tool_path)
             
             # Check if it's in PATH
-            if shutil.which('imgRePackerRK.exe'):
-                return shutil.which('imgRePackerRK.exe')
+            for name in ['imgRePackerRK', 'imgRePackerRK.exe']:
+                found = shutil.which(name)
+                if found:
+                    return found
             
             return None
         
@@ -14872,10 +15054,11 @@ def create_gui_app():
             """Unpack Rockchip firmware using imgRePackerRK."""
             tool = self._get_rockchip_tool()
             if not tool:
+                exe = '.exe' if sys.platform == 'win32' else ''
                 QMessageBox.critical(self, "Error", 
-                    "imgRePackerRK.exe not found!\n\n"
-                    "Please ensure the tool is in:\n"
-                    "tools/Rockchip/imgRePackerRK.exe")
+                    f"imgRePackerRK{exe} not found!\n\n"
+                    f"Please ensure the tool is in:\n"
+                    f"tools/Rockchip/imgRePackerRK{exe}")
                 return
             
             firmware = self.rk_firmware_path.text().strip()
@@ -14955,10 +15138,11 @@ def create_gui_app():
             """Repack Rockchip firmware using imgRePackerRK."""
             tool = self._get_rockchip_tool()
             if not tool:
+                exe = '.exe' if sys.platform == 'win32' else ''
                 QMessageBox.critical(self, "Error", 
-                    "imgRePackerRK.exe not found!\n\n"
-                    "Please ensure the tool is in:\n"
-                    "tools/Rockchip/imgRePackerRK.exe")
+                    f"imgRePackerRK{exe} not found!\n\n"
+                    f"Please ensure the tool is in:\n"
+                    f"tools/Rockchip/imgRePackerRK{exe}")
                 return
             
             # Check for .dump directory
@@ -17558,6 +17742,24 @@ def create_gui_app():
             tools_dir = os.path.join(app_dir, 'tools')
             plugins_dir = os.path.join(app_dir, 'plugins')
 
+            def _tool_exists(subdir, *names):
+                """Check if a tool exists in tools_dir/subdir by trying multiple names + shutil.which."""
+                import shutil as _shutil
+                for name in names:
+                    if subdir:
+                        if os.path.exists(os.path.join(tools_dir, subdir, name)):
+                            return True
+                    else:
+                        if os.path.exists(os.path.join(tools_dir, name)):
+                            return True
+                # Fallback: system PATH
+                base_name = names[-1] if names else None  # bare name is last
+                if base_name and _shutil.which(base_name):
+                    return True
+                return False
+
+            _is_win = sys.platform == 'win32'
+
             availability = {
                 # Built-in (always available)
                 'payload_extract': True,
@@ -17566,14 +17768,14 @@ def create_gui_app():
                 'boot_analyze': True,
                 'oppo_decrypt': True,
 
-                # Tools folder
-                'erofs_extract': os.path.exists(os.path.join(tools_dir, 'extract.erofs.exe')),
-                'erofs_create': os.path.exists(os.path.join(tools_dir, 'mkfs.erofs.exe')),
-                'erofs_fsck': os.path.exists(os.path.join(tools_dir, 'fsck.erofs.exe')),
-                'allwinner_unpack': os.path.exists(os.path.join(tools_dir, 'Allwinner', 'imgRePacker.exe')),
-                'allwinner_repack': os.path.exists(os.path.join(tools_dir, 'Allwinner', 'imgRePacker.exe')),
-                'rockchip_unpack': os.path.exists(os.path.join(tools_dir, 'Rockchip', 'imgRePackerRK.exe')),
-                'rockchip_repack': os.path.exists(os.path.join(tools_dir, 'Rockchip', 'imgRePackerRK.exe')),
+                # Tools folder — check both .exe and bare names + system PATH
+                'erofs_extract': _tool_exists('', 'extract.erofs.exe', 'extract.erofs'),
+                'erofs_create': _tool_exists('', 'mkfs.erofs.exe', 'mkfs.erofs'),
+                'erofs_fsck': _tool_exists('', 'fsck.erofs.exe', 'fsck.erofs'),
+                'allwinner_unpack': _tool_exists('Allwinner', 'imgRePacker.exe', 'imgRePacker'),
+                'allwinner_repack': _tool_exists('Allwinner', 'imgRePacker.exe', 'imgRePacker'),
+                'rockchip_unpack': _tool_exists('Rockchip', 'imgRePackerRK.exe', 'imgRePackerRK'),
+                'rockchip_repack': _tool_exists('Rockchip', 'imgRePackerRK.exe', 'imgRePackerRK'),
 
                 # Installed plugins
                 'adb_toolkit': os.path.exists(os.path.join(plugins_dir, 'adb_toolkit', 'manifest.json')),
@@ -17592,16 +17794,29 @@ def create_gui_app():
 
         def get_install_hint(self, tool_id: str) -> str:
             """Get hint for how to install a missing tool."""
-            hints = {
-                'erofs_extract': 'EROFS tools bundled with Image Anarchy',
-                'erofs_create': 'EROFS tools bundled with Image Anarchy',
-                'allwinner_unpack': 'Allwinner tools in tools/Allwinner/',
-                'rockchip_unpack': 'Rockchip tools in tools/Rockchip/',
-                'adb_toolkit': 'Install from Plugin Store',
-                'fastboot_toolkit': 'Install from Plugin Store',
-                'mtk_toolkit': 'Install from Plugin Store',
-                'scrcpy_toolkit': 'Install from Plugin Store',
-            }
+            _is_linux = sys.platform != 'win32'
+            if _is_linux:
+                hints = {
+                    'erofs_extract': 'Install: sudo apt install erofs-utils (or use built-in Python extractor)',
+                    'erofs_create': 'Install: sudo apt install erofs-utils',
+                    'allwinner_unpack': 'Windows only — imgRePacker has no Linux build',
+                    'rockchip_unpack': 'Windows only — imgRePackerRK has no Linux build',
+                    'adb_toolkit': 'Install ADB: sudo apt install android-tools-adb, or install plugin from Store',
+                    'fastboot_toolkit': 'Install Fastboot: sudo apt install android-tools-fastboot, or install plugin from Store',
+                    'mtk_toolkit': 'Install from Plugin Store',
+                    'scrcpy_toolkit': 'Install scrcpy: sudo apt install scrcpy, or install plugin from Store',
+                }
+            else:
+                hints = {
+                    'erofs_extract': 'EROFS tools bundled with Image Anarchy',
+                    'erofs_create': 'EROFS tools bundled with Image Anarchy',
+                    'allwinner_unpack': 'Allwinner tools in tools/Allwinner/',
+                    'rockchip_unpack': 'Rockchip tools in tools/Rockchip/',
+                    'adb_toolkit': 'Install from Plugin Store',
+                    'fastboot_toolkit': 'Install from Plugin Store',
+                    'mtk_toolkit': 'Install from Plugin Store',
+                    'scrcpy_toolkit': 'Install from Plugin Store',
+                }
             return hints.get(tool_id, 'Check tools/ folder or Plugin Store')
 
     # Global detector instance
@@ -21039,10 +21254,11 @@ def create_gui_app():
             """Find ADB executable from plugins or system."""
             import shutil
             base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+            adb_name = 'adb.exe' if sys.platform == 'win32' else 'adb'
             for p in [
-                base / 'plugins' / 'scrcpy_toolkit' / 'adb.exe',
-                base / 'plugins' / 'adb_toolkit' / 'platform-tools' / 'adb.exe',
-                base / 'platform-tools' / 'adb.exe',
+                base / 'plugins' / 'scrcpy_toolkit' / adb_name,
+                base / 'plugins' / 'adb_toolkit' / 'platform-tools' / adb_name,
+                base / 'platform-tools' / adb_name,
             ]:
                 if p.exists():
                     return str(p)
