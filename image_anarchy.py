@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
-Version: 3.2
+Version: 3.3
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -254,8 +254,46 @@ def _get_visual_plugin_maker_v2():
     return _VisualPluginMakerV2
 
 # Application version - used for update checking
-APP_VERSION = "3.2"
-APP_VERSION_CODE = 320  # Numeric version for comparison (3.2 = 320)
+APP_VERSION = "3.3"
+APP_VERSION_CODE = 330  # Numeric version for comparison (3.3 = 330)
+
+
+def _win_long_path(path) -> Path:
+    """Convert a path to use Windows extended-length prefix (\\\\?\\) to bypass MAX_PATH (260 char) limit.
+    
+    Android filesystem images (especially preload, system) contain deeply nested paths
+    that routinely exceed 260 characters when extracted. The \\\\?\\ prefix allows paths
+    up to 32,767 characters on NTFS.
+    
+    Also truncates individual path components to 255 chars (NTFS per-component limit).
+    
+    Args:
+        path: A str or Path object
+        
+    Returns:
+        Path with extended-length prefix on Windows, unchanged on other platforms
+    """
+    # Strip any embedded null characters (can come from raw filesystem name parsing)
+    p = Path(str(path).replace('\x00', ''))
+    if sys.platform == 'win32':
+        s = str(p.resolve())
+        # Truncate any single path component longer than 255 chars (NTFS limit)
+        parts = list(p.parts)
+        truncated = False
+        for i, part in enumerate(parts):
+            if len(part) > 255:
+                # Preserve extension if present
+                stem_part = Path(part)
+                ext = stem_part.suffix
+                parts[i] = part[:255 - len(ext)] + ext
+                truncated = True
+        if truncated:
+            p = Path(*parts)
+            s = str(p.resolve())
+        if not s.startswith('\\\\?\\'):
+            s = '\\\\?\\' + s
+        return Path(s)
+    return p
 
 
 def get_app_dir() -> str:
@@ -1063,6 +1101,7 @@ LP_METADATA_MAGIC = 0x414C5030  # "0PLA" - Android Logical Partition metadata he
 LP_GEOMETRY_MAGIC = 0x616c4467  # "gDla" - Android Logical Partition geometry
 EROFS_MAGIC = 0xE0F5E1E2
 EXT4_MAGIC = 0xEF53
+F2FS_MAGIC = 0xF2F52010  # F2FS superblock magic at offset 0x400
 FAT_BOOT_SIG = 0xAA55  # FAT boot signature at offset 0x1FE
 ELF_MAGIC = b'\x7fELF'  # ELF executable format
 MBN_MAGIC = 0x00000005  # Qualcomm MBN type 5 (common)
@@ -1171,6 +1210,22 @@ def detect_image_type(file_path: str) -> str:
             erofs_magic = struct.unpack('<I', erofs_header)[0]
             if erofs_magic == EROFS_MAGIC:
                 return 'erofs'
+    
+    # Check for F2FS (superblock at offset 0x400, backup at 0x1400)
+    with open(file_path, 'rb') as f:
+        f.seek(0x400)  # F2FS primary superblock offset
+        f2fs_header = f.read(4)
+        if len(f2fs_header) >= 4:
+            f2fs_magic = struct.unpack('<I', f2fs_header)[0]
+            if f2fs_magic == F2FS_MAGIC:
+                return 'f2fs'
+        # Check backup superblock at 0x1400
+        f.seek(0x1400)
+        f2fs_header2 = f.read(4)
+        if len(f2fs_header2) >= 4:
+            f2fs_magic2 = struct.unpack('<I', f2fs_header2)[0]
+            if f2fs_magic2 == F2FS_MAGIC:
+                return 'f2fs'
     
     # Check for LZ4 compressed file (common for .lz4 images)
     # LZ4 frame magic: 0x184D2204 (little endian reads as 04 22 4D 18)
@@ -6243,7 +6298,7 @@ class Ext4ImageExtractor:
                 break
             
             if inode_num != 0 and name_len > 0:
-                name = dir_data[offset+8:offset+8+name_len].decode('utf-8', errors='ignore')
+                name = dir_data[offset+8:offset+8+name_len].replace(b'\x00', b'').decode('utf-8', errors='ignore')
                 entries.append({
                     'inode': inode_num,
                     'name': name,
@@ -6313,7 +6368,7 @@ class Ext4ImageExtractor:
             mode = child_inode['mode'] & self.EXT4_S_IFMT
             
             if mode == self.EXT4_S_IFDIR:
-                dir_path = Path(output_dir) / full_path
+                dir_path = _win_long_path(Path(output_dir) / full_path)
                 dir_path.mkdir(parents=True, exist_ok=True)
                 self._extract_directory(f, entry['inode'], full_path, output_dir, file_list, extracted)
             
@@ -6328,7 +6383,7 @@ class Ext4ImageExtractor:
     def _extract_file(self, f: BinaryIO, inode: dict, full_path: str,
                       output_dir: str, extracted: dict):
         """Extract a regular file."""
-        output_path = Path(output_dir) / full_path
+        output_path = _win_long_path(Path(output_dir) / full_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         data = self._read_file_data(f, inode)
@@ -6340,7 +6395,7 @@ class Ext4ImageExtractor:
     def _extract_symlink(self, f: BinaryIO, inode: dict, full_path: str,
                          output_dir: str, extracted: dict):
         """Extract a symbolic link."""
-        output_path = Path(output_dir) / full_path
+        output_path = _win_long_path(Path(output_dir) / full_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         # For small symlinks, target is stored inline in block pointers
@@ -6712,11 +6767,16 @@ class ErofsImageExtractor:
             
             if proc.returncode == 0:
                 result['success'] = True
-                # Count extracted files
-                for root, dirs, files in os.walk(output_dir):
+                # Count extracted files (use long path prefix on Windows)
+                walk_dir = str(_win_long_path(output_dir))
+                for root, dirs, files in os.walk(walk_dir):
                     for f in files:
-                        rel_path = os.path.relpath(os.path.join(root, f), output_dir)
-                        result['files'][rel_path] = {'size': os.path.getsize(os.path.join(root, f))}
+                        full = os.path.join(root, f)
+                        rel_path = os.path.relpath(full, walk_dir)
+                        try:
+                            result['files'][rel_path] = {'size': os.path.getsize(full)}
+                        except OSError:
+                            result['files'][rel_path] = {'size': 0}
                 logger.info(f"{tool_type} extracted {len(result['files'])} files")
             else:
                 result['error'] = proc.stderr or f"{tool_type} exited with code {proc.returncode}"
@@ -6965,8 +7025,8 @@ class ErofsImageExtractor:
             
             # Handle names that might be padded with zeros
             name_bytes = dir_data[nameoff:name_end]
-            # Strip trailing nulls and decode
-            name_bytes = name_bytes.rstrip(b'\x00')
+            # EROFS names are C-strings: truncate at first null byte, then strip any remaining
+            name_bytes = name_bytes.split(b'\x00', 1)[0]
             
             if name_bytes:
                 name = name_bytes.decode('utf-8', errors='ignore')
@@ -7013,8 +7073,8 @@ class ErofsImageExtractor:
                 continue
             
             if entry_inode['type'] == 'dir':
-                # Create directory and recurse
-                dir_path = Path(output_dir) / full_path
+                # Create directory and recurse (use long path prefix on Windows)
+                dir_path = _win_long_path(Path(output_dir) / full_path)
                 dir_path.mkdir(parents=True, exist_ok=True)
                 self._extract_directory(f, entry['nid'], full_path, output_dir,
                                        file_list, extracted)
@@ -7028,7 +7088,7 @@ class ErofsImageExtractor:
     def _extract_file(self, f: BinaryIO, inode: dict, full_path: str,
                       output_dir: str, extracted: dict):
         """Extract a regular file."""
-        output_path = Path(output_dir) / full_path
+        output_path = _win_long_path(Path(output_dir) / full_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         try:
@@ -7046,7 +7106,7 @@ class ErofsImageExtractor:
     def _extract_symlink(self, f: BinaryIO, inode: dict, full_path: str,
                          output_dir: str, extracted: dict):
         """Extract a symbolic link."""
-        output_path = Path(output_dir) / full_path
+        output_path = _win_long_path(Path(output_dir) / full_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         try:
@@ -7110,40 +7170,637 @@ class ErofsImageExtractor:
             f.seek(data_offset)
             return f.read(size)
     
+    @staticmethod
+    def _lz4_decompress_block(compressed_block: bytes, uncompressed_size: int) -> bytes:
+        """Decompress an LZ4 compressed block, handling EROFS 0PADDING format.
+        
+        EROFS with LZ4_0PADDING stores compressed data at the start of a physical
+        block, followed by zero padding. Python's lz4.block.decompress wraps
+        LZ4_decompress_safe which fails on trailing zeros (unlike the kernel's
+        LZ4_decompress_safe_partial). We strip trailing zeros first, then retry
+        with progressive additions if stripping removed a legitimate trailing zero.
+        """
+        import lz4.block
+        
+        # Strip trailing zero padding
+        end = len(compressed_block)
+        while end > 0 and compressed_block[end - 1] == 0:
+            end -= 1
+        
+        if end == 0:
+            # All zeros — return zero-filled output
+            return b'\x00' * uncompressed_size
+        
+        # Try decompression with stripped data
+        trimmed = compressed_block[:end]
+        
+        # First try: stripped data with exact uncompressed size
+        try:
+            return lz4.block.decompress(trimmed, uncompressed_size=uncompressed_size)
+        except Exception:
+            pass
+        
+        # Second try: maybe we stripped a legitimate trailing zero byte
+        # Try adding back 1-3 zero bytes
+        for extra in range(1, 4):
+            try:
+                padded = trimmed + b'\x00' * extra
+                return lz4.block.decompress(padded, uncompressed_size=uncompressed_size)
+            except Exception:
+                continue
+        
+        # Third try: full block (in case the data isn't 0PADDING format)
+        try:
+            return lz4.block.decompress(compressed_block, uncompressed_size=uncompressed_size)
+        except Exception:
+            pass
+        
+        # Final: raise the original error for the caller to handle
+        return lz4.block.decompress(trimmed, uncompressed_size=uncompressed_size)
+    
     def _read_compressed_data(self, f: BinaryIO, inode: dict) -> bytes:
-        """Read and decompress LZ4-compressed data."""
+        """Read and decompress LZ4-compressed EROFS data using the compress index.
+        
+        EROFS compressed files store a compress index after the inode (+ xattr).
+        Each index entry is 8 bytes (legacy format, z_erofs_lcluster_index):
+          - di_advise  (u16): bit 0 = type (0=HEAD, 1=NONHEAD), bits 2-3 = algorithm
+          - di_clusterofs (u16): offset within decompressed cluster
+          - di_u (u32): for HEAD = blkaddr (physical block), for NONHEAD = delta[2] (u16 each)
+        
+        HEAD entries start a new physical cluster (pcluster). Each pcluster contains
+        one or more compressed physical blocks that decompress to one or more logical
+        blocks (lclusters). For simple single-block pclusters (no big_pcluster feature),
+        each HEAD = 1 compressed block -> 1 decompressed block.
+        
+        For big pcluster support, NONHEAD entries follow a HEAD and their count determines
+        how many logical blocks the pcluster decompresses to (pcluster may use multiple
+        physical blocks as well).
+        """
         import lz4.block
         
         size = inode['size']
-        raw_blkaddr = inode['raw_blkaddr']
+        layout = inode['layout']
+        inode_offset = self._nid_to_offset(inode['nid'])
         
-        # For compressed files, raw_blkaddr points to compressed data
-        # The compression uses LZ4 block format
+        # Compress index starts after inode header + xattr, aligned to 8 bytes
+        # Kernel: pos = ALIGN(erofs_iloc(vi) + vi->inode_isize + vi->xattr_isize, 8)
+        meta_offset = inode_offset + inode['inode_size']
+        if inode.get('xattr_icount', 0) > 0:
+            xattr_size = (inode['xattr_icount'] - 1) * 4 + 12
+            meta_offset += xattr_size
         
-        result = bytearray()
-        data_offset = raw_blkaddr * self.block_size
+        # Align to 8-byte boundary (critical for correct index parsing)
+        index_offset = (meta_offset + 7) & ~7
         
-        f.seek(data_offset)
+        # Number of logical clusters (each represents block_size of uncompressed data)
+        lcluster_count = (size + self.block_size - 1) // self.block_size
         
-        # Read compressed blocks and decompress
-        # This is simplified - actual EROFS compression is more complex
-        remaining = size
+        if layout == self.EROFS_INODE_FLAT_COMPRESSION:
+            # Compact index format (layout=3) — more complex encoding
+            # For now, fall back to raw_blkaddr based sequential read
+            return self._read_compressed_data_compact(f, inode, index_offset, lcluster_count)
         
-        while remaining > 0:
-            # Read block header (4 bytes for compressed size in simple case)
+        # Legacy/full index format (layout=1): 8 bytes per entry
+        f.seek(index_offset)
+        index_data = f.read(lcluster_count * 8)
+        
+        if len(index_data) < 8:
+            logger.warning(f"Empty compress index for nid={inode['nid']}, trying raw read")
+            data_offset = inode['raw_blkaddr'] * self.block_size
             f.seek(data_offset)
-            compressed_data = f.read(self.block_size * 2)  # Read enough for one pcluster
+            return f.read(size)
+        
+        return self._decompress_from_legacy_index(f, inode, index_data, lcluster_count)
+    
+    # --- Compact index cluster types (from kernel's Z_EROFS_VLE_CLUSTER_TYPE_*) ---
+    Z_EROFS_VLE_CLUSTER_TYPE_PLAIN = 0    # Uncompressed data
+    Z_EROFS_VLE_CLUSTER_TYPE_HEAD = 1     # Compressed data (HEAD of pcluster)
+    Z_EROFS_VLE_CLUSTER_TYPE_NONHEAD = 2  # Continuation of previous pcluster
+    Z_EROFS_VLE_CLUSTER_TYPE_RESERVED = 3
+    
+    @staticmethod
+    def _decode_compacted_bits(lobits: int, lomask: int, data: bytes, bit_pos: int) -> tuple:
+        """Decode a compact index entry at a given bit position.
+        
+        Translates decode_compactedbits() from Linux kernel fs/erofs/zmap.c.
+        Reads an unaligned le32 at the bit position and extracts:
+          - lo: lower 'lobits' bits (clusterofs or delta value)
+          - type: next 2 bits (cluster type: PLAIN/HEAD/NONHEAD/RESERVED)
+        
+        Returns:
+            (lo, type) tuple
+        """
+        byte_off = bit_pos >> 3
+        bit_shift = bit_pos & 7
+        
+        # Read 4 bytes (unaligned le32), pad if near end of buffer
+        end = byte_off + 4
+        if end > len(data):
+            chunk = data[byte_off:] + b'\x00' * (end - len(data))
+        else:
+            chunk = data[byte_off:end]
+        
+        v = struct.unpack('<I', chunk[:4])[0] >> bit_shift
+        lo = v & lomask
+        entry_type = (v >> lobits) & 3
+        return lo, entry_type
+    
+    def _unpack_compact_entry(self, idx_buf: bytes, pos: int, amortizedshift: int,
+                               lclusterbits: int, lomask: int, ebase_mod: int = 0) -> dict:
+        """Unpack a single compact index entry from the index buffer.
+        
+        Translates unpack_compacted_index() from Linux kernel fs/erofs/zmap.c.
+        
+        Compact entries are packed into groups (packs):
+          - 4B entries (amortizedshift=2): 2 entries per pack, 8 bytes total
+            (4 bytes of 16-bit entries + 4 bytes trailing blkaddr)
+          - 2B entries (amortizedshift=1): 16 entries per pack, 32 bytes total
+            (28 bytes of 14-bit entries + 4 bytes trailing blkaddr)
+        
+        For HEAD entries, walks backwards through the pack to count nblk
+        (number of physical blocks offset from the base blkaddr).
+        
+        Args:
+            idx_buf: Raw index buffer starting at ebase
+            pos: Byte position of this entry relative to ebase (start of idx_buf)
+            amortizedshift: 1 for 2B region, 2 for 4B region
+            lclusterbits: log2(logical_cluster_size), typically 12
+            lomask: (1 << lclusterbits) - 1
+            ebase_mod: ebase % 32 — needed for correct pack alignment.
+                The kernel uses absolute positions for round_down(pos, pack_size).
+                We simulate this by offsetting relative positions by ebase_mod.
+        
+        Returns:
+            dict with keys: type, clusterofs, delta0, pblk
+        """
+        # vcnt = entries per pack
+        if (1 << amortizedshift) == 4:
+            vcnt = 2
+        elif (1 << amortizedshift) == 2:
+            vcnt = 16
+        else:
+            return {'type': 3, 'clusterofs': 0, 'delta0': 0, 'pblk': 0}
+        
+        pack_size = vcnt << amortizedshift  # bytes per pack (8 for 4B, 32 for 2B)
+        # encodebits = bits per entry within the data portion of the pack
+        # For 2B: (16*2 - 4)*8/16 = 14 bits (12 clusterofs + 2 type)
+        # For 4B: (2*4 - 4)*8/2 = 16 bits (14 clusterofs + 2 type)
+        encodebits = (pack_size - 4) * 8 // vcnt
+        
+        # Find pack base using ABSOLUTE position alignment (kernel: round_down(pos, pack_size))
+        # pos is relative to idx_buf; ebase_mod accounts for ebase's misalignment vs pack_size
+        abs_pos = pos + ebase_mod
+        abs_base = (abs_pos // pack_size) * pack_size
+        base = abs_base - ebase_mod
+        i = (pos - base) >> amortizedshift
+        
+        # Read the pack data
+        if base + pack_size > len(idx_buf):
+            return {'type': 3, 'clusterofs': 0, 'delta0': 0, 'pblk': 0}
+        pack_data = idx_buf[base:base + pack_size]
+        
+        # Decode entry at index i
+        lo, entry_type = self._decode_compacted_bits(lclusterbits, lomask, pack_data, encodebits * i)
+        
+        if entry_type == self.Z_EROFS_VLE_CLUSTER_TYPE_NONHEAD:
+            # NONHEAD: lo is delta[0] (distance back to HEAD), except for last entry in pack
+            clusterofs = 1 << lclusterbits  # sentinel value for NONHEAD
+            if i + 1 != vcnt:
+                # Not the last entry — lo IS delta[0]
+                delta0 = lo
+            else:
+                # Last entry in pack: lo stores delta[1] (forward), not delta[0]
+                # Derive delta[0] from the previous entry
+                if i > 0:
+                    lo_prev, type_prev = self._decode_compacted_bits(
+                        lclusterbits, lomask, pack_data, encodebits * (i - 1))
+                    delta0 = (lo_prev if type_prev == self.Z_EROFS_VLE_CLUSTER_TYPE_NONHEAD else 0) + 1
+                else:
+                    delta0 = 1
+            return {'type': 2, 'clusterofs': clusterofs, 'delta0': delta0, 'pblk': 0}
+        
+        # HEAD or PLAIN (type 0 or 1): lo is clusterofs
+        clusterofs = lo
+        
+        # Walk backwards through pack to count nblk (HEAD entries before this one + 1)
+        nblk = 1
+        wi = i
+        while wi > 0:
+            wi -= 1
+            wlo, wtype = self._decode_compacted_bits(
+                lclusterbits, lomask, pack_data, encodebits * wi)
+            if wtype == self.Z_EROFS_VLE_CLUSTER_TYPE_NONHEAD:
+                wi -= wlo  # skip backwards by delta
+            if wi >= 0:
+                nblk += 1
+        
+        # Trailing blkaddr is stored in the last 4 bytes of the pack
+        base_blkaddr = struct.unpack('<I', pack_data[-4:])[0]
+        pblk = base_blkaddr + nblk
+        
+        return {'type': entry_type, 'clusterofs': clusterofs, 'delta0': 0, 'pblk': pblk}
+    
+    def _read_compressed_data_compact(self, f: BinaryIO, inode: dict, 
+                                       index_offset: int, lcluster_count: int) -> bytes:
+        """Read compressed data using compact index format (layout=3, EROFS_INODE_FLAT_COMPRESSION).
+        
+        Implements the kernel's compact index parser from fs/erofs/zmap.c:
+          - compacted_load_cluster_from_disk(): determines region (4b_initial/2b/4b_end) and position
+          - unpack_compacted_index(): unpacks entry from bit-packed data within a pack
+          - decode_compactedbits(): extracts bits from unaligned le32 at bit position
+        
+        Compact index packs entries into groups with a trailing le32 base blkaddr:
+          - 4B entries: 2 per pack (8 bytes: 4B of 16-bit entries + 4B blkaddr)
+          - 2B entries: 16 per pack (32 bytes: 28B of 14-bit entries + 4B blkaddr)
+        
+        Three contiguous regions of compact index data:
+          1. compacted_4b_initial: alignment padding to 32-byte boundary (4B entries)
+          2. compacted_2b: main region of space-efficient 2B entries (groups of 16)
+          3. compacted_4b_end: remainder entries (4B entries)
+        
+        Each entry stores cluster type (2 bits) + clusterofs/delta (remaining bits).
+        For HEAD entries, the physical block address = base_blkaddr + nblk, where
+        nblk is determined by walking backwards through the pack counting HEADs.
+        """
+        import lz4.block
+        
+        size = inode['size']
+        
+        try:
+            return self._do_read_compressed_data_compact(f, inode, index_offset, lcluster_count)
+        except Exception as e:
+            logger.warning(f"Compact index parsing failed for nid={inode['nid']}: {e}, using fallback")
+            return self._compact_fallback_sequential(f, inode)
+    
+    def _do_read_compressed_data_compact(self, f: BinaryIO, inode: dict,
+                                          index_offset: int, lcluster_count: int) -> bytes:
+        """Inner implementation of compact index decompression (called by _read_compressed_data_compact)."""
+        import lz4.block
+        
+        size = inode['size']
+        
+        # --- Step 1: Parse z_erofs_map_header (8 bytes at index_offset) ---
+        # struct z_erofs_map_header {
+        #   __le32 h_reserved1;      // 4 bytes
+        #   __le16 h_advise;         // 2 bytes  
+        #   __u8   h_algorithmtype;  // 1 byte (lo nibble = algo[0], hi = algo[1])
+        #   __u8   h_clusterbits;    // 1 byte (extra bits beyond block_size bits)
+        # };
+        f.seek(index_offset)
+        map_header = f.read(8)
+        if len(map_header) < 8:
+            logger.warning(f"Cannot read z_erofs_map_header for nid={inode['nid']}, using fallback")
+            return self._compact_fallback_sequential(f, inode)
+        
+        h_advise = struct.unpack('<H', map_header[4:6])[0]
+        h_algorithmtype = map_header[6]
+        h_clusterbits = map_header[7] & 0xf  # lower nibble only (kernel masks with 0xf)
+        
+        block_size_bits = self.block_size.bit_length() - 1  # log2(4096) = 12
+        lclusterbits = block_size_bits + h_clusterbits
+        
+        # Sanity check: lclusterbits should be 12-20 (4KB to 1MB lclusters)
+        if lclusterbits < 12 or lclusterbits > 20:
+            logger.warning(f"Unreasonable lclusterbits={lclusterbits} for nid={inode['nid']}, "
+                          f"using default 12")
+            lclusterbits = 12
+        
+        lcluster_size = 1 << lclusterbits  # logical cluster size (usually == block_size)
+        
+        logger.debug(f"  z_erofs_map_header: h_advise=0x{h_advise:04x}, "
+                     f"h_algorithmtype=0x{h_algorithmtype:02x}, h_clusterbits={h_clusterbits}, "
+                     f"lclusterbits={lclusterbits}")
+        
+        # --- Step 2: Calculate compact index regions ---
+        # ebase = byte offset where compact index entries begin (right after map_header)
+        ebase = index_offset + 8
+        totalidx = lcluster_count
+        
+        # compacted_4b_initial: pad with 4B entries until ebase is 32-byte aligned
+        # Kernel: compacted_4b_initial = (32 - ebase % 32) / 4
+        remainder = ebase % 32
+        compacted_4b_initial = (32 - remainder) // 4 if remainder else 0
+        if compacted_4b_initial == 8:  # (32 - 0) / 4 = 8 means already aligned
+            compacted_4b_initial = 0
+        if compacted_4b_initial > totalidx:
+            compacted_4b_initial = totalidx
+        
+        # compacted_2b: main region (groups of 16 entries, rounddown to 16)
+        # Only used when Z_EROFS_ADVISE_COMPACTED_2B (bit 0 of h_advise) is set
+        remaining_idx = totalidx - compacted_4b_initial
+        use_compacted_2b = bool(h_advise & 0x0001)  # Z_EROFS_ADVISE_COMPACTED_2B
+        if use_compacted_2b and remaining_idx > 0:
+            compacted_2b = (remaining_idx // 16) * 16
+        else:
+            compacted_2b = 0
+        
+        # compacted_4b_end: remaining entries that don't fill a group of 16
+        compacted_4b_end = totalidx - compacted_4b_initial - compacted_2b
+        
+        logger.debug(f"  Compact index regions: ebase=0x{ebase:x}, totalidx={totalidx}, "
+                     f"4b_init={compacted_4b_initial}, 2b={compacted_2b}, 4b_end={compacted_4b_end}")
+        
+        # --- Step 3: Read entire compact index buffer ---
+        # Upper bound: each entry uses at most 8 bytes in 4B pack format,
+        # plus trailing blkaddrs add ~4 bytes per pack.
+        # totalidx * 8 is a safe generous upper bound.
+        idx_data_size = max(totalidx * 8, 64)
+        
+        f.seek(ebase)
+        idx_buf = f.read(idx_data_size)
+        
+        if len(idx_buf) < 8:
+            logger.warning(f"Compact index buffer too small for nid={inode['nid']}, using fallback")
+            return self._compact_fallback_sequential(f, inode)
+        
+        # --- Step 4: Unpack all logical cluster entries ---
+        lomask = (1 << lclusterbits) - 1
+        ebase_mod = ebase % 32  # For pack alignment (kernel uses absolute round_down)
+        entries = []
+        
+        for lcn in range(totalidx):
+            # Determine region, amortizedshift, and byte position for this lcn
+            if lcn < compacted_4b_initial:
+                amortizedshift = 2
+                pos = lcn * 4
+            elif lcn < compacted_4b_initial + compacted_2b:
+                amortizedshift = 1
+                pos = compacted_4b_initial * 4 + (lcn - compacted_4b_initial) * 2
+            else:
+                amortizedshift = 2
+                pos = (compacted_4b_initial * 4 + compacted_2b * 2 +
+                       (lcn - compacted_4b_initial - compacted_2b) * 4)
+            
+            entry = self._unpack_compact_entry(
+                idx_buf, pos, amortizedshift, lclusterbits, lomask, ebase_mod)
+            entries.append(entry)
+        
+        # --- Step 5: Validate parsed entries ---
+        head_count = sum(1 for e in entries if e['type'] in (0, 1))
+        if head_count == 0:
+            logger.warning(f"No HEAD entries found in compact index for nid={inode['nid']}, "
+                          f"using fallback")
+            return self._compact_fallback_sequential(f, inode)
+        
+        # Sanity check: first entry should typically be a HEAD or PLAIN
+        if entries and entries[0]['type'] not in (0, 1):
+            logger.debug(f"  First compact entry is not HEAD (type={entries[0]['type']}), "
+                        f"may indicate parsing issue")
+        
+        # Validate pblk values — should be positive and within image bounds
+        # Check only the first HEAD entry as a quick sanity check
+        max_image_blocks = 0x1000000  # ~16M blocks = 64GB at 4K
+        first_head = next((e for e in entries if e['type'] in (0, 1)), None)
+        if first_head and (first_head['pblk'] == 0 or first_head['pblk'] > max_image_blocks):
+            logger.warning(f"Invalid first pblk={first_head['pblk']} in compact index for "
+                          f"nid={inode['nid']}, using fallback")
+            return self._compact_fallback_sequential(f, inode)
+        
+        # --- Step 6: Build pcluster list (HEAD + following NONHEADs) ---
+        pclusters = []
+        i = 0
+        while i < len(entries):
+            e = entries[i]
+            if e['type'] in (0, 1):  # PLAIN or HEAD
+                pc = {
+                    'head_lcn': i,
+                    'pblk': e['pblk'],
+                    'clusterofs': e['clusterofs'],
+                    'compressed': (e['type'] == self.Z_EROFS_VLE_CLUSTER_TYPE_HEAD),
+                    'lcluster_count': 1,
+                }
+                j = i + 1
+                while j < len(entries) and entries[j]['type'] == self.Z_EROFS_VLE_CLUSTER_TYPE_NONHEAD:
+                    pc['lcluster_count'] += 1
+                    j += 1
+                pclusters.append(pc)
+                i = j
+            else:
+                # Orphan NONHEAD (no preceding HEAD found) — skip
+                i += 1
+        
+        if not pclusters:
+            logger.warning(f"No pclusters built from compact index for nid={inode['nid']}, "
+                          f"using fallback")
+            return self._compact_fallback_sequential(f, inode)
+        
+        # --- Step 7: Determine physical block count per pcluster ---
+        for idx in range(len(pclusters)):
+            if idx + 1 < len(pclusters):
+                phys = pclusters[idx + 1]['pblk'] - pclusters[idx]['pblk']
+            else:
+                # Last pcluster: estimate from lcluster_count (conservative)
+                phys = pclusters[idx]['lcluster_count']
+            # Clamp to reasonable bounds
+            pclusters[idx]['phys_blocks'] = max(1, min(phys, 256))
+        
+        logger.debug(f"  Compact index: {len(pclusters)} pclusters, "
+                     f"{head_count} HEAD entries, {totalidx} total lclusters")
+        
+        # --- Step 8: Decompress and extract file data ---
+        result = bytearray()
+        
+        for pc in pclusters:
+            remaining = size - len(result)
+            if remaining <= 0:
+                break
+            
+            pblk = pc['pblk']
+            phys_blocks = pc['phys_blocks']
+            lcluster_cnt = pc['lcluster_count']
+            clusterofs = pc['clusterofs']
+            is_compressed = pc['compressed']
+            
+            decomp_size = lcluster_cnt * lcluster_size
+            phys_offset = pblk * self.block_size
+            read_size = phys_blocks * self.block_size
+            
+            f.seek(phys_offset)
+            raw_data = f.read(read_size)
+            
+            if not raw_data:
+                # Missing data — fill with zeros
+                result.extend(b'\x00' * min(decomp_size, remaining))
+                continue
+            
+            if is_compressed:
+                try:
+                    decompressed = self._lz4_decompress_block(raw_data, decomp_size)
+                except Exception:
+                    # If multi-block read failed, try single block
+                    if phys_blocks > 1:
+                        try:
+                            decompressed = self._lz4_decompress_block(
+                                raw_data[:self.block_size], decomp_size)
+                        except Exception:
+                            decompressed = raw_data
+                    else:
+                        decompressed = raw_data
+            else:
+                # PLAIN type — data stored uncompressed
+                decompressed = raw_data
+            
+            # Extract file data, skipping clusterofs overlap bytes
+            cofs = clusterofs if clusterofs < len(decompressed) else 0
+            chunk = decompressed[cofs:cofs + remaining]
+            result.extend(chunk)
+        
+        return bytes(result[:size])
+    
+    def _compact_fallback_sequential(self, f: BinaryIO, inode: dict) -> bytes:
+        """Fallback for when compact index parsing fails.
+        
+        For compressed inodes, raw_blkaddr = compressed_blocks (a count, NOT 
+        an address). Without a valid compress index, we cannot determine where
+        the compressed physical blocks are. Try legacy format as last resort.
+        """
+        import lz4.block
+        
+        size = inode['size']
+        inode_offset = self._nid_to_offset(inode['nid'])
+        
+        # Attempt to parse as legacy 8-byte entries starting right after the
+        # z_erofs_map_header (skip 8 bytes from the aligned index offset)
+        meta_offset = inode_offset + inode['inode_size']
+        if inode.get('xattr_icount', 0) > 0:
+            xattr_size = (inode['xattr_icount'] - 1) * 4 + 12
+            meta_offset += xattr_size
+        index_offset = (meta_offset + 7) & ~7
+        
+        lcluster_count = (size + self.block_size - 1) // self.block_size
+        
+        # Try reading as legacy index (skip the 8-byte map_header for layout=3)
+        f.seek(index_offset + 8)
+        index_data = f.read(lcluster_count * 8)
+        
+        if len(index_data) >= 8:
+            # Check if first entry looks like a valid legacy entry
+            advise0 = struct.unpack('<H', index_data[0:2])[0]
+            blkaddr0 = struct.unpack('<I', index_data[4:8])[0]
+            if (advise0 & 0xFFFC) == 0 and blkaddr0 > 0 and blkaddr0 < 0x1000000:
+                try:
+                    return self._decompress_from_legacy_index(f, inode, index_data, lcluster_count)
+                except Exception:
+                    pass
+        
+        # Also try without skipping map header (might be actual legacy data)
+        f.seek(index_offset)
+        index_data = f.read(lcluster_count * 8)
+        
+        if len(index_data) >= 8:
+            advise0 = struct.unpack('<H', index_data[0:2])[0]
+            blkaddr0 = struct.unpack('<I', index_data[4:8])[0]
+            if (advise0 & 0xFFFC) == 0 and blkaddr0 > 0 and blkaddr0 < 0x1000000:
+                try:
+                    return self._decompress_from_legacy_index(f, inode, index_data, lcluster_count)
+                except Exception:
+                    pass
+        
+        # Cannot determine compressed block locations — return zeros
+        logger.warning(f"Cannot extract compressed file nid={inode['nid']} ({size} bytes): "
+                      f"compact index parse failed and no legacy fallback available")
+        return b'\x00' * size
+    
+    def _decompress_from_legacy_index(self, f: BinaryIO, inode: dict,
+                                       index_data: bytes, lcluster_count: int) -> bytes:
+        """Decompress file data using legacy 8-byte compress index entries.
+        
+        Shared implementation for both COMPRESSED_FULL (layout=1) and 
+        COMPRESSED_COMPACT (layout=3) when the index is in legacy format.
+        """
+        import lz4.block
+        
+        size = inode['size']
+        
+        # Parse all compress index entries
+        entries = []
+        for i in range(lcluster_count):
+            off = i * 8
+            if off + 8 > len(index_data):
+                break
+            
+            advise = struct.unpack('<H', index_data[off:off+2])[0]
+            clusterofs = struct.unpack('<H', index_data[off+2:off+4])[0]
+            
+            lcluster_type = advise & 0x1  # bit 0: 0=HEAD, 1=NONHEAD
+            
+            if lcluster_type == 0:
+                blkaddr = struct.unpack('<I', index_data[off+4:off+8])[0]
+                entries.append({
+                    'type': 'HEAD',
+                    'blkaddr': blkaddr,
+                    'clusterofs': clusterofs,
+                    'advise': advise,
+                })
+            else:
+                delta0 = struct.unpack('<H', index_data[off+4:off+6])[0]
+                delta1 = struct.unpack('<H', index_data[off+6:off+8])[0]
+                entries.append({
+                    'type': 'NONHEAD',
+                    'delta0': delta0,
+                    'delta1': delta1,
+                    'clusterofs': clusterofs,
+                    'advise': advise,
+                })
+        
+        # Group by pclusters and decompress
+        result = bytearray()
+        i = 0
+        
+        while i < len(entries):
+            entry = entries[i]
+            
+            if entry['type'] != 'HEAD':
+                i += 1
+                continue
+            
+            blkaddr = entry['blkaddr']
+            
+            pcluster_lclusters = 1
+            j = i + 1
+            while j < len(entries) and entries[j]['type'] == 'NONHEAD':
+                pcluster_lclusters += 1
+                j += 1
+            
+            decomp_size = pcluster_lclusters * self.block_size
+            remaining_file = size - len(result)
+            if remaining_file <= 0:
+                break
+            
+            actual_decomp = min(decomp_size, remaining_file)
+            phys_blocks = pcluster_lclusters
+            
+            phys_offset = blkaddr * self.block_size
+            f.seek(phys_offset)
+            compressed_data = f.read(phys_blocks * self.block_size)
+            
+            if not compressed_data:
+                i = j
+                continue
             
             try:
-                # Try to decompress
-                decompressed = lz4.block.decompress(compressed_data, uncompressed_size=min(remaining, self.block_size * 4))
-                result.extend(decompressed[:remaining])
-                remaining -= len(decompressed)
-                data_offset += len(compressed_data)
-            except:
-                # If decompression fails, assume uncompressed
-                result.extend(compressed_data[:remaining])
-                remaining = 0
+                decompressed = self._lz4_decompress_block(compressed_data, decomp_size)
+            except Exception:
+                decompressed = None
+            
+            if decompressed is not None:
+                cofs = entry['clusterofs']
+                if cofs > 0 and cofs < len(decompressed):
+                    chunk = decompressed[cofs:]
+                else:
+                    chunk = decompressed
+                result.extend(chunk[:remaining_file])
+            else:
+                # Decompression failed — data might be stored uncompressed
+                cofs = entry['clusterofs']
+                if cofs > 0:
+                    chunk = compressed_data[cofs:]
+                else:
+                    chunk = compressed_data
+                result.extend(chunk[:remaining_file])
+                logger.debug(f"  LZ4 decompress failed for blkaddr={blkaddr}, using raw data")
+            
+            i = j
         
         return bytes(result[:size])
     
@@ -7426,6 +8083,1236 @@ class ErofsImageExtractor:
             pass
         
         return info
+
+
+class F2fsImageExtractor:
+    """Extract files from F2FS (Flash-Friendly File System) images.
+    
+    F2FS is a log-structured filesystem designed for NAND flash storage,
+    developed by Samsung and used in some Android devices.
+    
+    Superblock layout (at offset 1024 = 0x400):
+    - 0x00: magic (4 bytes) = 0xF2F52010
+    - 0x04: major_ver (2 bytes)
+    - 0x06: minor_ver (2 bytes)
+    - 0x08: log_sectorsize (4 bytes)
+    - 0x0C: log_sectors_per_block (4 bytes)
+    - 0x10: log_blocksize (4 bytes)
+    - 0x14: log_blocks_per_seg (4 bytes)
+    - 0x18: segs_per_sec (4 bytes)
+    - 0x1C: secs_per_zone (4 bytes)
+    - 0x20: checksum_offset (4 bytes)
+    - 0x24: block_count (8 bytes)
+    - 0x2C: section_count (4 bytes)
+    - 0x30: segment_count (4 bytes)
+    - 0x34: segment_count_ckpt (4 bytes)
+    - 0x38: segment_count_sit (4 bytes)
+    - 0x3C: segment_count_nat (4 bytes)
+    - 0x40: segment_count_ssa (4 bytes)
+    - 0x44: segment_count_main (4 bytes)
+    - 0x48: segment0_blkaddr (4 bytes)
+    - 0x4C: cp_blkaddr (4 bytes)
+    - 0x50: sit_blkaddr (4 bytes)
+    - 0x54: nat_blkaddr (4 bytes)
+    - 0x58: ssa_blkaddr (4 bytes)
+    - 0x5C: main_blkaddr (4 bytes)
+    - 0x60: root_ino (4 bytes)
+    - 0x64: node_ino (4 bytes)
+    - 0x68: meta_ino (4 bytes)
+    - 0x6C: uuid (16 bytes)
+    - 0x7C: volume_name (512 bytes, UTF-16LE, up to 256 chars)
+    """
+    
+    # F2FS constants
+    F2FS_SUPER_OFFSET = 1024  # 0x400
+    F2FS_SUPER_MAGIC = 0xF2F52010
+    F2FS_BLKSIZE = 4096
+    F2FS_LOG_BLOCK_SIZE = 12  # log2(4096)
+    
+    # Node footer size (last 24 bytes of every node block)
+    NODE_FOOTER_SIZE = 24
+    
+    # Inode address counts (for 4K blocks)
+    # Inode header: 360 bytes (i_addr starts at offset 0x168 = 360)
+    # Extra inode size: 0-variable, assume 0 for basic layout
+    # i_nid[5] at end (5 * 4 = 20 bytes)
+    # node_footer: 24 bytes
+    # So i_addr count = (4096 - 360 - 20 - 24) / 4 = 923
+    DEF_ADDRS_PER_INODE = 923
+    ADDRS_PER_BLOCK = 1018  # (4096 - 24) / 4
+    NIDS_PER_BLOCK = 1018   # (4096 - 24) / 4
+    DEF_NIDS_PER_INODE = 5  # 2 direct + 2 indirect + 1 double-indirect
+    
+    # NAT entry size: 1 (version) + 4 (ino) + 4 (block_addr) = 9 bytes
+    NAT_ENTRY_SIZE = 9
+    NAT_ENTRIES_PER_BLOCK = 455  # 4096 / 9 = 455 (with 1 byte slack)
+    
+    # File types (from f2fs_dir_entry->file_type)
+    F2FS_FT_UNKNOWN = 0
+    F2FS_FT_REG_FILE = 1
+    F2FS_FT_DIR = 2
+    F2FS_FT_CHRDEV = 3
+    F2FS_FT_BLKDEV = 4
+    F2FS_FT_FIFO = 5
+    F2FS_FT_SOCK = 6
+    F2FS_FT_SYMLINK = 7
+    
+    # Inode mode flags (same as Linux stat)
+    S_IFMT = 0o170000
+    S_IFREG = 0o100000
+    S_IFDIR = 0o040000
+    S_IFLNK = 0o120000
+    
+    # Inode inline flags (from i_inline field at offset 0xCD in inode)
+    F2FS_INLINE_DATA = 0x02
+    F2FS_INLINE_DENTRY = 0x04
+    F2FS_EXTRA_ATTR = 0x20
+    
+    # Checkpoint flags
+    CP_LARGE_NAT_BITMAP_FLAG = 0x00000400
+    CP_NAT_BITS_FLAG = 0x00000200
+    CP_COMPACT_SUM_FLAG = 0x00000008
+    
+    # Dentry block layout
+    # bitmap: 27 bytes + 3 padding = 32 bytes (214 bits for 214 slots)
+    # reserved: 0 bytes  
+    # dentry array: 214 * 11 = 2354 bytes
+    # filename array: 214 * 8 = 1712 bytes
+    # Total = 32 + 2354 + 1712 = 4098... but fits in 4096 with slightly fewer slots
+    # Actual: SIZE_OF_DENTRY_BITMAP = 27, NR_DENTRY_IN_BLOCK = 214
+    SIZE_OF_DENTRY_BITMAP = 27
+    NR_DENTRY_IN_BLOCK = 214
+    F2FS_SLOT_LEN = 8  # Max name bytes per slot
+    DENTRY_SIZE = 11    # sizeof(struct f2fs_dir_entry)
+    
+    # Inline dentry layout within inode
+    # Uses reserved space in inode block after the base inode fields
+    # NR_INLINE_DENTRY depends on available space
+    
+    def __init__(self, progress_callback: Optional[Callable] = None):
+        self.progress_callback = progress_callback
+        self.superblock = {}
+        self.block_size = self.F2FS_BLKSIZE
+        self.nat_blkaddr = 0
+        self.cp_blkaddr = 0
+        self.main_blkaddr = 0
+        self.root_ino = 0
+        self.segment_count_nat = 0
+        self.blocks_per_seg = 0
+        self._nat_cache = {}
+        self._checkpoint = {}
+    
+    @staticmethod
+    def is_f2fs(file_path: str) -> bool:
+        """Check if a file is an F2FS image."""
+        try:
+            with open(file_path, 'rb') as f:
+                f.seek(1024)
+                magic_bytes = f.read(4)
+                if len(magic_bytes) < 4:
+                    return False
+                magic = struct.unpack('<I', magic_bytes)[0]
+                return magic == F2fsImageExtractor.F2FS_SUPER_MAGIC
+        except:
+            return False
+    
+    F2FS_BACKUP_SUPER_OFFSET = 5120  # 0x1400 - backup superblock
+    
+    def _read_superblock(self, f: BinaryIO):
+        """Read and parse f2fs superblock at offset 1024.
+        
+        Falls back to backup superblock at offset 0x1400 if primary is invalid.
+        """
+        f.seek(self.F2FS_SUPER_OFFSET)
+        sb = f.read(512)  # Read enough for all fields
+        
+        magic = struct.unpack('<I', sb[0x00:0x04])[0]
+        if magic != self.F2FS_SUPER_MAGIC:
+            # Try backup superblock at 0x1400
+            logger.info("Primary F2FS superblock invalid, trying backup at 0x1400...")
+            f.seek(self.F2FS_BACKUP_SUPER_OFFSET)
+            sb = f.read(512)
+            magic = struct.unpack('<I', sb[0x00:0x04])[0]
+            if magic != self.F2FS_SUPER_MAGIC:
+                raise PayloadError(f"Invalid F2FS magic at both primary and backup: {hex(magic)}")
+        
+        self.superblock = {
+            'magic': magic,
+            'major_ver': struct.unpack('<H', sb[0x04:0x06])[0],
+            'minor_ver': struct.unpack('<H', sb[0x06:0x08])[0],
+            'log_sectorsize': struct.unpack('<I', sb[0x08:0x0C])[0],
+            'log_sectors_per_block': struct.unpack('<I', sb[0x0C:0x10])[0],
+            'log_blocksize': struct.unpack('<I', sb[0x10:0x14])[0],
+            'log_blocks_per_seg': struct.unpack('<I', sb[0x14:0x18])[0],
+            'segs_per_sec': struct.unpack('<I', sb[0x18:0x1C])[0],
+            'secs_per_zone': struct.unpack('<I', sb[0x1C:0x20])[0],
+            'checksum_offset': struct.unpack('<I', sb[0x20:0x24])[0],
+            'block_count': struct.unpack('<Q', sb[0x24:0x2C])[0],
+            'section_count': struct.unpack('<I', sb[0x2C:0x30])[0],
+            'segment_count': struct.unpack('<I', sb[0x30:0x34])[0],
+            'segment_count_ckpt': struct.unpack('<I', sb[0x34:0x38])[0],
+            'segment_count_sit': struct.unpack('<I', sb[0x38:0x3C])[0],
+            'segment_count_nat': struct.unpack('<I', sb[0x3C:0x40])[0],
+            'segment_count_ssa': struct.unpack('<I', sb[0x40:0x44])[0],
+            'segment_count_main': struct.unpack('<I', sb[0x44:0x48])[0],
+            'segment0_blkaddr': struct.unpack('<I', sb[0x48:0x4C])[0],
+            'cp_blkaddr': struct.unpack('<I', sb[0x4C:0x50])[0],
+            'sit_blkaddr': struct.unpack('<I', sb[0x50:0x54])[0],
+            'nat_blkaddr': struct.unpack('<I', sb[0x54:0x58])[0],
+            'ssa_blkaddr': struct.unpack('<I', sb[0x58:0x5C])[0],
+            'main_blkaddr': struct.unpack('<I', sb[0x5C:0x60])[0],
+            'root_ino': struct.unpack('<I', sb[0x60:0x64])[0],
+            'node_ino': struct.unpack('<I', sb[0x64:0x68])[0],
+            'meta_ino': struct.unpack('<I', sb[0x68:0x6C])[0],
+        }
+        
+        # UUID (16 bytes)
+        uuid_bytes = sb[0x6C:0x7C]
+        self.superblock['uuid'] = '-'.join([
+            uuid_bytes[0:4].hex(),
+            uuid_bytes[4:6].hex(),
+            uuid_bytes[6:8].hex(),
+            uuid_bytes[8:10].hex(),
+            uuid_bytes[10:16].hex(),
+        ])
+        
+        # Volume name (512 bytes UTF-16LE starting at 0x7C, up to 256 chars)
+        name_data = sb[0x7C:0x7C + 512] if len(sb) >= 0x7C + 512 else sb[0x7C:]
+        try:
+            self.superblock['volume_name'] = name_data.decode('utf-16-le').rstrip('\x00').strip()
+        except:
+            self.superblock['volume_name'] = ''
+        
+        # Set derived values
+        self.block_size = 1 << self.superblock['log_blocksize']
+        self.blocks_per_seg = 1 << self.superblock['log_blocks_per_seg']
+        self.nat_blkaddr = self.superblock['nat_blkaddr']
+        self.cp_blkaddr = self.superblock['cp_blkaddr']
+        self.main_blkaddr = self.superblock['main_blkaddr']
+        self.root_ino = self.superblock['root_ino']
+        self.segment_count_nat = self.superblock['segment_count_nat']
+        
+        self._nat_cache = {}
+    
+    def _read_checkpoint(self, f: BinaryIO):
+        """Read the f2fs checkpoint to determine current NAT state.
+        
+        F2FS has two checkpoint packs; the one with the higher version is current.
+        """
+        cp_blkaddr = self.cp_blkaddr
+        
+        # Read first checkpoint header (first block of CP area)
+        f.seek(cp_blkaddr * self.block_size)
+        cp1_data = f.read(self.block_size)
+        
+        cp1_ver = struct.unpack('<Q', cp1_data[0x00:0x08])[0]
+        cp1_nat_upd_blkoffs = struct.unpack('<I', cp1_data[0x28:0x2C])[0]
+        cp1_ckpt_flags = struct.unpack('<I', cp1_data[0x24:0x28])[0]
+        cp1_cp_pack_total_block_count = struct.unpack('<I', cp1_data[0x08:0x0C])[0]
+        
+        # Second checkpoint pack is after the first (segment_count_ckpt segments)
+        cp2_start = cp_blkaddr + self.superblock['segment_count_ckpt'] * self.blocks_per_seg // 2
+        f.seek(cp2_start * self.block_size)
+        cp2_data = f.read(self.block_size)
+        
+        cp2_ver = struct.unpack('<Q', cp2_data[0x00:0x08])[0]
+        
+        # Use the checkpoint with higher version number
+        if cp2_ver > cp1_ver:
+            self._checkpoint = {
+                'version': cp2_ver,
+                'flags': struct.unpack('<I', cp2_data[0x24:0x28])[0],
+                'nat_upd_blkoffs': struct.unpack('<I', cp2_data[0x28:0x2C])[0],
+                'data': cp2_data,
+                'pack': 2,
+            }
+        else:
+            self._checkpoint = {
+                'version': cp1_ver,
+                'flags': cp1_ckpt_flags,
+                'nat_upd_blkoffs': cp1_nat_upd_blkoffs,
+                'data': cp1_data,
+                'pack': 1,
+            }
+    
+    def _get_nat_block_addr(self, nid: int) -> int:
+        """Calculate which NAT block contains the entry for a given node ID.
+        
+        F2FS NAT area has two sets of blocks. Based on the checkpoint, 
+        we know which set is current for each NAT block.
+        The NAT area spans segment_count_nat segments.
+        
+        Returns the on-disk block address of the NAT block containing nid's entry.
+        """
+        # Which entry index within the NAT
+        nat_block_offset = nid // self.NAT_ENTRIES_PER_BLOCK
+        
+        # The NAT area is divided into two sets (for journaling)
+        # Total NAT blocks = segment_count_nat * blocks_per_seg
+        total_nat_blocks = self.segment_count_nat * self.blocks_per_seg
+        half_nat_blocks = total_nat_blocks // 2
+        
+        # Simple approach: use the first set as primary
+        # (For a read-only extractor, the first set is typically valid after clean unmount)
+        if nat_block_offset < half_nat_blocks:
+            block_addr = self.nat_blkaddr + nat_block_offset
+        else:
+            # Wrap around to second set
+            block_addr = self.nat_blkaddr + half_nat_blocks + (nat_block_offset - half_nat_blocks)
+        
+        return block_addr
+    
+    def _read_nat_entry(self, f: BinaryIO, nid: int) -> Optional[dict]:
+        """Read a NAT entry for the given node ID.
+        
+        NAT entry format (9 bytes):
+        - version: 1 byte
+        - ino: 4 bytes (little-endian)
+        - block_addr: 4 bytes (little-endian)
+        
+        Returns dict with 'version', 'ino', 'block_addr' or None if invalid.
+        """
+        if nid in self._nat_cache:
+            return self._nat_cache[nid]
+        
+        if nid == 0:
+            return None
+        
+        nat_block_addr = self._get_nat_block_addr(nid)
+        entry_index = nid % self.NAT_ENTRIES_PER_BLOCK
+        
+        f.seek(nat_block_addr * self.block_size + entry_index * self.NAT_ENTRY_SIZE)
+        entry_data = f.read(self.NAT_ENTRY_SIZE)
+        
+        if len(entry_data) < self.NAT_ENTRY_SIZE:
+            return None
+        
+        version = entry_data[0]
+        ino = struct.unpack('<I', entry_data[1:5])[0]
+        block_addr = struct.unpack('<I', entry_data[5:9])[0]
+        
+        # NULL_ADDR = 0, NEW_ADDR = -1 (0xFFFFFFFF)
+        if block_addr == 0 or block_addr == 0xFFFFFFFF:
+            return None
+        
+        entry = {
+            'version': version,
+            'ino': ino,
+            'block_addr': block_addr,
+        }
+        self._nat_cache[nid] = entry
+        return entry
+    
+    def _read_node_block(self, f: BinaryIO, block_addr: int) -> Optional[bytes]:
+        """Read a full node block (4096 bytes) from a block address."""
+        if block_addr == 0 or block_addr == 0xFFFFFFFF:
+            return None
+        
+        f.seek(block_addr * self.block_size)
+        data = f.read(self.block_size)
+        
+        if len(data) < self.block_size:
+            return None
+        
+        return data
+    
+    def _read_inode(self, f: BinaryIO, nid: int) -> Optional[dict]:
+        """Read an inode by its node ID (looks up via NAT).
+        
+        F2FS inode layout within a node block (4096 bytes):
+        - 0x00: i_mode (2 bytes)
+        - 0x02: i_advise (1 byte)
+        - 0x03: i_inline (1 byte)  -- inline flags
+        - 0x04: i_uid (4 bytes)
+        - 0x08: i_gid (4 bytes)
+        - 0x0C: i_links (4 bytes)
+        - 0x10: i_size (8 bytes)
+        - 0x18: i_blocks (8 bytes)
+        - 0x20: i_atime (8 bytes)
+        - 0x28: i_ctime (8 bytes)
+        - 0x30: i_mtime (8 bytes)
+        - 0x38: i_atime_nsec (4 bytes)
+        - 0x3C: i_ctime_nsec (4 bytes)
+        - 0x40: i_mtime_nsec (4 bytes)
+        - 0x44: i_generation (4 bytes)  
+        - 0x48: i_current_depth (4 bytes) (for directories, depth of hash tree)
+        - 0x4C: i_xattr_nid (4 bytes)
+        - 0x50: i_flags (4 bytes)
+        - 0x54: i_pino (4 bytes) (parent inode number)
+        - 0x58: i_namelen (4 bytes)
+        - 0x5C: i_name (255 bytes, UTF-8)
+        - ...
+        - 0x168: i_addr[DEF_ADDRS_PER_INODE] (923 * 4 = 3692 bytes)
+        - i_nid[5] (5 * 4 = 20 bytes)  -- direct/indirect node IDs
+        - node_footer (24 bytes) -- last 24 bytes of block
+        """
+        nat_entry = self._read_nat_entry(f, nid)
+        if not nat_entry:
+            return None
+        
+        data = self._read_node_block(f, nat_entry['block_addr'])
+        if not data:
+            return None
+        
+        mode = struct.unpack('<H', data[0x00:0x02])[0]
+        i_inline = data[0x03]
+        size = struct.unpack('<Q', data[0x10:0x18])[0]
+        blocks = struct.unpack('<Q', data[0x18:0x20])[0]
+        i_flags = struct.unpack('<I', data[0x50:0x54])[0]
+        current_depth = struct.unpack('<I', data[0x48:0x4C])[0]
+        namelen = struct.unpack('<I', data[0x58:0x5C])[0]
+        
+        # Name (up to 255 bytes)
+        name = ''
+        if namelen > 0 and namelen <= 255:
+            try:
+                name = data[0x5C:0x5C + namelen].decode('utf-8', errors='replace')
+            except:
+                name = ''
+        
+        # Extra inode space check
+        i_extra_isize = 0
+        has_extra = bool(i_inline & self.F2FS_EXTRA_ATTR)
+        if has_extra:
+            # i_extra_isize is at offset 0x15B (after i_name)
+            # Actually it's at the start of the extra attribute area
+            # The extra area starts right after the base inode fields
+            # In practice, offset 0x15C (right after i_name[255]) 
+            try:
+                i_extra_isize = struct.unpack('<H', data[0x15C:0x15E])[0]
+            except:
+                i_extra_isize = 0
+        
+        # Calculate i_addr offset and count
+        # Base offset for i_addr is 0x168 (360 bytes from start)
+        addr_offset = 0x168
+        if has_extra and i_extra_isize > 0:
+            addr_offset = 0x168 + i_extra_isize
+        
+        # Node footer starts at block_size - 24
+        footer_offset = self.block_size - self.NODE_FOOTER_SIZE
+        
+        # i_nid[5] is right before the footer (5 * 4 = 20 bytes)
+        nid_offset = footer_offset - 20
+        
+        # Number of direct addr entries
+        addr_count = (nid_offset - addr_offset) // 4
+        
+        # Read direct block addresses
+        addrs = []
+        for i in range(min(addr_count, self.DEF_ADDRS_PER_INODE)):
+            off = addr_offset + i * 4
+            if off + 4 <= nid_offset:
+                addr = struct.unpack('<I', data[off:off + 4])[0]
+                addrs.append(addr)
+        
+        # Read i_nid[5]
+        nids = []
+        for i in range(self.DEF_NIDS_PER_INODE):
+            off = nid_offset + i * 4
+            if off + 4 <= footer_offset:
+                nid_val = struct.unpack('<I', data[off:off + 4])[0]
+                nids.append(nid_val)
+        
+        # Node footer
+        footer_nid = struct.unpack('<I', data[footer_offset:footer_offset + 4])[0]
+        footer_ino = struct.unpack('<I', data[footer_offset + 4:footer_offset + 8])[0]
+        
+        inode = {
+            'mode': mode,
+            'size': size,
+            'blocks': blocks,
+            'flags': i_flags,
+            'inline': i_inline,
+            'name': name,
+            'current_depth': current_depth,
+            'addrs': addrs,
+            'nids': nids,
+            'raw_data': data,
+            'addr_offset': addr_offset,
+            'nid_offset': nid_offset,
+        }
+        
+        return inode
+    
+    def _is_dir(self, inode: dict) -> bool:
+        return (inode['mode'] & self.S_IFMT) == self.S_IFDIR
+    
+    def _is_file(self, inode: dict) -> bool:
+        return (inode['mode'] & self.S_IFMT) == self.S_IFREG
+    
+    def _is_symlink(self, inode: dict) -> bool:
+        return (inode['mode'] & self.S_IFMT) == self.S_IFLNK
+    
+    def _read_block(self, f: BinaryIO, block_addr: int) -> Optional[bytes]:
+        """Read a data block by block address."""
+        if block_addr == 0 or block_addr == 0xFFFFFFFF:
+            return None
+        f.seek(block_addr * self.block_size)
+        return f.read(self.block_size)
+    
+    def _read_file_data(self, f: BinaryIO, inode: dict) -> bytes:
+        """Read all data blocks for a file inode.
+        
+        Handles inline data, direct block addresses, and indirect/double-indirect nodes.
+        """
+        size = inode['size']
+        if size == 0:
+            return b''
+        
+        # Check for inline data (small files stored in inode block)
+        if inode['inline'] & self.F2FS_INLINE_DATA:
+            # Inline data is stored in the i_addr area of the inode
+            raw = inode['raw_data']
+            addr_offset = inode['addr_offset']
+            # Inline data starts at addr_offset + 1 (skip reserved byte)
+            data_start = addr_offset + 4  # Skip first addr entry used as inline indicator
+            # Available space = up to nid_offset
+            available = inode['nid_offset'] - data_start
+            data = raw[data_start:data_start + min(size, available)]
+            return data[:size]
+        
+        data = bytearray()
+        remaining = size
+        
+        # 1. Direct block addresses from inode
+        for addr in inode['addrs']:
+            if remaining <= 0:
+                break
+            if addr == 0 or addr == 0xFFFFFFFF:
+                # Hole - zero fill
+                chunk = min(remaining, self.block_size)
+                data.extend(b'\x00' * chunk)
+                remaining -= chunk
+                continue
+            
+            block_data = self._read_block(f, addr)
+            if block_data:
+                chunk = min(remaining, len(block_data))
+                data.extend(block_data[:chunk])
+                remaining -= chunk
+            else:
+                chunk = min(remaining, self.block_size)
+                data.extend(b'\x00' * chunk)
+                remaining -= chunk
+        
+        if remaining <= 0:
+            return bytes(data[:size])
+        
+        # 2. Indirect nodes (nids[0] and nids[1] are direct node IDs)
+        for i in range(2):  # nids[0], nids[1]
+            if remaining <= 0:
+                break
+            if i >= len(inode['nids']) or inode['nids'][i] == 0:
+                continue
+            remaining = self._read_direct_node_data(f, inode['nids'][i], data, remaining)
+        
+        if remaining <= 0:
+            return bytes(data[:size])
+        
+        # 3. Indirect node IDs (nids[2] and nids[3] are indirect node IDs)
+        for i in range(2, 4):
+            if remaining <= 0:
+                break
+            if i >= len(inode['nids']) or inode['nids'][i] == 0:
+                continue
+            remaining = self._read_indirect_node_data(f, inode['nids'][i], data, remaining)
+        
+        if remaining <= 0:
+            return bytes(data[:size])
+        
+        # 4. Double-indirect node (nids[4])
+        if len(inode['nids']) > 4 and inode['nids'][4] != 0:
+            remaining = self._read_double_indirect_node_data(f, inode['nids'][4], data, remaining)
+        
+        return bytes(data[:size])
+    
+    def _read_direct_node_data(self, f: BinaryIO, nid: int, data: bytearray, remaining: int) -> int:
+        """Read data blocks from a direct node (contains block addresses).
+        
+        A direct node block has ADDRS_PER_BLOCK addresses + node_footer.
+        """
+        nat_entry = self._read_nat_entry(f, nid)
+        if not nat_entry:
+            return remaining
+        
+        node_data = self._read_node_block(f, nat_entry['block_addr'])
+        if not node_data:
+            return remaining
+        
+        # Direct node: block addresses fill the block up to the footer
+        footer_offset = self.block_size - self.NODE_FOOTER_SIZE
+        addr_count = footer_offset // 4
+        
+        for i in range(min(addr_count, self.ADDRS_PER_BLOCK)):
+            if remaining <= 0:
+                break
+            
+            off = i * 4
+            if off + 4 > footer_offset:
+                break
+            
+            addr = struct.unpack('<I', node_data[off:off + 4])[0]
+            if addr == 0 or addr == 0xFFFFFFFF:
+                chunk = min(remaining, self.block_size)
+                data.extend(b'\x00' * chunk)
+                remaining -= chunk
+            else:
+                block_data = self._read_block(f, addr)
+                if block_data:
+                    chunk = min(remaining, len(block_data))
+                    data.extend(block_data[:chunk])
+                    remaining -= chunk
+                else:
+                    chunk = min(remaining, self.block_size)
+                    data.extend(b'\x00' * chunk)
+                    remaining -= chunk
+        
+        return remaining
+    
+    def _read_indirect_node_data(self, f: BinaryIO, nid: int, data: bytearray, remaining: int) -> int:
+        """Read data from an indirect node (contains node IDs pointing to direct nodes)."""
+        nat_entry = self._read_nat_entry(f, nid)
+        if not nat_entry:
+            return remaining
+        
+        node_data = self._read_node_block(f, nat_entry['block_addr'])
+        if not node_data:
+            return remaining
+        
+        footer_offset = self.block_size - self.NODE_FOOTER_SIZE
+        nid_count = footer_offset // 4
+        
+        for i in range(min(nid_count, self.NIDS_PER_BLOCK)):
+            if remaining <= 0:
+                break
+            
+            off = i * 4
+            if off + 4 > footer_offset:
+                break
+            
+            child_nid = struct.unpack('<I', node_data[off:off + 4])[0]
+            if child_nid == 0:
+                continue
+            remaining = self._read_direct_node_data(f, child_nid, data, remaining)
+        
+        return remaining
+    
+    def _read_double_indirect_node_data(self, f: BinaryIO, nid: int, data: bytearray, remaining: int) -> int:
+        """Read data from a double-indirect node (nid -> indirect nodes -> direct nodes)."""
+        nat_entry = self._read_nat_entry(f, nid)
+        if not nat_entry:
+            return remaining
+        
+        node_data = self._read_node_block(f, nat_entry['block_addr'])
+        if not node_data:
+            return remaining
+        
+        footer_offset = self.block_size - self.NODE_FOOTER_SIZE
+        nid_count = footer_offset // 4
+        
+        for i in range(min(nid_count, self.NIDS_PER_BLOCK)):
+            if remaining <= 0:
+                break
+            
+            off = i * 4
+            if off + 4 > footer_offset:
+                break
+            
+            child_nid = struct.unpack('<I', node_data[off:off + 4])[0]
+            if child_nid == 0:
+                continue
+            remaining = self._read_indirect_node_data(f, child_nid, data, remaining)
+        
+        return remaining
+    
+    def _read_dentry_block(self, f: BinaryIO, block_addr: int) -> list[dict]:
+        """Parse a f2fs directory entry block.
+        
+        Layout of a dentry block (4096 bytes):
+        - bitmap: 27 bytes (1 bit per dentry slot, 214 slots)
+        - padding: 3 bytes
+        - reserved: 2 bytes
+        - dentry array: 214 * 11 bytes
+        - filename array: 214 * F2FS_SLOT_LEN bytes
+        
+        Each dentry is 11 bytes:
+        - hash_code: 4 bytes
+        - ino: 4 bytes
+        - name_len: 2 bytes
+        - file_type: 1 byte
+        """
+        block_data = self._read_block(f, block_addr)
+        if not block_data:
+            return []
+        
+        entries = []
+        
+        # Parse bitmap (27 bytes = 216 bits, but only 214 used)
+        bitmap = block_data[0:self.SIZE_OF_DENTRY_BITMAP]
+        
+        # Dentry array starts at offset 32 (27 bitmap + 3 padding + 2 reserved)
+        dentry_offset = 32
+        # Filename array starts after dentry array
+        fname_offset = dentry_offset + self.NR_DENTRY_IN_BLOCK * self.DENTRY_SIZE
+        
+        i = 0
+        while i < self.NR_DENTRY_IN_BLOCK:
+            # Check bitmap
+            byte_idx = i // 8
+            bit_idx = i % 8
+            if byte_idx >= len(bitmap):
+                break
+            
+            if not (bitmap[byte_idx] & (1 << bit_idx)):
+                i += 1
+                continue
+            
+            # Read dentry
+            d_off = dentry_offset + i * self.DENTRY_SIZE
+            if d_off + self.DENTRY_SIZE > len(block_data):
+                break
+            
+            hash_code = struct.unpack('<I', block_data[d_off:d_off + 4])[0]
+            ino = struct.unpack('<I', block_data[d_off + 4:d_off + 8])[0]
+            name_len = struct.unpack('<H', block_data[d_off + 8:d_off + 10])[0]
+            file_type = block_data[d_off + 10]
+            
+            if ino == 0 or name_len == 0:
+                i += 1
+                continue
+            
+            # Read filename (spans multiple slots if needed)
+            slots_needed = (name_len + self.F2FS_SLOT_LEN - 1) // self.F2FS_SLOT_LEN
+            f_off = fname_offset + i * self.F2FS_SLOT_LEN
+            name_data = block_data[f_off:f_off + name_len]
+            
+            try:
+                name = name_data.decode('utf-8', errors='replace')
+            except:
+                name = f'<ino_{ino}>'
+            
+            # Skip . and ..
+            if name not in ('.', '..'):
+                entries.append({
+                    'name': name,
+                    'ino': ino,
+                    'file_type': file_type,
+                    'hash_code': hash_code,
+                })
+            
+            # Skip to next entry (account for multi-slot names)
+            i += max(1, slots_needed)
+        
+        return entries
+    
+    def _read_inline_dentry(self, inode: dict) -> list[dict]:
+        """Read inline directory entries stored within the inode block.
+        
+        When F2FS_INLINE_DENTRY is set, the directory entries are stored
+        in the i_addr area of the inode.
+        """
+        raw = inode['raw_data']
+        addr_offset = inode['addr_offset']
+        nid_offset = inode['nid_offset']
+        
+        # Available space for inline dentry
+        available = nid_offset - addr_offset
+        if available < 32:  # Need at least bitmap + some entries
+            return []
+        
+        dentry_data = raw[addr_offset:nid_offset]
+        
+        # Inline dentry has a similar layout but smaller
+        # NR_INLINE_DENTRY = available / (bitmap_ratio + entry_size + name_size)
+        # Simplified: bitmap + dentry array + filename array
+        # The bitmap size is (nr_entries + 7) / 8, rounded
+        # For inline, typically ~61 entries fit
+        
+        # Calculate inline capacity
+        # Each entry needs: 1/8 bitmap bit + 11 dentry bytes + 8 fname bytes ≈ 19.125 bytes
+        nr_inline = (available - 4) * 8 // (8 * (self.DENTRY_SIZE + self.F2FS_SLOT_LEN) + 1)
+        if nr_inline <= 0:
+            return []
+        if nr_inline > 214:
+            nr_inline = 214
+        
+        bitmap_size = (nr_inline + 7) // 8
+        bitmap = dentry_data[0:bitmap_size]
+        
+        # Pad bitmap to align
+        bitmap_aligned = ((bitmap_size + 3) // 4) * 4
+        
+        dentry_start = bitmap_aligned
+        fname_start = dentry_start + nr_inline * self.DENTRY_SIZE
+        
+        entries = []
+        i = 0
+        while i < nr_inline:
+            byte_idx = i // 8
+            bit_idx = i % 8
+            if byte_idx >= len(bitmap):
+                break
+            
+            if not (bitmap[byte_idx] & (1 << bit_idx)):
+                i += 1
+                continue
+            
+            d_off = dentry_start + i * self.DENTRY_SIZE
+            if d_off + self.DENTRY_SIZE > len(dentry_data):
+                break
+            
+            hash_code = struct.unpack('<I', dentry_data[d_off:d_off + 4])[0]
+            ino = struct.unpack('<I', dentry_data[d_off + 4:d_off + 8])[0]
+            name_len = struct.unpack('<H', dentry_data[d_off + 8:d_off + 10])[0]
+            file_type = dentry_data[d_off + 10]
+            
+            if ino == 0 or name_len == 0:
+                i += 1
+                continue
+            
+            slots_needed = (name_len + self.F2FS_SLOT_LEN - 1) // self.F2FS_SLOT_LEN
+            f_off = fname_start + i * self.F2FS_SLOT_LEN
+            name_data = dentry_data[f_off:f_off + name_len]
+            
+            try:
+                name = name_data.decode('utf-8', errors='replace')
+            except:
+                name = f'<ino_{ino}>'
+            
+            if name not in ('.', '..'):
+                entries.append({
+                    'name': name,
+                    'ino': ino,
+                    'file_type': file_type,
+                    'hash_code': hash_code,
+                })
+            
+            i += max(1, slots_needed)
+        
+        return entries
+    
+    def _read_directory_entries(self, f: BinaryIO, inode: dict) -> list[dict]:
+        """Read all directory entries from a directory inode.
+        
+        Handles both inline dentries and block-based dentries.
+        """
+        # Check for inline dentry
+        if inode['inline'] & self.F2FS_INLINE_DENTRY:
+            return self._read_inline_dentry(inode)
+        
+        entries = []
+        
+        # Read dentry blocks from direct addresses
+        for addr in inode['addrs']:
+            if addr == 0 or addr == 0xFFFFFFFF:
+                continue
+            block_entries = self._read_dentry_block(f, addr)
+            entries.extend(block_entries)
+        
+        # Also check indirect node IDs for large directories
+        for i in range(2):  # nids[0], nids[1] are direct nodes
+            if i >= len(inode['nids']) or inode['nids'][i] == 0:
+                continue
+            nat_entry = self._read_nat_entry(f, inode['nids'][i])
+            if not nat_entry:
+                continue
+            node_data = self._read_node_block(f, nat_entry['block_addr'])
+            if not node_data:
+                continue
+            
+            footer_offset = self.block_size - self.NODE_FOOTER_SIZE
+            addr_count = footer_offset // 4
+            
+            for j in range(min(addr_count, self.ADDRS_PER_BLOCK)):
+                off = j * 4
+                if off + 4 > footer_offset:
+                    break
+                addr = struct.unpack('<I', node_data[off:off + 4])[0]
+                if addr == 0 or addr == 0xFFFFFFFF:
+                    continue
+                block_entries = self._read_dentry_block(f, addr)
+                entries.extend(block_entries)
+        
+        return entries
+    
+    def _list_directory(self, f: BinaryIO, nid: int, prefix: str, 
+                        files: list, depth: int = 0, max_depth: int = -1):
+        """Recursively list directory contents."""
+        if max_depth >= 0 and depth > max_depth:
+            return
+        
+        inode = self._read_inode(f, nid)
+        if not inode or not self._is_dir(inode):
+            return
+        
+        entries = self._read_directory_entries(f, inode)
+        
+        for entry in entries:
+            name = entry['name']
+            ino = entry['ino']
+            file_type = entry['file_type']
+            
+            full_path = f"{prefix}/{name}" if prefix else name
+            
+            if file_type == self.F2FS_FT_DIR:
+                files.append({
+                    'path': full_path,
+                    'name': name,
+                    'size': 0,
+                    'type': 'directory',
+                    'ino': ino,
+                })
+                # Recurse into subdirectory
+                self._list_directory(f, ino, full_path, files, depth + 1, max_depth)
+            elif file_type == self.F2FS_FT_SYMLINK:
+                child_inode = self._read_inode(f, ino)
+                target = ''
+                if child_inode:
+                    try:
+                        target = self._read_file_data(f, child_inode).decode('utf-8', errors='replace')
+                    except:
+                        pass
+                files.append({
+                    'path': full_path,
+                    'name': name,
+                    'size': 0,
+                    'type': 'symlink',
+                    'target': target,
+                    'ino': ino,
+                })
+            else:
+                child_inode = self._read_inode(f, ino)
+                file_size = child_inode['size'] if child_inode else 0
+                files.append({
+                    'path': full_path,
+                    'name': name,
+                    'size': file_size,
+                    'type': 'file',
+                    'ino': ino,
+                })
+    
+    def _extract_directory(self, f: BinaryIO, nid: int, prefix: str,
+                           output_dir: str, file_list: Optional[list[str]],
+                           extracted: dict):
+        """Recursively extract directory contents."""
+        inode = self._read_inode(f, nid)
+        if not inode or not self._is_dir(inode):
+            return
+        
+        entries = self._read_directory_entries(f, inode)
+        
+        for entry in entries:
+            name = entry['name']
+            ino = entry['ino']
+            file_type = entry['file_type']
+            
+            full_path = f"{prefix}/{name}" if prefix else name
+            
+            # Skip if file_list provided and this file isn't in it
+            if file_list and full_path not in file_list:
+                # But still recurse into directories to find nested matches
+                if file_type == self.F2FS_FT_DIR:
+                    self._extract_directory(f, ino, full_path, output_dir, file_list, extracted)
+                continue
+            
+            output_path = Path(output_dir) / full_path
+            
+            try:
+                if file_type == self.F2FS_FT_DIR:
+                    output_path.mkdir(parents=True, exist_ok=True)
+                    self._extract_directory(f, ino, full_path, output_dir, file_list, extracted)
+                
+                elif file_type == self.F2FS_FT_SYMLINK:
+                    child_inode = self._read_inode(f, ino)
+                    if child_inode:
+                        target = self._read_file_data(f, child_inode).decode('utf-8', errors='replace')
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        link_file = output_path.with_suffix(output_path.suffix + '.symlink')
+                        link_file.write_text(f"SYMLINK -> {target}")
+                        extracted['files'][full_path] = str(link_file)
+                        logger.info(f"  Extracted symlink: {full_path} -> {target}")
+                
+                else:  # Regular file
+                    child_inode = self._read_inode(f, ino)
+                    if child_inode:
+                        file_data = self._read_file_data(f, child_inode)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(str(_win_long_path(str(output_path))), 'wb') as out_f:
+                            out_f.write(file_data)
+                        extracted['files'][full_path] = str(output_path)
+                        logger.info(f"  Extracted: {full_path} ({len(file_data)} bytes)")
+                        
+                        if self.progress_callback:
+                            self.progress_callback(len(extracted['files']), 0,
+                                                   f"Extracting: {name}")
+            
+            except Exception as e:
+                extracted['errors'].append(f"{full_path}: {e}")
+                logger.warning(f"  Error extracting {full_path}: {e}")
+    
+    def analyze(self, input_path: str) -> dict:
+        """Analyze an F2FS image and return metadata."""
+        info = {
+            'type': 'f2fs',
+            'valid': False,
+        }
+        
+        try:
+            with open(input_path, 'rb') as f:
+                self._read_superblock(f)
+                self._read_checkpoint(f)
+                
+                info['valid'] = True
+                info['block_size'] = self.block_size
+                info['block_count'] = self.superblock.get('block_count', 0)
+                info['segment_count'] = self.superblock.get('segment_count', 0)
+                info['version'] = (f"{self.superblock.get('major_ver', 0)}."
+                                   f"{self.superblock.get('minor_ver', 0)}")
+                info['volume_name'] = self.superblock.get('volume_name', '')
+                info['uuid'] = self.superblock.get('uuid', '')
+                info['root_ino'] = self.root_ino
+                info['checkpoint_version'] = self._checkpoint.get('version', 0)
+                
+                # Compute size
+                total_bytes = info['block_count'] * self.block_size
+                info['total_size_mb'] = total_bytes / (1024 * 1024)
+                
+                # Segment layout info
+                info['segments'] = {
+                    'checkpoint': self.superblock.get('segment_count_ckpt', 0),
+                    'sit': self.superblock.get('segment_count_sit', 0),
+                    'nat': self.superblock.get('segment_count_nat', 0),
+                    'ssa': self.superblock.get('segment_count_ssa', 0),
+                    'main': self.superblock.get('segment_count_main', 0),
+                }
+                
+                # Count root directory entries
+                root_inode = self._read_inode(f, self.root_ino)
+                if root_inode:
+                    info['root_inode_size'] = root_inode['size']
+                    entries = self._read_directory_entries(f, root_inode)
+                    info['root_entries'] = len(entries)
+                    
+        except Exception as e:
+            info['error'] = str(e)
+            logger.error(f"Failed to analyze F2FS: {e}")
+        
+        return info
+    
+    def list_files(self, input_path: str, max_depth: int = -1) -> list[dict]:
+        """List all files in an F2FS image."""
+        files = []
+        
+        with open(input_path, 'rb') as f:
+            self._read_superblock(f)
+            self._read_checkpoint(f)
+            self._list_directory(f, self.root_ino, '', files, 0, max_depth)
+        
+        return files
+    
+    def extract(self, input_path: str, output_dir: str,
+                file_list: Optional[list[str]] = None,
+                use_native: bool = False) -> dict:
+        """Extract files from F2FS image.
+        
+        Args:
+            input_path: Path to F2FS image
+            output_dir: Output directory for extracted files
+            file_list: Optional list of specific files to extract
+            use_native: Force pure Python extraction (skip fsck.f2fs)
+            
+        Returns:
+            Dict with 'files', 'errors', 'skipped', 'method' keys
+        """
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        extracted = {'files': {}, 'errors': [], 'skipped': [], 'method': 'unknown'}
+        
+        # Try dump.f2fs or fsck.f2fs first (more reliable for complex images)
+        if not use_native and file_list is None:
+            fsck_info = self._find_fsck_f2fs()
+            if fsck_info:
+                logger.info(f"Using {fsck_info['tool']} for extraction (WSL: {fsck_info.get('use_wsl', False)})")
+                result = self._extract_via_fsck(input_path, output_dir, fsck_info)
+                if result['success']:
+                    extracted['method'] = fsck_info['tool']
+                    extracted['files'] = result.get('files', {})
+                    self._write_f2fs_info(input_path, output_dir)
+                    return extracted
+                else:
+                    logger.warning(f"{fsck_info['tool']} extraction failed: {result.get('error', 'unknown')}, falling back to native")
+        
+        # Fall back to pure Python extraction
+        logger.info("Using native Python extraction for F2FS")
+        extracted['method'] = 'native'
+        
+        with open(input_path, 'rb') as f:
+            self._read_superblock(f)
+            self._read_checkpoint(f)
+            
+            self._write_f2fs_info(input_path, output_dir)
+            self._extract_directory(f, self.root_ino, '', output_dir, file_list, extracted)
+        
+        return extracted
+    
+    def _write_f2fs_info(self, input_path: str, output_dir: str):
+        """Write F2FS image info to a text file."""
+        info_path = Path(output_dir) / 'f2fs_info.txt'
+        info = self.analyze(input_path)
+        with open(info_path, 'w') as info_f:
+            info_f.write("F2FS Image Information\n")
+            info_f.write("=" * 40 + "\n")
+            info_f.write(f"Version: {info.get('version', 'N/A')}\n")
+            info_f.write(f"Block size: {info.get('block_size', 'N/A')}\n")
+            info_f.write(f"Block count: {info.get('block_count', 'N/A')}\n")
+            info_f.write(f"Total size: {info.get('total_size_mb', 0):.2f} MB\n")
+            info_f.write(f"Volume name: {info.get('volume_name', 'N/A')}\n")
+            info_f.write(f"UUID: {info.get('uuid', 'N/A')}\n")
+            info_f.write(f"Segment count: {info.get('segment_count', 'N/A')}\n")
+            info_f.write(f"Checkpoint version: {info.get('checkpoint_version', 'N/A')}\n")
+            info_f.write(f"Root entries: {info.get('root_entries', 'N/A')}\n")
+            info_f.write(f"Extraction method: {info.get('method', 'N/A')}\n")
+    
+    def _find_fsck_f2fs(self) -> Optional[dict]:
+        """Find F2FS extraction tool (dump.f2fs or fsck.f2fs).
+        
+        Checks:
+        1. Bundled tools directory
+        2. System PATH (native Windows/Linux)
+        3. WSL (if on Windows)
+        
+        Returns:
+            Dict with 'path', 'use_wsl', and 'tool' keys, or None if not found
+        """
+        import shutil
+        
+        # Check Tools directory first
+        tools_dir = Path(get_app_dir()) / 'tools'
+        if tools_dir.exists():
+            for candidate in ['dump.f2fs.exe', 'dump.f2fs']:
+                tool_path = tools_dir / candidate
+                if tool_path.exists():
+                    return {'path': str(tool_path), 'use_wsl': False, 'tool': 'dump.f2fs'}
+            for candidate in ['fsck.f2fs.exe', 'fsck.f2fs']:
+                tool_path = tools_dir / candidate
+                if tool_path.exists():
+                    return {'path': str(tool_path), 'use_wsl': False, 'tool': 'fsck.f2fs'}
+        
+        # Check native PATH
+        dump_f2fs = shutil.which('dump.f2fs')
+        if dump_f2fs:
+            return {'path': dump_f2fs, 'use_wsl': False, 'tool': 'dump.f2fs'}
+        
+        fsck = shutil.which('fsck.f2fs')
+        if fsck:
+            return {'path': fsck, 'use_wsl': False, 'tool': 'fsck.f2fs'}
+        
+        # On Windows, try WSL
+        if sys.platform == 'win32':
+            try:
+                result = subprocess.run(
+                    ['wsl', '--list'],
+                    capture_output=True,
+                    timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                if result.returncode == 0:
+                    # Check for dump.f2fs in WSL
+                    result = subprocess.run(
+                        ['wsl', 'which', 'dump.f2fs'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return {'path': 'dump.f2fs', 'use_wsl': True, 'tool': 'dump.f2fs'}
+                    
+                    # Check for fsck.f2fs in WSL
+                    result = subprocess.run(
+                        ['wsl', 'which', 'fsck.f2fs'],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return {'path': 'fsck.f2fs', 'use_wsl': True, 'tool': 'fsck.f2fs'}
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                pass
+        
+        return None
+    
+    def _extract_via_fsck(self, input_path: str, output_dir: str, fsck_info: dict) -> dict:
+        """Extract F2FS image using dump.f2fs or fsck.f2fs tools.
+        
+        Note: dump.f2fs can dump individual inodes; fsck.f2fs can verify and
+        extract the filesystem. If neither supports full extraction natively,
+        we fall back to native Python.
+        """
+        result = {'success': False, 'files': {}, 'error': None}
+        
+        try:
+            input_file = Path(input_path).resolve()
+            output_path = Path(output_dir).resolve()
+            use_wsl = fsck_info.get('use_wsl', False)
+            tool_path = fsck_info['path']
+            tool_type = fsck_info.get('tool', 'fsck.f2fs')
+            
+            if tool_type == 'dump.f2fs':
+                # dump.f2fs dumps metadata; not ideal for full extraction
+                # Use it to verify the image, then fall back to native
+                if use_wsl:
+                    wsl_input = self._windows_to_wsl_path(str(input_file))
+                    cmd = ['wsl', tool_path, wsl_input]
+                else:
+                    cmd = [tool_path, str(input_file)]
+                
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=60,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                
+                # dump.f2fs doesn't extract files, so fall back
+                result['error'] = 'dump.f2fs does not support full extraction'
+                return result
+            
+            elif tool_type == 'fsck.f2fs':
+                # fsck.f2fs is primarily a checker, not an extractor
+                # Some builds have --extract but it's not standard
+                # Try running it to verify, then fall back to native
+                if use_wsl:
+                    wsl_input = self._windows_to_wsl_path(str(input_file))
+                    cmd = ['wsl', tool_path, '--dry-run', wsl_input]
+                else:
+                    cmd = [tool_path, '--dry-run', str(input_file)]
+                
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=120,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                )
+                
+                # fsck.f2fs doesn't extract files either
+                result['error'] = 'fsck.f2fs does not support full extraction'
+                return result
+        
+        except subprocess.TimeoutExpired:
+            result['error'] = 'Tool timed out'
+        except FileNotFoundError:
+            result['error'] = f'{fsck_info["tool"]} not found'
+        except Exception as e:
+            result['error'] = str(e)
+        
+        return result
+    
+    def _windows_to_wsl_path(self, win_path: str) -> str:
+        """Convert Windows path to WSL path."""
+        path = Path(win_path)
+        if len(path.parts) > 0 and len(path.parts[0]) == 3 and path.parts[0][1] == ':':
+            drive = path.parts[0][0].lower()
+            rest = '/'.join(path.parts[1:])
+            return f"/mnt/{drive}/{rest}"
+        return str(path).replace('\\', '/')
 
 
 class SuperImageExtractor:
@@ -8231,6 +10118,29 @@ class AndroidImageExtractor:
             except Exception as e:
                 info['error'] = str(e)
         
+        elif img_type == 'f2fs':
+            info['filesystem'] = 'f2fs'
+            try:
+                extractor = F2fsImageExtractor(self.progress_callback)
+                f2fs_info = extractor.analyze(path)
+                info['block_size'] = f2fs_info.get('block_size', 0)
+                info['block_count'] = f2fs_info.get('block_count', 0)
+                info['volume_name'] = f2fs_info.get('volume_name', '')
+                info['uuid'] = f2fs_info.get('uuid', '')
+                info['version'] = f2fs_info.get('version', '')
+                info['total_size_mb'] = f2fs_info.get('total_size_mb', 0)
+                info['checkpoint_version'] = f2fs_info.get('checkpoint_version', 0)
+                
+                # List files for contents
+                files = extractor.list_files(path, max_depth=2)
+                info['file_count'] = len(files)
+                info['contents'] = [
+                    {'name': f['path'], 'size': f['size'], 'type': f.get('type', 'file')}
+                    for f in files[:100]
+                ]
+            except Exception as e:
+                info['error'] = str(e)
+        
         elif img_type == 'elf':
             # Parse ELF header for info
             with open(path, 'rb') as f:
@@ -8411,6 +10321,13 @@ class AndroidImageExtractor:
             extractor = ErofsImageExtractor(self.progress_callback)
             extracted = extractor.extract(path, output_dir, partition_names)
             return {'type': 'erofs', 'files': extracted.get('files', {}),
+                    'errors': extracted.get('errors', [])}
+        
+        elif img_type == 'f2fs':
+            logger.info("Extracting files from F2FS filesystem image...")
+            extractor = F2fsImageExtractor(self.progress_callback)
+            extracted = extractor.extract(path, output_dir, partition_names)
+            return {'type': 'f2fs', 'files': extracted.get('files', {}),
                     'errors': extracted.get('errors', [])}
         
         elif img_type == 'elf':
@@ -10347,7 +12264,8 @@ def create_gui_app():
         QComboBox, QSpinBox, QTreeWidget, QTreeWidgetItem, QHeaderView,
         QFormLayout, QRadioButton, QScrollArea, QFrame, QMenu, QDoubleSpinBox,
         QGridLayout, QDialog, QInputDialog, QSystemTrayIcon, QGraphicsOpacityEffect,
-        QPlainTextEdit, QStackedWidget, QButtonGroup, QSizePolicy
+        QPlainTextEdit, QStackedWidget, QButtonGroup, QSizePolicy,
+        QTableWidget, QTableWidgetItem
     )
     from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QPoint, QEasingCurve, QMimeData, QUrl, QObject, QEvent
     from PyQt6.QtGui import QFont, QDragEnterEvent, QDropEvent, QPalette, QColor, QAction, QIcon, QPixmap, QPainter, QDrag
@@ -11303,24 +13221,37 @@ def create_gui_app():
             self.status_label.setVisible(True)
             self.status_label.setText("Preparing download...")
 
-            # Determine download path - same directory as current exe
-            if getattr(sys, 'frozen', False):
-                app_dir = os.path.dirname(sys.executable)
-                exe_name = os.path.basename(sys.executable)
-                ext = '.exe' if sys.platform == 'win32' else ''
-                # Download to temp name first
+            # Determine download path
+            # The bootstrapper sets IMAGEANARCHY_EXE so we know the real exe path
+            bootstrapper_exe = os.environ.get('IMAGEANARCHY_EXE')
+            
+            if bootstrapper_exe and os.path.isfile(bootstrapper_exe):
+                # Launched from bootstrapper exe — update replaces the exe
+                app_dir = os.path.dirname(bootstrapper_exe)
+                ext = '.exe'
                 download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}{ext}.download")
+                self._is_bootstrapper = True
+                self._bootstrapper_exe = bootstrapper_exe
+            elif getattr(sys, 'frozen', False):
+                # Directly frozen (shouldn't happen normally, but fallback)
+                app_dir = os.path.dirname(sys.executable)
+                ext = '.exe' if sys.platform == 'win32' else ''
+                download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}{ext}.download")
+                self._is_bootstrapper = True
+                self._bootstrapper_exe = sys.executable
             else:
-                # Running from source — pip users should use pip install --upgrade
+                # Running from source — just download the file
                 app_dir = os.path.dirname(os.path.abspath(__file__))
                 ext = '.exe' if sys.platform == 'win32' else ''
                 download_path = os.path.join(app_dir, f"ImageAnarchy_v{self.update_info['latest_version']}{ext}")
+                self._is_bootstrapper = False
+                self._bootstrapper_exe = None
 
             self.download_path = download_path
             self.final_path = download_path.replace('.download', '')
 
             # Create update checker for download
-            self.update_checker = UpdateChecker(self)
+            self.update_checker = UpdateChecker()
             self.update_checker.download_progress.connect(self._on_progress)
             self.update_checker.download_complete.connect(self._on_download_complete)
             self.update_checker.download_failed.connect(self._on_download_failed)
@@ -11344,15 +13275,25 @@ def create_gui_app():
             self.progress_bar.setValue(100)
 
             try:
-                # Rename download file to final name
-                if os.path.exists(self.final_path):
-                    # Backup old version
-                    backup_path = self.final_path + ".backup"
-                    if os.path.exists(backup_path):
-                        os.remove(backup_path)
-                    os.rename(self.final_path, backup_path)
-
-                os.rename(path, self.final_path)
+                if self._is_bootstrapper:
+                    # For bootstrapper: rename the download to the final versioned name,
+                    # then on restart we launch the new exe which replaces the old one
+                    if os.path.exists(self.final_path):
+                        backup_path = self.final_path + ".backup"
+                        if os.path.exists(backup_path):
+                            os.remove(backup_path)
+                        os.rename(self.final_path, backup_path)
+                    
+                    os.rename(path, self.final_path)
+                else:
+                    # Source mode: just rename the download
+                    if path.endswith('.download'):
+                        if os.path.exists(self.final_path):
+                            backup_path = self.final_path + ".backup"
+                            if os.path.exists(backup_path):
+                                os.remove(backup_path)
+                            os.rename(self.final_path, backup_path)
+                        os.rename(path, self.final_path)
 
                 # Verify SHA256 if provided
                 if self.update_info.get('sha256'):
@@ -11389,14 +13330,13 @@ def create_gui_app():
 
         def _restart_app(self):
             """Restart the application with the new version."""
-            if getattr(sys, 'frozen', False):
-                # For frozen exe, we need to start the new exe and close this one
+            if self._is_bootstrapper:
+                # Launch the new downloaded exe (bootstrapper) and close this instance
                 import subprocess
-
-                # Start the new version
-                subprocess.Popen([self.final_path], creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0)
-
-                # Close current app
+                subprocess.Popen(
+                    [self.final_path],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == 'win32' else 0
+                )
                 QApplication.instance().quit()
             else:
                 # For source, just show message
@@ -11550,6 +13490,21 @@ def create_gui_app():
 
         def _on_update_available(self, update_info: dict):
             """Show update dialog when update is available."""
+            # v3.2 had a broken auto-updater (bootstrapper env var missing).
+            # If the server flags manual_update_required, show a manual download message instead.
+            if update_info.get('manual_update_required'):
+                download_url = update_info.get('download_url', 'https://imageanarchy.com')
+                QMessageBox.information(
+                    self,
+                    "🔥 Update Available — Manual Download Required",
+                    f"<b>Image Anarchy v{update_info.get('latest_version', '?')} is available!</b><br><br>"
+                    f"Your current version (v{APP_VERSION}) has a known bug in the auto-updater.<br>"
+                    f"Please download the new version manually:<br><br>"
+                    f'<a href="{download_url}">{download_url}</a><br><br>'
+                    f"We're sorry for the inconvenience, rebel. This is fixed in the new version!"
+                )
+                return
+
             dialog = UpdateDialog(self, update_info)
             dialog.exec()
 
@@ -11711,6 +13666,27 @@ def create_gui_app():
         def _force_quit_app(self):
             """Force quit the application - no minimize to tray."""
             self._force_quit = True
+            # Disconnect ALL Socket.IO clients BEFORE quitting to stop engineio
+            # polling threads (_read_loop_polling / _write_loop) that block exit.
+            # There are two CommunityChatWidget instances:
+            #   1. self.community_chat      — Plugins Store sidebar (rarely connected)
+            #   2. self.chat_tab._chat_widget — ChatTab main chat  (auto-connects on startup)
+            try:
+                if hasattr(self, 'community_chat') and self.community_chat:
+                    self.community_chat.disconnect_chat()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'chat_tab') and self.chat_tab:
+                    if hasattr(self.chat_tab, '_chat_widget') and self.chat_tab._chat_widget:
+                        self.chat_tab._chat_widget.disconnect_chat()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, '_share_session') and self._share_session:
+                    self._share_session.stop_sharing()
+            except Exception:
+                pass
             # Hide tray icon first to prevent orphaned icons
             self.tray_icon.hide()
             # Close the application
@@ -11719,7 +13695,23 @@ def create_gui_app():
         def closeEvent(self, event):
             """Minimize to tray instead of closing, unless force quit."""
             if self._force_quit:
-                # User chose to quit - actually close
+                # User chose to quit - disconnect ALL Socket.IO clients first
+                try:
+                    if hasattr(self, 'community_chat') and self.community_chat:
+                        self.community_chat.disconnect_chat()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, 'chat_tab') and self.chat_tab:
+                        if hasattr(self.chat_tab, '_chat_widget') and self.chat_tab._chat_widget:
+                            self.chat_tab._chat_widget.disconnect_chat()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, '_share_session') and self._share_session:
+                        self._share_session.stop_sharing()
+                except Exception:
+                    pass
                 self.tray_icon.hide()  # Ensure tray icon is removed
                 event.accept()
             elif self.tray_icon.isVisible():
@@ -13264,6 +15256,223 @@ def create_gui_app():
             oppo_layout.addLayout(oppo_action_layout)
             
             self.tab_widget.addTab(oppo_tab, "📱 OPPO/OnePlus")
+            
+            # =====================================================================
+            # TAB 9: MTK Scatter File Generator
+            # =====================================================================
+            scatter_tab = QWidget()
+            scatter_layout = QVBoxLayout(scatter_tab)
+            scatter_layout.setSpacing(10)
+            
+            # Header
+            scatter_header = QLabel("📄 MTK Scatter File Generator — Break the Flash Chains")
+            scatter_header.setStyleSheet("font-size: 16px; font-weight: bold; color: #4fc3f7; padding: 10px;")
+            scatter_layout.addWidget(scatter_header)
+            
+            scatter_desc = QLabel(
+                "Generate, edit, and import MediaTek scatter files for SP Flash Tool.\n"
+                "Load templates for common chipsets, import from existing scatter files or GPT dumps,\n"
+                "or build your partition layout from scratch. Your device, your layout, your rules."
+            )
+            scatter_desc.setStyleSheet("color: #888; padding: 0 5px 5px 5px;")
+            scatter_layout.addWidget(scatter_desc)
+            
+            # Top controls: General Settings + Actions side by side
+            top_splitter = QSplitter(Qt.Orientation.Horizontal)
+            
+            # --- General Settings ---
+            general_group = QGroupBox("General Settings")
+            general_form = QFormLayout(general_group)
+            general_form.setSpacing(8)
+            
+            self.scatter_platform = QComboBox()
+            self.scatter_platform.setEditable(True)
+            self.scatter_platform.addItems([
+                "MT6261", "MT6572", "MT6580", "MT6582", "MT6589",
+                "MT6735", "MT6737", "MT6739", "MT6750", "MT6753",
+                "MT6755", "MT6757", "MT6761", "MT6762", "MT6763",
+                "MT6765", "MT6768", "MT6769", "MT6771", "MT6779",
+                "MT6781", "MT6785", "MT6789", "MT6795", "MT6797",
+                "MT6799", "MT6833", "MT6853", "MT6873", "MT6877",
+                "MT6879", "MT6883", "MT6885", "MT6889", "MT6891",
+                "MT6893", "MT6895", "MT6983", "MT6985",
+                "MT8163", "MT8167", "MT8173", "MT8183", "MT8188",
+                "MT8321", "MT8362", "MT8382", "MT8765",
+            ])
+            self.scatter_platform.setCurrentText("MT6765")
+            general_form.addRow("Platform:", self.scatter_platform)
+            
+            self.scatter_project = QLineEdit("k65v1_64_bsp")
+            self.scatter_project.setPlaceholderText("e.g., k65v1_64_bsp")
+            general_form.addRow("Project:", self.scatter_project)
+            
+            self.scatter_storage = QComboBox()
+            self.scatter_storage.addItems(["EMMC", "UFS", "NAND"])
+            general_form.addRow("Storage:", self.scatter_storage)
+            
+            self.scatter_boot_channel = QComboBox()
+            self.scatter_boot_channel.addItems(["MSDC_0", "MSDC_1", "UFS_0"])
+            general_form.addRow("Boot Channel:", self.scatter_boot_channel)
+            
+            self.scatter_block_size = QComboBox()
+            self.scatter_block_size.setEditable(True)
+            self.scatter_block_size.addItems(["0x20000", "0x40000", "0x80000", "0x100000"])
+            self.scatter_block_size.setCurrentText("0x20000")
+            general_form.addRow("Block Size:", self.scatter_block_size)
+            
+            top_splitter.addWidget(general_group)
+            
+            # --- Actions panel ---
+            actions_group = QGroupBox("Actions")
+            actions_layout = QVBoxLayout(actions_group)
+            actions_layout.setSpacing(6)
+            
+            # Template selector
+            template_row = QHBoxLayout()
+            self.scatter_template_combo = QComboBox()
+            self.scatter_template_combo.addItems([
+                "-- Select Template --",
+                "Standard MTK (EMMC, 43 partitions)",
+                "Minimal MTK (EMMC, 12 partitions)",
+                "MTK A/B (EMMC, 48 partitions)",
+                "MTK UFS (UFS, 43 partitions)",
+            ])
+            template_row.addWidget(self.scatter_template_combo, 1)
+            scatter_load_template_btn = QPushButton("🔥 Load Template")
+            scatter_load_template_btn.setToolTip("Load a predefined partition layout")
+            scatter_load_template_btn.clicked.connect(self._scatter_load_template)
+            template_row.addWidget(scatter_load_template_btn)
+            actions_layout.addLayout(template_row)
+            
+            # Import/Export buttons
+            import_row = QHBoxLayout()
+            scatter_import_btn = QPushButton("📥 Import Scatter")
+            scatter_import_btn.setToolTip("Import an existing scatter file")
+            scatter_import_btn.clicked.connect(self._scatter_import_file)
+            import_row.addWidget(scatter_import_btn)
+            
+            scatter_import_gpt_btn = QPushButton("💽 Import GPT")
+            scatter_import_gpt_btn.setToolTip("Import partition layout from a GPT dump (e.g., gpt_main.bin)")
+            scatter_import_gpt_btn.clicked.connect(self._scatter_import_gpt)
+            import_row.addWidget(scatter_import_gpt_btn)
+            actions_layout.addLayout(import_row)
+            
+            export_row = QHBoxLayout()
+            scatter_export_btn = QPushButton("💾 Export Scatter File")
+            scatter_export_btn.setProperty("primary", True)
+            scatter_export_btn.setToolTip("Save the scatter file to disk")
+            scatter_export_btn.clicked.connect(self._scatter_export)
+            export_row.addWidget(scatter_export_btn)
+            
+            scatter_preview_btn = QPushButton("👁️ Preview")
+            scatter_preview_btn.setToolTip("Preview the scatter file contents")
+            scatter_preview_btn.clicked.connect(self._scatter_preview)
+            export_row.addWidget(scatter_preview_btn)
+            actions_layout.addLayout(export_row)
+            
+            actions_layout.addStretch()
+            top_splitter.addWidget(actions_group)
+            top_splitter.setSizes([400, 350])
+            
+            scatter_layout.addWidget(top_splitter)
+            
+            # --- Partition Table ---
+            table_group = QGroupBox("Partition Layout")
+            table_layout = QVBoxLayout(table_group)
+            
+            # Partition table toolbar
+            table_toolbar = QHBoxLayout()
+            
+            scatter_add_btn = QPushButton("➕ Add Partition")
+            scatter_add_btn.clicked.connect(self._scatter_add_partition)
+            table_toolbar.addWidget(scatter_add_btn)
+            
+            scatter_remove_btn = QPushButton("➖ Remove")
+            scatter_remove_btn.clicked.connect(self._scatter_remove_partition)
+            table_toolbar.addWidget(scatter_remove_btn)
+            
+            scatter_up_btn = QPushButton("⬆️ Move Up")
+            scatter_up_btn.clicked.connect(self._scatter_move_up)
+            table_toolbar.addWidget(scatter_up_btn)
+            
+            scatter_down_btn = QPushButton("⬇️ Move Down")
+            scatter_down_btn.clicked.connect(self._scatter_move_down)
+            table_toolbar.addWidget(scatter_down_btn)
+            
+            table_toolbar.addStretch()
+            
+            scatter_auto_calc_btn = QPushButton("🔢 Auto-Calculate Addresses")
+            scatter_auto_calc_btn.setToolTip("Recalculate start addresses based on partition sizes")
+            scatter_auto_calc_btn.clicked.connect(self._scatter_auto_calculate)
+            table_toolbar.addWidget(scatter_auto_calc_btn)
+            
+            scatter_clear_btn = QPushButton("🗑️ Clear All")
+            scatter_clear_btn.clicked.connect(self._scatter_clear_table)
+            table_toolbar.addWidget(scatter_clear_btn)
+            
+            table_layout.addLayout(table_toolbar)
+            
+            # The actual partition table
+            self.scatter_table = QTableWidget()
+            self.scatter_table.setColumnCount(9)
+            self.scatter_table.setHorizontalHeaderLabels([
+                "Partition Name", "File Name", "Start Address",
+                "Size", "Region", "Type", "Operation Type",
+                "Download", "Reserved"
+            ])
+            self.scatter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            self.scatter_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            for col in range(2, 9):
+                self.scatter_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+            self.scatter_table.setAlternatingRowColors(True)
+            self.scatter_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            self.scatter_table.setStyleSheet("""
+                QTableWidget {
+                    background-color: #1e1e1e;
+                    gridline-color: #3c3c3c;
+                    font-family: Consolas, monospace;
+                    font-size: 12px;
+                }
+                QTableWidget::item {
+                    padding: 4px;
+                }
+                QTableWidget::item:selected {
+                    background-color: #264f78;
+                }
+                QHeaderView::section {
+                    background-color: #2d2d2d;
+                    color: #4fc3f7;
+                    padding: 6px;
+                    border: 1px solid #3c3c3c;
+                    font-weight: bold;
+                }
+            """)
+            table_layout.addWidget(self.scatter_table)
+            
+            # Status bar for partition table
+            scatter_status_row = QHBoxLayout()
+            self.scatter_count_label = QLabel("Partitions: 0")
+            self.scatter_count_label.setStyleSheet("color: #888;")
+            scatter_status_row.addWidget(self.scatter_count_label)
+            scatter_status_row.addStretch()
+            self.scatter_total_size_label = QLabel("Total layout size: 0 bytes")
+            self.scatter_total_size_label.setStyleSheet("color: #888;")
+            scatter_status_row.addWidget(self.scatter_total_size_label)
+            table_layout.addLayout(scatter_status_row)
+            
+            scatter_layout.addWidget(table_group, 1)
+            
+            # Preview/Log area
+            scatter_preview_group = QGroupBox("Preview / Log")
+            scatter_preview_layout = QVBoxLayout(scatter_preview_group)
+            self.scatter_preview_text = QPlainTextEdit()
+            self.scatter_preview_text.setReadOnly(True)
+            self.scatter_preview_text.setStyleSheet("font-family: Consolas; background: #0d0d0d; font-size: 11px;")
+            self.scatter_preview_text.setMaximumHeight(200)
+            scatter_preview_layout.addWidget(self.scatter_preview_text)
+            scatter_layout.addWidget(scatter_preview_group)
+            
+            self.tab_widget.addTab(scatter_tab, "📄 Scatter Gen")
             
             main_layout.addWidget(self.tab_widget)
             
@@ -15843,6 +18052,753 @@ def create_gui_app():
                 self._oppo_log(f"❌ Error: {e}")
                 raise
         
+        # =================================================================
+        # SCATTER FILE GENERATOR METHODS
+        # =================================================================
+        
+        # Standard MTK partition templates
+        _SCATTER_TEMPLATES = {
+            "Standard MTK (EMMC, 43 partitions)": [
+                # (name, file_name, size_hex, region, type, op_type, download)
+                ("preloader", "preloader_{project}.bin", "0x40000", "EMMC_BOOT1_BOOT2", "SV5_BL_BIN", "BOOTLOADERS", True),
+                ("pgpt", "NONE", "0x8000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("proinfo", "proinfo.img", "0x300000", "EMMC_USER", "NORMAL_ROM", "PROTECTED", False),
+                ("nvram", "nvram.img", "0x4000000", "EMMC_USER", "NORMAL_ROM", "BINREGION", False),
+                ("protect1", "protect1.img", "0x800000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("protect2", "protect2.img", "0x800000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("lk", "lk.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("lk2", "lk2.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("para", "para.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("boot", "boot.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("recovery", "recovery.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("dtbo", "dtbo.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta", "vbmeta.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta_system", "vbmeta_system.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta_vendor", "vbmeta_vendor.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("logo", "logo.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("expdb", "NONE", "0xA00000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("seccfg", "seccfg.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("tee1", "tee.img", "0x500000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("tee2", "tee.img", "0x500000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("scp1", "scp.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("scp2", "scp.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("sspm_1", "sspm.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("sspm_2", "sspm.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("gz1", "gz.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("gz2", "gz.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("efuse", "NONE", "0x1000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("md1img", "md1img.img", "0x6400000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("md1dsp", "md1dsp.img", "0x1400000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("spmfw", "spmfw.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("pi_img", "pi_img.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("nvdata", "nvdata.img", "0x2000000", "EMMC_USER", "EXT4_IMG", "INVISIBLE", False),
+                ("metadata", "metadata.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("nvcfg", "nvcfg.img", "0x2000000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("persist", "persist.img", "0x2000000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("sec1", "sec1.img", "0x200000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("otp", "NONE", "0x2B00000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("super", "super.img", "0x180000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("cache", "cache.img", "0x1B000000", "EMMC_USER", "EXT4_IMG", "UPDATE", True),
+                ("userdata", "userdata.img", "0xFFFFFFFF", "EMMC_USER", "EXT4_IMG", "UPDATE", True),
+                ("flashinfo", "NONE", "0x1000000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("cdt_engineering", "NONE", "0x80000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("sgpt", "NONE", "0x4200", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+            ],
+            "Minimal MTK (EMMC, 12 partitions)": [
+                ("preloader", "preloader_{project}.bin", "0x40000", "EMMC_BOOT1_BOOT2", "SV5_BL_BIN", "BOOTLOADERS", True),
+                ("pgpt", "NONE", "0x8000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("lk", "lk.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("lk2", "lk2.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("boot", "boot.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("recovery", "recovery.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta", "vbmeta.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("tee1", "tee.img", "0x500000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("super", "super.img", "0x180000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("cache", "cache.img", "0x1B000000", "EMMC_USER", "EXT4_IMG", "UPDATE", True),
+                ("userdata", "userdata.img", "0xFFFFFFFF", "EMMC_USER", "EXT4_IMG", "UPDATE", True),
+                ("sgpt", "NONE", "0x4200", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+            ],
+            "MTK A/B (EMMC, 48 partitions)": [
+                ("preloader", "preloader_{project}.bin", "0x40000", "EMMC_BOOT1_BOOT2", "SV5_BL_BIN", "BOOTLOADERS", True),
+                ("pgpt", "NONE", "0x8000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("proinfo", "proinfo.img", "0x300000", "EMMC_USER", "NORMAL_ROM", "PROTECTED", False),
+                ("nvram", "nvram.img", "0x4000000", "EMMC_USER", "NORMAL_ROM", "BINREGION", False),
+                ("protect1", "protect1.img", "0x800000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("protect2", "protect2.img", "0x800000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("lk_a", "lk.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("lk_b", "lk.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("para", "para.img", "0x80000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("boot_a", "boot.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("boot_b", "boot.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", False),
+                ("dtbo_a", "dtbo.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("dtbo_b", "dtbo.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "UPDATE", False),
+                ("vbmeta_a", "vbmeta.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta_b", "vbmeta.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", False),
+                ("vbmeta_system_a", "vbmeta_system.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta_system_b", "vbmeta_system.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", False),
+                ("vbmeta_vendor_a", "vbmeta_vendor.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("vbmeta_vendor_b", "vbmeta_vendor.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "UPDATE", False),
+                ("logo", "logo.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("expdb", "NONE", "0xA00000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("seccfg", "seccfg.img", "0x800000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("tee_a", "tee.img", "0x500000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("tee_b", "tee.img", "0x500000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("scp_a", "scp.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("scp_b", "scp.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("sspm_a", "sspm.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("sspm_b", "sspm.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("gz_a", "gz.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("gz_b", "gz.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("efuse", "NONE", "0x1000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("md1img_a", "md1img.img", "0x6400000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("md1img_b", "md1img.img", "0x6400000", "EMMC_USER", "NORMAL_ROM", "UPDATE", False),
+                ("md1dsp", "md1dsp.img", "0x1400000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("spmfw_a", "spmfw.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", True),
+                ("spmfw_b", "spmfw.img", "0x100000", "EMMC_USER", "NORMAL_ROM", "BOOTLOADERS", False),
+                ("nvdata", "nvdata.img", "0x2000000", "EMMC_USER", "EXT4_IMG", "INVISIBLE", False),
+                ("metadata", "metadata.img", "0x2000000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("nvcfg", "nvcfg.img", "0x2000000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("persist", "persist.img", "0x2000000", "EMMC_USER", "EXT4_IMG", "PROTECTED", False),
+                ("sec1", "sec1.img", "0x200000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("otp", "NONE", "0x2B00000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("super", "super.img", "0x180000000", "EMMC_USER", "NORMAL_ROM", "UPDATE", True),
+                ("cache", "cache.img", "0x1B000000", "EMMC_USER", "EXT4_IMG", "UPDATE", True),
+                ("userdata", "userdata.img", "0xFFFFFFFF", "EMMC_USER", "EXT4_IMG", "UPDATE", True),
+                ("flashinfo", "NONE", "0x1000000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("cdt_engineering", "NONE", "0x80000", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+                ("sgpt", "NONE", "0x4200", "EMMC_USER", "NORMAL_ROM", "INVISIBLE", False),
+            ],
+        }
+        # UFS template is same as standard but with UFS regions
+        _SCATTER_TEMPLATES["MTK UFS (UFS, 43 partitions)"] = [
+            (name, fname, size, region.replace("EMMC_USER", "UFS_LU2").replace("EMMC_BOOT1_BOOT2", "UFS_LU1"),
+             typ, op, dl)
+            for name, fname, size, region, typ, op, dl
+            in _SCATTER_TEMPLATES["Standard MTK (EMMC, 43 partitions)"]
+        ]
+        
+        _SCATTER_REGIONS = [
+            "EMMC_USER", "EMMC_BOOT1_BOOT2", "EMMC_BOOT1", "EMMC_BOOT2", "EMMC_RPMB",
+            "UFS_LU0", "UFS_LU1", "UFS_LU2", "UFS_LU3",
+        ]
+        _SCATTER_TYPES = [
+            "NORMAL_ROM", "SV5_BL_BIN", "EXT4_IMG", "YAFFS_IMG",
+        ]
+        _SCATTER_OP_TYPES = [
+            "UPDATE", "BOOTLOADERS", "BINREGION", "PROTECTED", "INVISIBLE",
+        ]
+        
+        def _scatter_add_partition(self, name="new_partition", file_name="NONE",
+                                   start_addr="0x0", size="0x100000",
+                                   region="EMMC_USER", ptype="NORMAL_ROM",
+                                   op_type="UPDATE", download=True, reserved=False):
+            """Add a partition row to the scatter table."""
+            row = self.scatter_table.rowCount()
+            self.scatter_table.insertRow(row)
+            
+            self.scatter_table.setItem(row, 0, QTableWidgetItem(name))
+            self.scatter_table.setItem(row, 1, QTableWidgetItem(file_name))
+            self.scatter_table.setItem(row, 2, QTableWidgetItem(start_addr))
+            self.scatter_table.setItem(row, 3, QTableWidgetItem(size))
+            
+            # Region combo
+            region_combo = QComboBox()
+            region_combo.addItems(self._SCATTER_REGIONS)
+            region_combo.setCurrentText(region)
+            self.scatter_table.setCellWidget(row, 4, region_combo)
+            
+            # Type combo
+            type_combo = QComboBox()
+            type_combo.addItems(self._SCATTER_TYPES)
+            type_combo.setCurrentText(ptype)
+            self.scatter_table.setCellWidget(row, 5, type_combo)
+            
+            # Operation type combo
+            op_combo = QComboBox()
+            op_combo.addItems(self._SCATTER_OP_TYPES)
+            op_combo.setCurrentText(op_type)
+            self.scatter_table.setCellWidget(row, 6, op_combo)
+            
+            # Download checkbox
+            dl_item = QTableWidgetItem()
+            dl_item.setCheckState(Qt.CheckState.Checked if download else Qt.CheckState.Unchecked)
+            self.scatter_table.setItem(row, 7, dl_item)
+            
+            # Reserved checkbox
+            res_item = QTableWidgetItem()
+            res_item.setCheckState(Qt.CheckState.Checked if reserved else Qt.CheckState.Unchecked)
+            self.scatter_table.setItem(row, 8, res_item)
+            
+            self._scatter_update_counts()
+        
+        def _scatter_remove_partition(self):
+            """Remove the selected partition row(s)."""
+            rows = sorted(set(idx.row() for idx in self.scatter_table.selectedIndexes()), reverse=True)
+            if not rows:
+                QMessageBox.information(self, "Info", "Select a partition row to remove")
+                return
+            for row in rows:
+                self.scatter_table.removeRow(row)
+            self._scatter_update_counts()
+        
+        def _scatter_move_up(self):
+            """Move selected partition row up."""
+            row = self.scatter_table.currentRow()
+            if row <= 0:
+                return
+            self._scatter_swap_rows(row, row - 1)
+            self.scatter_table.selectRow(row - 1)
+        
+        def _scatter_move_down(self):
+            """Move selected partition row down."""
+            row = self.scatter_table.currentRow()
+            if row < 0 or row >= self.scatter_table.rowCount() - 1:
+                return
+            self._scatter_swap_rows(row, row + 1)
+            self.scatter_table.selectRow(row + 1)
+        
+        def _scatter_swap_rows(self, row1, row2):
+            """Swap two rows in the scatter table."""
+            col_count = self.scatter_table.columnCount()
+            for col in range(col_count):
+                widget1 = self.scatter_table.cellWidget(row1, col)
+                widget2 = self.scatter_table.cellWidget(row2, col)
+                if widget1 and widget2:
+                    # Both are combo boxes
+                    val1 = widget1.currentText()
+                    val2 = widget2.currentText()
+                    widget1.setCurrentText(val2)
+                    widget2.setCurrentText(val1)
+                else:
+                    item1 = self.scatter_table.takeItem(row1, col)
+                    item2 = self.scatter_table.takeItem(row2, col)
+                    if item1 and item2:
+                        self.scatter_table.setItem(row1, col, item2)
+                        self.scatter_table.setItem(row2, col, item1)
+        
+        def _scatter_clear_table(self):
+            """Clear all partitions from the table."""
+            if self.scatter_table.rowCount() == 0:
+                return
+            reply = QMessageBox.question(self, "Clear All",
+                "Clear all partitions from the table?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.scatter_table.setRowCount(0)
+                self._scatter_update_counts()
+                self.scatter_preview_text.clear()
+        
+        def _scatter_update_counts(self):
+            """Update the partition count and total size labels."""
+            count = self.scatter_table.rowCount()
+            self.scatter_count_label.setText(f"Partitions: {count}")
+            
+            total = 0
+            for row in range(count):
+                size_item = self.scatter_table.item(row, 3)
+                if size_item:
+                    try:
+                        val = int(size_item.text(), 16) if size_item.text().startswith("0x") else int(size_item.text())
+                        if val != 0xFFFFFFFF:  # Skip userdata fill-rest marker
+                            total += val
+                    except (ValueError, TypeError):
+                        pass
+            
+            # Human-readable size
+            if total >= 1 << 30:
+                size_str = f"{total / (1 << 30):.2f} GB"
+            elif total >= 1 << 20:
+                size_str = f"{total / (1 << 20):.1f} MB"
+            elif total >= 1 << 10:
+                size_str = f"{total / (1 << 10):.0f} KB"
+            else:
+                size_str = f"{total} bytes"
+            self.scatter_total_size_label.setText(f"Total layout size: {size_str} (0x{total:X})")
+        
+        def _scatter_load_template(self):
+            """Load a predefined partition template."""
+            template_name = self.scatter_template_combo.currentText()
+            if template_name.startswith("--"):
+                QMessageBox.information(self, "Info", "Select a template first")
+                return
+            
+            if self.scatter_table.rowCount() > 0:
+                reply = QMessageBox.question(self, "Load Template",
+                    f"Loading '{template_name}' will replace the current partition table.\nContinue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            
+            self.scatter_table.setRowCount(0)
+            
+            template = self._SCATTER_TEMPLATES.get(template_name, [])
+            project = self.scatter_project.text().strip() or "project"
+            
+            # Auto-calculate start addresses
+            # preloader is special — address 0x0 in BOOT region
+            # EMMC_USER partitions start after pgpt
+            current_addr = 0
+            boot_addr = 0
+            
+            for name, fname, size_hex, region, ptype, op_type, download in template:
+                # Replace {project} placeholder in file name
+                actual_fname = fname.replace("{project}", project)
+                
+                size_val = int(size_hex, 16)
+                
+                if "BOOT" in region or "LU1" in region:
+                    addr = boot_addr
+                    boot_addr += size_val
+                else:
+                    addr = current_addr
+                    if size_val != 0xFFFFFFFF:
+                        current_addr += size_val
+                    else:
+                        current_addr = 0xFFFFFFFF
+                
+                self._scatter_add_partition(
+                    name=name, file_name=actual_fname,
+                    start_addr=f"0x{addr:X}", size=size_hex,
+                    region=region, ptype=ptype, op_type=op_type,
+                    download=download, reserved=False
+                )
+            
+            # Update storage type based on template name
+            if "UFS" in template_name:
+                self.scatter_storage.setCurrentText("UFS")
+                self.scatter_boot_channel.setCurrentText("UFS_0")
+            else:
+                self.scatter_storage.setCurrentText("EMMC")
+                self.scatter_boot_channel.setCurrentText("MSDC_0")
+            
+            self.scatter_preview_text.setPlainText(
+                f"✅ Loaded template: {template_name}\n"
+                f"   {self.scatter_table.rowCount()} partitions loaded.\n"
+                f"   Addresses auto-calculated. Edit as needed."
+            )
+        
+        def _scatter_auto_calculate(self):
+            """Recalculate start addresses sequentially based on partition sizes."""
+            count = self.scatter_table.rowCount()
+            if count == 0:
+                return
+            
+            current_user_addr = 0
+            current_boot_addr = 0
+            
+            for row in range(count):
+                region_widget = self.scatter_table.cellWidget(row, 4)
+                region = region_widget.currentText() if region_widget else "EMMC_USER"
+                
+                size_item = self.scatter_table.item(row, 3)
+                try:
+                    size_val = int(size_item.text(), 16) if size_item.text().startswith("0x") else int(size_item.text())
+                except (ValueError, TypeError, AttributeError):
+                    size_val = 0
+                
+                if "BOOT" in region or "LU1" in region:
+                    self.scatter_table.item(row, 2).setText(f"0x{current_boot_addr:X}")
+                    current_boot_addr += size_val
+                else:
+                    self.scatter_table.item(row, 2).setText(f"0x{current_user_addr:X}")
+                    if size_val != 0xFFFFFFFF:
+                        current_user_addr += size_val
+            
+            self._scatter_update_counts()
+            self.scatter_preview_text.setPlainText("🔢 Addresses recalculated successfully.")
+        
+        def _scatter_get_table_data(self):
+            """Read all partition data from the table."""
+            partitions = []
+            for row in range(self.scatter_table.rowCount()):
+                name = self.scatter_table.item(row, 0).text() if self.scatter_table.item(row, 0) else ""
+                fname = self.scatter_table.item(row, 1).text() if self.scatter_table.item(row, 1) else "NONE"
+                start = self.scatter_table.item(row, 2).text() if self.scatter_table.item(row, 2) else "0x0"
+                size = self.scatter_table.item(row, 3).text() if self.scatter_table.item(row, 3) else "0x0"
+                
+                region_w = self.scatter_table.cellWidget(row, 4)
+                region = region_w.currentText() if region_w else "EMMC_USER"
+                
+                type_w = self.scatter_table.cellWidget(row, 5)
+                ptype = type_w.currentText() if type_w else "NORMAL_ROM"
+                
+                op_w = self.scatter_table.cellWidget(row, 6)
+                op_type = op_w.currentText() if op_w else "UPDATE"
+                
+                dl_item = self.scatter_table.item(row, 7)
+                download = dl_item.checkState() == Qt.CheckState.Checked if dl_item else True
+                
+                res_item = self.scatter_table.item(row, 8)
+                reserved = res_item.checkState() == Qt.CheckState.Checked if res_item else False
+                
+                storage_type = self.scatter_storage.currentText()
+                storage_map = {
+                    "EMMC": "HW_STORAGE_EMMC",
+                    "UFS": "HW_STORAGE_UFS",
+                    "NAND": "HW_STORAGE_NAND",
+                }
+                
+                partitions.append({
+                    "name": name,
+                    "file_name": fname,
+                    "linear_start_addr": start,
+                    "physical_start_addr": start,
+                    "partition_size": size,
+                    "region": region,
+                    "type": ptype,
+                    "operation_type": op_type,
+                    "is_download": download,
+                    "is_reserved": reserved,
+                    "storage": storage_map.get(storage_type, "HW_STORAGE_EMMC"),
+                })
+            return partitions
+        
+        def _scatter_generate_text(self):
+            """Generate the full scatter file text."""
+            platform = self.scatter_platform.currentText().strip()
+            project = self.scatter_project.text().strip() or "project"
+            storage = self.scatter_storage.currentText()
+            boot_channel = self.scatter_boot_channel.currentText()
+            block_size = self.scatter_block_size.currentText().strip()
+            
+            partitions = self._scatter_get_table_data()
+            if not partitions:
+                return ""
+            
+            lines = []
+            lines.append("############################################################################################################")
+            lines.append("#")
+            lines.append("#  General Setting")
+            lines.append("#    ")
+            lines.append("############################################################################################################")
+            lines.append(f"- general: MTK_PLATFORM_CFG")
+            lines.append(f"  info:")
+            lines.append(f"    - config_version: V1.1.2")
+            lines.append(f"      platform: {platform}")
+            lines.append(f"      project: {project}")
+            lines.append(f"      storage: {storage}")
+            lines.append(f"      boot_channel: {boot_channel}")
+            lines.append(f"      block_size: {block_size}")
+            lines.append("")
+            lines.append("############################################################################################################")
+            lines.append("#")
+            lines.append("#  Layout Setting")
+            lines.append("#")
+            lines.append("############################################################################################################")
+            
+            for idx, part in enumerate(partitions):
+                lines.append(f"- partition_index: SYS{idx}")
+                lines.append(f"  partition_name: {part['name']}")
+                lines.append(f"  file_name: {part['file_name']}")
+                lines.append(f"  is_download: {'true' if part['is_download'] else 'false'}")
+                lines.append(f"  type: {part['type']}")
+                lines.append(f"  linear_start_addr: {part['linear_start_addr']}")
+                lines.append(f"  physical_start_addr: {part['physical_start_addr']}")
+                lines.append(f"  partition_size: {part['partition_size']}")
+                lines.append(f"  region: {part['region']}")
+                lines.append(f"  storage: {part['storage']}")
+                lines.append(f"  boundary_check: true")
+                lines.append(f"  is_reserved: {'true' if part['is_reserved'] else 'false'}")
+                lines.append(f"  operation_type: {part['operation_type']}")
+                lines.append(f"  reserve: 0x00")
+                lines.append("")
+            
+            return "\n".join(lines)
+        
+        def _scatter_preview(self):
+            """Show a preview of the scatter file."""
+            text = self._scatter_generate_text()
+            if not text:
+                self.scatter_preview_text.setPlainText("⚠️ No partitions defined. Add partitions or load a template first.")
+                return
+            self.scatter_preview_text.setPlainText(text)
+        
+        def _scatter_export(self):
+            """Export the scatter file to disk."""
+            text = self._scatter_generate_text()
+            if not text:
+                QMessageBox.warning(self, "Error", "No partitions defined. Add partitions or load a template first.")
+                return
+            
+            platform = self.scatter_platform.currentText().strip()
+            project = self.scatter_project.text().strip() or "project"
+            default_name = f"{platform}_{project}_Android_scatter.txt"
+            
+            path, _ = QFileDialog.getSaveFileName(
+                self, "💾 Save Scatter File", default_name,
+                "Scatter Files (*.txt);;All Files (*)"
+            )
+            if not path:
+                return
+            
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(text)
+                self.scatter_preview_text.setPlainText(
+                    f"✅ Mission accomplished! Scatter file saved:\n{path}\n\n"
+                    f"Partitions: {self.scatter_table.rowCount()}\n"
+                    f"Platform: {platform}\n"
+                    f"Project: {project}"
+                )
+                QMessageBox.information(self, "Success",
+                    f"Scatter file saved!\n\n{path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save scatter file:\n{e}")
+        
+        def _scatter_import_file(self):
+            """Import an existing scatter file."""
+            path, _ = QFileDialog.getOpenFileName(
+                self, "📥 Import Scatter File", "",
+                "Scatter Files (*.txt *.scatter);;All Files (*)"
+            )
+            if not path:
+                return
+            
+            try:
+                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                self._scatter_parse_and_load(content, path)
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Import Error", f"Failed to import scatter file:\n{e}")
+        
+        def _scatter_parse_and_load(self, content: str, source_name: str = ""):
+            """Parse scatter file content and populate the table."""
+            import re
+            
+            self.scatter_table.setRowCount(0)
+            
+            # Parse general settings
+            platform_match = re.search(r'platform:\s*(\S+)', content)
+            project_match = re.search(r'project:\s*(\S+)', content)
+            storage_match = re.search(r'storage:\s*(\S+)', content, re.MULTILINE)
+            boot_channel_match = re.search(r'boot_channel:\s*(\S+)', content)
+            block_size_match = re.search(r'block_size:\s*(\S+)', content)
+            
+            if platform_match:
+                self.scatter_platform.setCurrentText(platform_match.group(1))
+            if project_match:
+                self.scatter_project.setText(project_match.group(1))
+            if storage_match:
+                # Find the first storage match in general section (not per-partition)
+                for m in re.finditer(r'storage:\s*(\S+)', content):
+                    val = m.group(1)
+                    if val in ("EMMC", "UFS", "NAND"):
+                        self.scatter_storage.setCurrentText(val)
+                        break
+            if boot_channel_match:
+                self.scatter_boot_channel.setCurrentText(boot_channel_match.group(1))
+            if block_size_match:
+                self.scatter_block_size.setCurrentText(block_size_match.group(1))
+            
+            # Parse partitions using regex blocks
+            # Each partition block starts with "- partition_index:"
+            partition_blocks = re.split(r'(?=- partition_index:)', content)
+            
+            count = 0
+            for block in partition_blocks:
+                if '- partition_index:' not in block:
+                    continue
+                
+                name = re.search(r'partition_name:\s*(\S+)', block)
+                fname = re.search(r'file_name:\s*(\S+)', block)
+                linear_addr = re.search(r'linear_start_addr:\s*(\S+)', block)
+                phys_addr = re.search(r'physical_start_addr:\s*(\S+)', block)
+                size = re.search(r'partition_size:\s*(\S+)', block)
+                region = re.search(r'region:\s*(\S+)', block)
+                ptype = re.search(r'type:\s*(\S+)', block)
+                op_type = re.search(r'operation_type:\s*(\S+)', block)
+                is_dl = re.search(r'is_download:\s*(\S+)', block)
+                is_res = re.search(r'is_reserved:\s*(\S+)', block)
+                
+                if not name:
+                    continue
+                
+                self._scatter_add_partition(
+                    name=name.group(1) if name else "unknown",
+                    file_name=fname.group(1) if fname else "NONE",
+                    start_addr=phys_addr.group(1) if phys_addr else (linear_addr.group(1) if linear_addr else "0x0"),
+                    size=size.group(1) if size else "0x0",
+                    region=region.group(1) if region else "EMMC_USER",
+                    ptype=ptype.group(1) if ptype else "NORMAL_ROM",
+                    op_type=op_type.group(1) if op_type else "UPDATE",
+                    download=(is_dl.group(1).lower() == 'true') if is_dl else False,
+                    reserved=(is_res.group(1).lower() == 'true') if is_res else False,
+                )
+                count += 1
+            
+            src = f" from {os.path.basename(source_name)}" if source_name else ""
+            self.scatter_preview_text.setPlainText(
+                f"✅ Imported {count} partitions{src}\n"
+                f"Platform: {self.scatter_platform.currentText()}\n"
+                f"Project: {self.scatter_project.text()}\n"
+                f"Storage: {self.scatter_storage.currentText()}"
+            )
+        
+        def _scatter_import_gpt(self):
+            """Import partition layout from a binary GPT dump."""
+            path, _ = QFileDialog.getOpenFileName(
+                self, "💽 Import GPT Partition Table", "",
+                "GPT Dumps (*.bin *.img *.gpt);;All Files (*)"
+            )
+            if not path:
+                return
+            
+            try:
+                self._scatter_parse_gpt(path)
+            except Exception as e:
+                QMessageBox.critical(self, "GPT Import Error", f"Failed to parse GPT:\n{e}")
+        
+        def _scatter_parse_gpt(self, path: str):
+            """Parse a GPT partition table binary and populate the scatter table."""
+            import struct
+            import uuid
+            
+            with open(path, 'rb') as f:
+                data = f.read()
+            
+            # Locate GPT header — "EFI PART" signature
+            gpt_sig = b'EFI PART'
+            sig_offset = data.find(gpt_sig)
+            if sig_offset < 0:
+                QMessageBox.warning(self, "GPT Error",
+                    "No GPT header found (missing 'EFI PART' signature).\n"
+                    "Make sure you're loading a GPT partition table dump,\n"
+                    "not a full disk image.")
+                return
+            
+            # Parse GPT header
+            header = data[sig_offset:sig_offset + 92]
+            if len(header) < 92:
+                QMessageBox.warning(self, "GPT Error", "GPT header too short")
+                return
+            
+            (signature, revision, header_size, header_crc, reserved,
+             my_lba, alt_lba, first_usable, last_usable,
+             disk_guid_bytes,
+             part_entry_lba, num_entries, entry_size, part_crc
+            ) = struct.unpack_from('<8sIIIIQQQQ16sQIII', header, 0)
+            
+            # Determine sector size (usually 512, but check if header is at LBA 1)
+            sector_size = sig_offset  # If GPT header starts at offset 512, sector_size = 512
+            if sector_size == 0:
+                sector_size = 512  # Fallback
+            
+            # Partition entries typically start at LBA 2
+            if sig_offset == sector_size:
+                # We have the full disk from LBA 0
+                entry_offset = part_entry_lba * sector_size
+            else:
+                # Just the GPT area — entries likely follow the header
+                entry_offset = sig_offset + sector_size
+            
+            if entry_offset + num_entries * entry_size > len(data):
+                # Try entries right after header
+                entry_offset = sig_offset + header_size
+                if entry_offset + num_entries * entry_size > len(data):
+                    QMessageBox.warning(self, "GPT Error",
+                        "Cannot locate partition entries in the dump.\n"
+                        "Try providing a larger dump (include at least the first 34 sectors).")
+                    return
+            
+            self.scatter_table.setRowCount(0)
+            storage = self.scatter_storage.currentText()
+            
+            count = 0
+            for i in range(num_entries):
+                offset = entry_offset + i * entry_size
+                if offset + entry_size > len(data):
+                    break
+                
+                entry = data[offset:offset + entry_size]
+                type_guid = entry[0:16]
+                unique_guid = entry[16:32]
+                first_lba = struct.unpack_from('<Q', entry, 32)[0]
+                last_lba = struct.unpack_from('<Q', entry, 40)[0]
+                attributes = struct.unpack_from('<Q', entry, 48)[0]
+                
+                # Check if entry is empty (all zeros type GUID)
+                if type_guid == b'\x00' * 16:
+                    continue
+                
+                # Parse partition name (UTF-16LE, up to 72 bytes)
+                name_bytes = entry[56:128] if entry_size >= 128 else entry[56:]
+                try:
+                    part_name = name_bytes.decode('utf-16-le').rstrip('\x00').strip()
+                except (UnicodeDecodeError, ValueError):
+                    part_name = f"partition_{i}"
+                
+                if not part_name:
+                    continue
+                
+                # Calculate size in bytes
+                size_sectors = (last_lba - first_lba + 1) if last_lba >= first_lba else 0
+                size_bytes = size_sectors * sector_size
+                start_bytes = first_lba * sector_size
+                
+                # Guess file name
+                file_name = f"{part_name}.img"
+                
+                # Guess operation type based on partition name
+                op_type = "UPDATE"
+                ptype = "NORMAL_ROM"
+                download = True
+                if part_name in ("pgpt", "sgpt", "expdb", "flashinfo", "otp", "para", "cdt_engineering"):
+                    op_type = "INVISIBLE"
+                    file_name = "NONE"
+                    download = False
+                elif part_name in ("protect1", "protect2", "nvcfg", "persist"):
+                    op_type = "PROTECTED"
+                    ptype = "EXT4_IMG"
+                    download = False
+                elif part_name in ("seccfg", "sec1"):
+                    op_type = "INVISIBLE"
+                    download = False
+                elif part_name in ("nvram",):
+                    op_type = "BINREGION"
+                    download = False
+                elif part_name in ("nvdata", "metadata"):
+                    op_type = "INVISIBLE"
+                    download = False
+                elif part_name.startswith("lk") or part_name.startswith("tee") or part_name.startswith("scp") or \
+                     part_name.startswith("sspm") or part_name.startswith("gz") or part_name.startswith("spm"):
+                    op_type = "BOOTLOADERS"
+                elif part_name in ("proinfo",):
+                    op_type = "PROTECTED"
+                    download = False
+                elif part_name in ("userdata", "cache"):
+                    ptype = "EXT4_IMG"
+                elif part_name in ("super",):
+                    op_type = "UPDATE"
+                
+                region = "EMMC_USER" if storage == "EMMC" else "UFS_LU2"
+                if part_name == "preloader":
+                    region = "EMMC_BOOT1_BOOT2" if storage == "EMMC" else "UFS_LU1"
+                    ptype = "SV5_BL_BIN"
+                    op_type = "BOOTLOADERS"
+                    file_name = f"preloader_{self.scatter_project.text().strip() or 'project'}.bin"
+                
+                self._scatter_add_partition(
+                    name=part_name, file_name=file_name,
+                    start_addr=f"0x{start_bytes:X}",
+                    size=f"0x{size_bytes:X}",
+                    region=region, ptype=ptype, op_type=op_type,
+                    download=download, reserved=False
+                )
+                count += 1
+            
+            if count == 0:
+                QMessageBox.warning(self, "GPT Import", "No valid partitions found in GPT dump.")
+            else:
+                self.scatter_preview_text.setPlainText(
+                    f"✅ Imported {count} partitions from GPT dump\n"
+                    f"   Source: {os.path.basename(path)}\n"
+                    f"   Sector size: {sector_size} bytes\n\n"
+                    f"   ⚠️ Review region, type, and operation_type columns —\n"
+                    f"   GPT doesn't store MTK-specific metadata, so these are best guesses."
+                )
+        
         def _start_image_extract(self):
             if not hasattr(self, 'current_image_path'):
                 QMessageBox.warning(self, "Error", "Please analyze an image first")
@@ -16074,6 +19030,8 @@ def create_gui_app():
                     self._extract_ext4()
                 elif image_type == 'erofs':
                     self._extract_erofs()
+                elif image_type == 'f2fs':
+                    self._extract_f2fs()
                 elif image_type == 'lz4':
                     self._extract_lz4()
                 elif image_type == 'elf':
@@ -16226,6 +19184,37 @@ def create_gui_app():
                 self.log.emit(f"  Error: {e}")
                 raise
         
+        def _extract_f2fs(self):
+            self.log.emit("Extracting files from F2FS filesystem image...")
+            
+            extractor = F2fsImageExtractor()
+            file_names = [item.get('name') for item in self.selected_items if item.get('name')]
+            
+            total = len(file_names) if file_names else 1
+            self.progress.emit(0, total, "Extracting files from F2FS...")
+            
+            try:
+                results = extractor.extract(
+                    self.image_path, 
+                    self.output_dir, 
+                    file_names if file_names else None
+                )
+                
+                file_count = len(results.get('files', {}))
+                method = results.get('method', 'unknown')
+                
+                for name in results.get('files', {}).keys():
+                    self.log.emit(f"  Extracted: {name}")
+                
+                for err in results.get('errors', []):
+                    self.log.emit(f"  Warning: {err}")
+                
+                self.log.emit(f"\nExtracted {file_count} file(s) using {method}")
+                self.progress.emit(file_count, file_count, "F2FS extraction complete")
+            except Exception as e:
+                self.log.emit(f"  Error: {e}")
+                raise
+        
         def _extract_lz4(self):
             self.log.emit("Decompressing LZ4 compressed image...")
             
@@ -16279,6 +19268,8 @@ def create_gui_app():
                     self.log.emit("Hint: The decompressed file is EROFS - load it to extract contents")
                 elif decompressed_type == 'ext4':
                     self.log.emit("Hint: The decompressed file is ext4 - load it to extract contents")
+                elif decompressed_type == 'f2fs':
+                    self.log.emit("Hint: The decompressed file is F2FS - load it to extract contents")
                 elif decompressed_type == 'sparse':
                     self.log.emit("Hint: The decompressed file is sparse - load it to convert/extract")
                 
@@ -19305,7 +22296,28 @@ def create_gui_app():
             http_session = None
             try:
                 from curl_cffi.requests import Session as CurlSession
-                http_session = CurlSession()
+                import threading as _threading
+                
+                # Wrap curl_cffi Session with a lock for thread safety.
+                # Engine.IO uses the session from multiple threads simultaneously
+                # (_read_loop_polling + _write_loop), but curl_cffi's Session is
+                # NOT thread-safe. Without this lock, concurrent HTTP requests can
+                # corrupt internal libcurl state and cause permanent hangs.
+                class _ThreadSafeCurlSession(CurlSession):
+                    """Thread-safe wrapper around curl_cffi Session."""
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self._lock = _threading.Lock()
+                    
+                    def request(self, *args, **kwargs):
+                        with self._lock:
+                            return super().request(*args, **kwargs)
+                    
+                    def send(self, *args, **kwargs):
+                        with self._lock:
+                            return super().send(*args, **kwargs)
+                
+                http_session = _ThreadSafeCurlSession()
                 http_session.headers.update({
                     'User-Agent': f'ImageAnarchy/{APP_VERSION}',
                     'CF-Access-Client-Id': CF_ACCESS_CLIENT_ID,
@@ -19326,10 +22338,11 @@ def create_gui_app():
                     return
             
             # Create socket.io client with the pre-configured http session
-            # Using more aggressive reconnection settings for reliability with polling transport
+            # Finite reconnection to prevent infinite polling threads that block exit.
+            # 30 attempts with exponential backoff (1s → 10s) covers ~3 minutes of downtime.
             self.sio = socketio.Client(
                 reconnection=True,
-                reconnection_attempts=0,  # 0 = infinite reconnection attempts
+                reconnection_attempts=30,  # Finite — prevents stuck daemon threads
                 reconnection_delay=1,
                 reconnection_delay_max=10,
                 logger=False,  # Disable verbose logging
@@ -19554,12 +22567,31 @@ def create_gui_app():
             thread.start()
             
         def disconnect_chat(self):
-            """Disconnect from the chat server."""
-            if self.sio and self.connected:
+            """Disconnect from the chat server.
+            
+            Uses a timeout to prevent hanging if the server is unreachable
+            and the disconnect handshake blocks on curl_cffi.
+            """
+            if self.sio:
                 try:
-                    self.sio.disconnect()
-                except:
+                    # Attempt graceful disconnect with a timeout.
+                    # sio.disconnect() can block if the polling thread is stuck
+                    # in a curl_cffi HTTP request, so do it in a thread with a timeout.
+                    import threading
+                    def _do_disconnect():
+                        try:
+                            self.sio.disconnect()
+                        except Exception:
+                            pass
+                    t = threading.Thread(target=_do_disconnect, daemon=True)
+                    t.start()
+                    t.join(timeout=3)  # Wait max 3 seconds for graceful disconnect
+                    if t.is_alive():
+                        logger.warning("[CHAT] disconnect_chat timed out — forcing cleanup")
+                except Exception:
                     pass
+                # Ensure the sio reference is cleared so engineio threads can be GC'd
+                self.sio = None
             self.connected = False
             self.username = None
             self._on_connection_changed(False, "Disconnected")
@@ -20906,10 +23938,24 @@ def create_gui_app():
                 return
 
             # Build HTTP session with CF auth (curl_cffi for Cloudflare bypass)
+            # Use thread-safe wrapper — engine.io polling uses session from multiple threads
             http_session = None
             try:
                 from curl_cffi.requests import Session as CurlSession
-                http_session = CurlSession()
+                import threading as _threading
+                
+                class _ThreadSafeCurlSession(CurlSession):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self._lock = _threading.Lock()
+                    def request(self, *args, **kwargs):
+                        with self._lock:
+                            return super().request(*args, **kwargs)
+                    def send(self, *args, **kwargs):
+                        with self._lock:
+                            return super().send(*args, **kwargs)
+                
+                http_session = _ThreadSafeCurlSession()
                 http_session.headers.update(get_rc_cf_headers())
             except ImportError:
                 try:
@@ -23777,6 +26823,38 @@ def create_gui_app():
             self._store_refresh_thread.error.connect(on_store_refresh_error)
             self._store_refresh_thread.start()
         
+        @staticmethod
+        def _compare_versions(v1: str, v2: str) -> int:
+            """Compare two version strings (semver-like).
+            
+            Returns:
+                -1 if v1 < v2, 0 if equal, 1 if v1 > v2
+            """
+            def normalize(v):
+                parts = []
+                for p in str(v).split('.'):
+                    try:
+                        parts.append(int(p))
+                    except ValueError:
+                        parts.append(0)
+                while len(parts) < 3:
+                    parts.append(0)
+                return parts
+            
+            p1, p2 = normalize(v1), normalize(v2)
+            if p1 < p2:
+                return -1
+            elif p1 > p2:
+                return 1
+            return 0
+        
+        def _get_installed_versions(self) -> dict:
+            """Get a map of installed plugin_id -> version string."""
+            versions = {}
+            for pid, manifest in plugin_manager.manifests.items():
+                versions[pid] = manifest.version
+            return versions
+        
         def _display_store_plugins(self, plugins: list):
             """Display plugins in the store grid."""
             # Clear existing
@@ -23785,34 +26863,77 @@ def create_gui_app():
                 if item.widget():
                     item.widget().deleteLater()
             
+            # Build installed version map for badge display
+            installed_versions = self._get_installed_versions()
+            
             row, col = 0, 0
             max_cols = 3
             
             for plugin in plugins:
-                card = self._create_store_plugin_card(plugin)
+                card = self._create_store_plugin_card(plugin, installed_versions)
                 self.store_grid_layout.addWidget(card, row, col)
                 col += 1
                 if col >= max_cols:
                     col = 0
                     row += 1
         
-        def _create_store_plugin_card(self, plugin: dict) -> QWidget:
+        def _create_store_plugin_card(self, plugin: dict, installed_versions: dict = None) -> QWidget:
             """Create a modern card widget for a store plugin."""
+            if installed_versions is None:
+                installed_versions = {}
+            
+            plugin_id = plugin.get('id', '')
+            store_version = plugin.get('version', '1.0')
+            installed_ver = installed_versions.get(plugin_id)
+            
+            # Determine status badge
+            has_update = False
+            is_installed = installed_ver is not None
+            if is_installed and self._compare_versions(installed_ver, store_version) < 0:
+                has_update = True
+            
+            # Check if recently updated (within last 7 days)
+            is_recently_updated = False
+            updated_at = plugin.get('updated_at', '')
+            if updated_at:
+                try:
+                    from datetime import datetime, timedelta
+                    if isinstance(updated_at, str):
+                        # Handle ISO format or MySQL datetime
+                        updated_at_clean = updated_at.replace('T', ' ').replace('Z', '').split('.')[0]
+                        update_dt = datetime.strptime(updated_at_clean, '%Y-%m-%d %H:%M:%S')
+                    else:
+                        update_dt = datetime.fromtimestamp(updated_at)
+                    is_recently_updated = (datetime.now() - update_dt).days <= 7
+                except Exception:
+                    pass
+            
+            # Choose card border color based on status
+            if has_update:
+                border_color = '#f44336'  # Red for update available
+                hover_border = '#ff7043'
+            elif is_recently_updated and not is_installed:
+                border_color = '#ff9800'  # Orange for recently updated
+                hover_border = '#ffb74d'
+            else:
+                border_color = '#3a3a4a'
+                hover_border = '#4fc3f7'
+            
             card = QFrame()
             card.setFrameShape(QFrame.Shape.StyledPanel)
-            card.setStyleSheet("""
-                QFrame {
+            card.setStyleSheet(f"""
+                QFrame {{
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                                 stop:0 #2d2d3a, stop:1 #1e1e28);
-                    border: 1px solid #3a3a4a;
+                    border: 1px solid {border_color};
                     border-radius: 12px;
                     padding: 0px;
-                }
-                QFrame:hover {
-                    border: 2px solid #4fc3f7;
+                }}
+                QFrame:hover {{
+                    border: 2px solid {hover_border};
                     background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                                 stop:0 #353545, stop:1 #252530);
-                }
+                }}
             """)
             card.setFixedSize(280, 220)
             
@@ -23846,12 +26967,68 @@ def create_gui_app():
             name_col = QVBoxLayout()
             name_col.setSpacing(2)
             
+            # Name row with status badge
+            name_row = QHBoxLayout()
+            name_row.setSpacing(6)
+            
             name_label = QLabel(plugin.get('name', 'Unknown'))
             name_label.setStyleSheet("font-weight: bold; font-size: 14px; color: #ffffff; background: transparent; border: none;")
             name_label.setWordWrap(True)
-            name_col.addWidget(name_label)
+            name_row.addWidget(name_label, 1)
             
-            info_label = QLabel(f"by {plugin.get('author_name', 'Unknown')} • v{plugin.get('version', '1.0')}")
+            # Status badge
+            if has_update:
+                badge = QLabel("🔄 UPDATE")
+                badge.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(244, 67, 54, 0.25);
+                        color: #ff5252;
+                        font-weight: bold;
+                        font-size: 9px;
+                        padding: 2px 6px;
+                        border-radius: 6px;
+                        border: none;
+                    }
+                """)
+                badge.setToolTip(f"Update available: v{installed_ver} → v{store_version}")
+                name_row.addWidget(badge)
+            elif is_installed:
+                badge = QLabel("✅")
+                badge.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(76, 175, 80, 0.2);
+                        color: #4CAF50;
+                        font-size: 9px;
+                        padding: 2px 6px;
+                        border-radius: 6px;
+                        border: none;
+                    }
+                """)
+                badge.setToolTip(f"Installed (v{installed_ver})")
+                name_row.addWidget(badge)
+            elif is_recently_updated:
+                badge = QLabel("🆕 NEW")
+                badge.setStyleSheet("""
+                    QLabel {
+                        background-color: rgba(255, 152, 0, 0.2);
+                        color: #ff9800;
+                        font-weight: bold;
+                        font-size: 9px;
+                        padding: 2px 6px;
+                        border-radius: 6px;
+                        border: none;
+                    }
+                """)
+                badge.setToolTip("Recently updated")
+                name_row.addWidget(badge)
+            
+            name_col.addLayout(name_row)
+            
+            # Version info line
+            version_text = f"by {plugin.get('author_name', 'Unknown')} • v{store_version}"
+            if has_update:
+                version_text += f"  (you: v{installed_ver})"
+            info_label = QLabel(version_text)
             info_label.setStyleSheet("color: #8888aa; font-size: 11px; background: transparent; border: none;")
             name_col.addWidget(info_label)
             
@@ -23932,26 +27109,47 @@ def create_gui_app():
             
             footer.addStretch()
             
-            # Details button - modern style
-            details_btn = QPushButton("Details")
-            details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            details_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #4fc3f7;
-                    color: #000000;
-                    font-weight: bold;
-                    font-size: 11px;
-                    padding: 6px 16px;
-                    border-radius: 12px;
-                    border: none;
-                }
-                QPushButton:hover {
-                    background-color: #81d4fa;
-                }
-                QPushButton:pressed {
-                    background-color: #29b6f6;
-                }
-            """)
+            # Details/Update button - modern style
+            if has_update:
+                details_btn = QPushButton("🔄 Update")
+                details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                details_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #f44336;
+                        color: #ffffff;
+                        font-weight: bold;
+                        font-size: 11px;
+                        padding: 6px 16px;
+                        border-radius: 12px;
+                        border: none;
+                    }
+                    QPushButton:hover {
+                        background-color: #ff7043;
+                    }
+                    QPushButton:pressed {
+                        background-color: #e53935;
+                    }
+                """)
+            else:
+                details_btn = QPushButton("Details")
+                details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                details_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #4fc3f7;
+                        color: #000000;
+                        font-weight: bold;
+                        font-size: 11px;
+                        padding: 6px 16px;
+                        border-radius: 12px;
+                        border: none;
+                    }
+                    QPushButton:hover {
+                        background-color: #81d4fa;
+                    }
+                    QPushButton:pressed {
+                        background-color: #29b6f6;
+                    }
+                """)
             details_btn.clicked.connect(lambda checked, p=plugin: self._show_plugin_details(p))
             footer.addWidget(details_btn)
             
@@ -24000,6 +27198,27 @@ def create_gui_app():
             author_label = QLabel(f"by <b>{full_plugin.get('author_name', 'Unknown')}</b> • v{full_plugin.get('version', '1.0')}")
             author_label.setStyleSheet("color: #888;")
             header_info.addWidget(author_label)
+            
+            # Version comparison with installed
+            detail_plugin_id = full_plugin.get('id', '')
+            detail_installed_ver = self._get_installed_versions().get(detail_plugin_id)
+            detail_store_ver = full_plugin.get('version', '1.0')
+            
+            if detail_installed_ver is not None:
+                cmp = self._compare_versions(detail_installed_ver, detail_store_ver)
+                if cmp < 0:
+                    ver_label = QLabel(
+                        f"<span style='color: #f44336; font-weight: bold;'>"
+                        f"🔄 Update available: v{detail_installed_ver} → v{detail_store_ver}</span>"
+                    )
+                    ver_label.setTextFormat(Qt.TextFormat.RichText)
+                elif cmp == 0:
+                    ver_label = QLabel(f"✅ You have the latest version (v{detail_installed_ver})")
+                    ver_label.setStyleSheet("color: #4CAF50; font-size: 11px;")
+                else:
+                    ver_label = QLabel(f"🔮 You have a newer version (v{detail_installed_ver}) than store (v{detail_store_ver})")
+                    ver_label.setStyleSheet("color: #ff9800; font-size: 11px;")
+                header_info.addWidget(ver_label)
             
             # Safely convert rating to float (API may return string)
             try:
@@ -24207,8 +27426,16 @@ def create_gui_app():
             close_btn.clicked.connect(dialog.reject)
             btn_layout.addWidget(close_btn)
             
-            install_btn = QPushButton("⬇️ Install Plugin")
-            install_btn.setStyleSheet("background-color: #4CAF50; padding: 10px 24px; font-size: 14px;")
+            # Smart install/update button
+            if detail_installed_ver is not None and self._compare_versions(detail_installed_ver, detail_store_ver) < 0:
+                install_btn = QPushButton(f"🔄 Update Plugin (v{detail_installed_ver} → v{detail_store_ver})")
+                install_btn.setStyleSheet("background-color: #f44336; color: white; padding: 10px 24px; font-size: 14px; font-weight: bold;")
+            elif detail_installed_ver is not None:
+                install_btn = QPushButton("🔄 Reinstall Plugin")
+                install_btn.setStyleSheet("background-color: #666; color: white; padding: 10px 24px; font-size: 14px;")
+            else:
+                install_btn = QPushButton("⬇️ Install Plugin")
+                install_btn.setStyleSheet("background-color: #4CAF50; padding: 10px 24px; font-size: 14px;")
             install_btn.clicked.connect(lambda: self._install_from_details(dialog, full_plugin))
             btn_layout.addWidget(install_btn)
             
@@ -29828,10 +33055,23 @@ This Agreement constitutes the entire agreement between Developer and Image Anar
                     QApplication.instance().postEvent(_event_receiver, _CallableEvent(fn))
                 
                 # Build HTTP session with CF auth (curl_cffi for Cloudflare bypass)
+                # Use thread-safe wrapper — engine.io uses session from multiple threads
                 http_session = None
                 try:
                     from curl_cffi.requests import Session as CurlSession
-                    http_session = CurlSession()
+                    
+                    class _ThreadSafeCurlSession(CurlSession):
+                        def __init__(self, *args, **kwargs):
+                            super().__init__(*args, **kwargs)
+                            self._ts_lock = threading.Lock()
+                        def request(self, *args, **kwargs):
+                            with self._ts_lock:
+                                return super().request(*args, **kwargs)
+                        def send(self, *args, **kwargs):
+                            with self._ts_lock:
+                                return super().send(*args, **kwargs)
+                    
+                    http_session = _ThreadSafeCurlSession()
                     http_session.headers.update(get_rc_cf_headers())
                 except ImportError:
                     try:
@@ -30936,8 +34176,9 @@ Examples:
         plugins_tab = PluginsTab(window)
         window.tab_widget.addTab(plugins_tab, "🔌 Plugins")
         
-        # Add Chat tab
+        # Add Chat tab (store reference for cleanup on exit)
         chat_tab = ChatTab(window)
+        window.chat_tab = chat_tab
         window.tab_widget.addTab(chat_tab, "💬 Chat")
         
         # Add Forum tab
