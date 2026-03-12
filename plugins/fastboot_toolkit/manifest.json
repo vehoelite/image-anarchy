@@ -1,8 +1,8 @@
 {
     "id": "fastboot_toolkit",
     "name": "Fastboot Toolkit",
-    "version": "1.0",
-    "description": "Comprehensive Fastboot toolkit - Flash partitions, Boot images, OEM unlock/lock, Erase, Device info, Reboot options and more. Includes bundled platform-tools (Fastboot).",
+    "version": "1.5.0",
+    "description": "Comprehensive Fastboot toolkit - Flash, Boot, OEM unlock/lock, Erase, Device info, Shell, Reboot + Boot Image Mods with boot/init_boot/vendor_boot support, LZ4 legacy ramdisk format + ADB Rescue: inject ADB key into product partition via recovery root shell for broken-screen devices (zero screen interaction, survives reboots). Pure Python.",
     "author": "Image Anarchy Team",
     "icon": "⚡",
     "license_type": "free",
@@ -11,8 +11,7 @@
     "min_version": "1.0",
     "git_clone": null,
     "requirements": [],
-    "bundled_binaries": ["https://imageanarchy.com/platform-tools/fastboot.exe", "https://imageanarchy.com/platform-tools/AdbWinApi.dll", "https://imageanarchy.com/platform-tools/AdbWinUsbApi.dll", "https://imageanarchy.com/platform-tools/libwinpthread-1.dll", "https://imageanarchy.com/platform-tools/mke2fs.exe", "https://imageanarchy.com/platform-tools/mke2fs.conf", "https://imageanarchy.com/platform-tools/make_f2fs.exe"],
+    "bundled_binaries": ["https://imageanarchy.com/platform-tools/fastboot.exe", "https://imageanarchy.com/platform-tools/adb.exe", "https://imageanarchy.com/platform-tools/AdbWinApi.dll", "https://imageanarchy.com/platform-tools/AdbWinUsbApi.dll", "https://imageanarchy.com/platform-tools/libwinpthread-1.dll", "https://imageanarchy.com/platform-tools/mke2fs.exe", "https://imageanarchy.com/platform-tools/mke2fs.conf", "https://imageanarchy.com/platform-tools/make_f2fs.exe"],
     "setup_commands": [],
-    "enabled": true,
-    "remote_capable": true
+    "enabled": true
 }
