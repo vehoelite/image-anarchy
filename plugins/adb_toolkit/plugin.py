@@ -19,6 +19,7 @@ import sys
 import subprocess
 import shutil
 import tempfile
+import time
 from typing import Optional, List
 from datetime import datetime
 
@@ -298,8 +299,11 @@ class AdbWorkerThread(QThread):
         device = self.kwargs.get('device')
         partition_path = self.kwargs.get('partition_path')
         partition_name = self.kwargs.get('partition_name')
-        output_dir = self.kwargs.get('output_dir')
+        base_output_dir = self.kwargs.get('output_dir')
         
+        # Create partition-specific subfolder (e.g., output/boot/ for boot.img)
+        output_dir = os.path.join(base_output_dir, partition_name)
+        os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, f"{partition_name}.img")
         self.log.emit(f"Pulling {partition_name}...")
         
@@ -487,6 +491,245 @@ class AdbWorkerThread(QThread):
         self.finished_signal.emit(success, "Logcat retrieved")
 
 
+class RootExtractWorker(QThread):
+    """Worker thread for extracting the live filesystem from a rooted device."""
+    
+    progress = pyqtSignal(int, int)  # current, total
+    status = pyqtSignal(str)
+    log = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self, device: str, paths: list, output_dir: str,
+                 save_permissions: bool = True, skip_errors: bool = True,
+                 include_symlinks: bool = True, max_file_mb: int = 500):
+        super().__init__()
+        self.device = device
+        self.paths = paths
+        self.output_dir = output_dir
+        self.save_permissions = save_permissions
+        self.skip_errors = skip_errors
+        self.include_symlinks = include_symlinks
+        self.max_file_mb = max_file_mb
+        self._cancelled = False
+        self.adb_path = find_adb()
+        
+        self.files_extracted = 0
+        self.files_failed = 0
+        self.files_skipped = 0
+        self.total_bytes = 0
+        self.permissions_log = []
+    
+    def cancel(self):
+        self._cancelled = True
+    
+    def run(self):
+        if not self.adb_path:
+            self.finished.emit(False, "ADB not found")
+            return
+        
+        # Check root access
+        self.status.emit("Checking root access...")
+        result = subprocess.run(
+            [self.adb_path, "-s", self.device, "shell", "su", "-c", "id"],
+            capture_output=True, text=True, timeout=10
+        )
+        
+        if "uid=0" not in result.stdout:
+            self.finished.emit(False, "ROOT ACCESS REQUIRED - Device is not rooted or su was denied")
+            return
+        
+        self.log.emit("✓ Root access confirmed")
+        
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Phase 1: Create all tar archives on device
+        total_paths = len(self.paths)
+        self.log.emit(f"\n📦 Phase 1: Creating {total_paths} tar archives on device...")
+        tar_jobs = []  # (remote_tar, local_tar, partition_name, remote_path)
+        
+        for idx, remote_path in enumerate(self.paths):
+            if self._cancelled:
+                break
+            
+            partition_name = self._get_partition_name(remote_path)
+            remote_tar = f"/data/local/tmp/_extract_{partition_name}.tar"
+            local_tar = os.path.join(self.output_dir, f"{partition_name}.tar")
+            
+            pct = int((idx / total_paths) * 33)  # Phase 1 is 0-33%
+            self.progress.emit(pct, 100)
+            self.status.emit(f"[{pct}%] Creating tar [{idx+1}/{total_paths}]: {partition_name}...")
+            self.log.emit(f"   📁 {remote_path} → {partition_name}.tar")
+            
+            # Create tar on device (run as root)
+            tar_cmd = f"su -c \"tar -cf '{remote_tar}' -C / '{remote_path.lstrip('/')}' 2>/dev/null\""
+            subprocess.run(
+                [self.adb_path, "-s", self.device, "shell", tar_cmd],
+                capture_output=True, timeout=600
+            )
+            
+            # Verify tar was created and get size
+            check = subprocess.run(
+                [self.adb_path, "-s", self.device, "shell", f"ls -l '{remote_tar}' 2>/dev/null"],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if remote_tar in check.stdout:
+                try:
+                    size = int(check.stdout.split()[4])
+                    self.log.emit(f"      ✓ {size / 1024 / 1024:.1f} MB")
+                    tar_jobs.append((remote_tar, local_tar, partition_name, remote_path, size))
+                except:
+                    tar_jobs.append((remote_tar, local_tar, partition_name, remote_path, 0))
+            else:
+                self.log.emit(f"      ⚠️ Failed to create tar for {remote_path}")
+                self.files_failed += 1
+        
+        if self._cancelled or not tar_jobs:
+            self.finished.emit(False, "Cancelled or no tars created")
+            return
+        
+        # Phase 2: Pull all tar files
+        total_tar_size = sum(job[4] for job in tar_jobs)
+        self.log.emit(f"\n📥 Phase 2: Pulling {len(tar_jobs)} tar archives ({total_tar_size / 1024 / 1024:.1f} MB total)...")
+        pulled_tars = []
+        pulled_bytes = 0
+        
+        for i, (remote_tar, local_tar, partition_name, remote_path, tar_size) in enumerate(tar_jobs):
+            if self._cancelled:
+                break
+            
+            # Phase 2 is 33-66%
+            pct = 33 + int((i / len(tar_jobs)) * 33)
+            self.progress.emit(pct, 100)
+            self.status.emit(f"[{pct}%] Pulling [{i+1}/{len(tar_jobs)}]: {partition_name}.tar...")
+            
+            pull_result = subprocess.run(
+                [self.adb_path, "-s", self.device, "pull", remote_tar, local_tar],
+                capture_output=True, text=True, timeout=1800
+            )
+            
+            if pull_result.returncode == 0 and os.path.exists(local_tar):
+                size = os.path.getsize(local_tar)
+                self.total_bytes += size
+                pulled_bytes += size
+                self.log.emit(f"   ✓ {partition_name}.tar ({size / 1024 / 1024:.1f} MB)")
+                pulled_tars.append((local_tar, partition_name))
+            else:
+                self.log.emit(f"   ❌ Failed to pull {partition_name}.tar")
+                self.files_failed += 1
+            
+            # Clean up remote tar immediately after pull
+            subprocess.run(
+                [self.adb_path, "-s", self.device, "shell", f"rm -f '{remote_tar}'"],
+                capture_output=True, timeout=10
+            )
+        
+        if self._cancelled:
+            self.finished.emit(False, "Cancelled")
+            return
+        
+        # Phase 3: Extract all tars locally
+        self.log.emit(f"\n📂 Phase 3: Extracting {len(pulled_tars)} archives locally...")
+        import tarfile
+        
+        total_extracted = 0
+        for i, (local_tar, partition_name) in enumerate(pulled_tars):
+            if self._cancelled:
+                break
+            
+            # Phase 3 is 66-100%
+            base_pct = 66 + int((i / len(pulled_tars)) * 34)
+            self.progress.emit(base_pct, 100)
+            self.status.emit(f"[{base_pct}%] Extracting [{i+1}/{len(pulled_tars)}]: {partition_name}...")
+            
+            output_dir = os.path.join(self.output_dir, partition_name)
+            os.makedirs(output_dir, exist_ok=True)
+            
+            try:
+                with tarfile.open(local_tar, 'r') as tar:
+                    members = tar.getmembers()
+                    total = len(members)
+                    self.log.emit(f"   📦 {partition_name}: {total} files")
+                    
+                    for j, member in enumerate(members):
+                        if self._cancelled:
+                            break
+                        
+                        # Update progress within this tar extraction
+                        if j % 100 == 0 or j == total - 1:
+                            inner_pct = int((j / total) * 100) if total > 0 else 100
+                            tar_pct = 66 + int((i / len(pulled_tars)) * 34) + int((1 / len(pulled_tars)) * 34 * (j / total))
+                            self.progress.emit(min(tar_pct, 99), 100)
+                            self.status.emit(f"[{min(tar_pct, 99)}%] {partition_name}: {j}/{total} ({inner_pct}%)")
+                        
+                        try:
+                            tar.extract(member, output_dir)
+                            self.files_extracted += 1
+                        except Exception as e:
+                            self.files_failed += 1
+                    
+                    self.log.emit(f"   ✓ Extracted {partition_name} ({total} files)")
+                    
+            except tarfile.TarError as e:
+                self.log.emit(f"   ⚠️ Tar error for {partition_name}: {e}")
+                self.files_failed += 1
+            
+            # Delete tar after extraction to save space
+            try:
+                os.remove(local_tar)
+            except:
+                pass
+        
+        self.progress.emit(100, 100)
+        
+        # Summary
+        summary = (
+            f"✅ Extraction complete!\n"
+            f"   Files extracted: {self.files_extracted}\n"
+            f"   Files failed: {self.files_failed}\n"
+            f"   Total size: {self.total_bytes / 1024 / 1024:.1f} MB\n"
+            f"   Output: {self.output_dir}"
+        )
+        
+        self.finished.emit(True, summary)
+    
+    def _get_partition_name(self, path: str) -> str:
+        """Get a clean partition/folder name from the path."""
+        # Remove leading slash and get first component
+        parts = path.strip('/').split('/')
+        
+        if len(parts) == 1:
+            return parts[0]
+        
+        # For nested paths like /data/data, use meaningful name
+        if path.startswith('/data/data'):
+            return 'data_app_data'
+        elif path.startswith('/data/app'):
+            return 'data_apps'
+        elif path.startswith('/data/misc'):
+            return 'data_misc'
+        elif path.startswith('/data/system'):
+            return 'data_system'
+        elif path.startswith('/data'):
+            return 'data'
+        elif path.startswith('/sdcard/DCIM'):
+            return 'sdcard_dcim'
+        elif path.startswith('/sdcard/Download'):
+            return 'sdcard_download'
+        elif path.startswith('/sdcard'):
+            return 'sdcard'
+        elif path.startswith('/mnt/vendor/nvdata'):
+            return 'nvdata'
+        elif path.startswith('/mnt/vendor/nvcfg'):
+            return 'nvcfg'
+        elif path.startswith('/mnt/vendor/protect'):
+            return 'protect'
+        
+        # Default: use first path component
+        return parts[0]
+
+
 class AdbToolkitPlugin:
     """Comprehensive ADB Toolkit Plugin."""
     
@@ -560,7 +803,10 @@ class AdbToolkitPlugin:
         # Tab 6: Tools
         self.tabs.addTab(self._create_tools_tab(), "🔧 Tools")
         
-        # Tab 7: Reboot
+        # Tab 7: Root Extract (Full Filesystem)
+        self.tabs.addTab(self._create_root_extract_tab(), "🌳 Root Extract")
+        
+        # Tab 8: Reboot
         self.tabs.addTab(self._create_reboot_tab(), "🔄 Reboot")
         
         main_layout.addWidget(self.tabs)
@@ -828,23 +1074,21 @@ class AdbToolkitPlugin:
             QMessageBox.warning(self.parent_window, "Error", "Select partitions first")
             return
         
-        # Determine output directory based on setup mode
+        # Determine base output directory
         if self._setup_base_dir:
-            # Setup directories mode - each partition goes to its own folder
-            data = selected[0].data(Qt.ItemDataRole.UserRole)
-            output_dir = os.path.join(self._setup_base_dir, data['name'])
-            os.makedirs(output_dir, exist_ok=True)
+            base_output_dir = self._setup_base_dir
         else:
-            # Manual output directory mode
-            output_dir = self.partition_output.text()
-            os.makedirs(output_dir, exist_ok=True)
+            base_output_dir = self.partition_output.text()
+        
+        os.makedirs(base_output_dir, exist_ok=True)
         
         # Pull first selected (simplified - could queue all)
+        # Note: Worker thread will create partition subfolder automatically
         data = selected[0].data(Qt.ItemDataRole.UserRole)
         self.worker = AdbWorkerThread("pull_partition", device=device,
                                        partition_path=data['path'],
                                        partition_name=data['name'],
-                                       output_dir=output_dir)
+                                       output_dir=base_output_dir)
         self.worker.log.connect(self._log)
         self.worker.finished_signal.connect(lambda s, m: self._log(m))
         self.worker.start()
@@ -1955,20 +2199,11 @@ class AdbToolkitPlugin:
             return
         
         self._log("Checking OEM unlock status...")
-        print("[OEM Check] Gathering device unlock information...")
         
         state = self._get_oem_state(device, adb_path)
         
-        print(f"[OEM Check] Settings value: {state['settings_value']}")
-        print(f"[OEM Check] Runtime value: {state['runtime_value']}")
-        print(f"[OEM Check] Is truly enabled: {state['is_truly_enabled']}")
-        print(f"[OEM Check] Needs reboot: {state['needs_reboot']}")
-        if state['blocked_reason']:
-            print(f"[OEM Check] Blocked reason: {state['blocked_reason']}")
-        
         self.oem_status_label.setText(self._format_oem_status(state))
         self._log("OEM status check complete")
-        print("[OEM Check] Status check complete")
     
     def _enable_oem_unlock(self):
         """Attempt to enable OEM unlocking via settings"""
@@ -1995,7 +2230,6 @@ class AdbToolkitPlugin:
             return
         
         self._log("Attempting to enable OEM unlock...")
-        print("[OEM Unlock] Attempting to enable OEM unlock setting...")
         
         try:
             result = subprocess.run(
@@ -2011,7 +2245,6 @@ class AdbToolkitPlugin:
                 )
                 return
             
-            print("[OEM Unlock] Command executed, checking new state...")
             after_state = self._get_oem_state(device, adb_path)
             
             if after_state['is_truly_enabled']:
@@ -2065,7 +2298,6 @@ class AdbToolkitPlugin:
                 
         except Exception as e:
             self._log(f"✗ Error: {e}")
-            print(f"[OEM Unlock] ✗ Exception: {e}")
             self.oem_status_label.setText(f"✗ <b style='color:#f44747'>Error: {e}</b>")
     
     def _reboot_and_wait_for_oem(self, device, adb_path):
@@ -2167,7 +2399,6 @@ class AdbToolkitPlugin:
             return
         
         self._log("Opening Developer Options...")
-        print("[OEM] Opening Developer Options on device...")
         
         try:
             # Try the standard developer options intent
@@ -2179,7 +2410,6 @@ class AdbToolkitPlugin:
             
             if result.returncode == 0 and "Error" not in result.stdout:
                 self._log("✓ Developer Options opened on device")
-                print("[OEM] ✓ Developer Options opened")
             else:
                 # Try alternate method
                 result2 = subprocess.run(
@@ -2189,14 +2419,11 @@ class AdbToolkitPlugin:
                 )
                 if result2.returncode == 0:
                     self._log("✓ Developer Options opened on device")
-                    print("[OEM] ✓ Developer Options opened (alternate)")
                 else:
                     self._log("⚠ Could not open Developer Options directly")
-                    print(f"[OEM] ⚠ Could not open: {result.stdout} {result2.stdout}")
                     
         except Exception as e:
             self._log(f"✗ Error: {e}")
-            print(f"[OEM] ✗ Error opening Developer Options: {e}")
     
     def _take_screenshot(self):
         device = self._get_device()
@@ -2220,6 +2447,303 @@ class AdbToolkitPlugin:
         self.worker.finished_signal.connect(lambda s, m: self._log(m))
         self.worker.start()
     
+    # ===== ROOT EXTRACT TAB =====
+    def _create_root_extract_tab(self):
+        """Create the Root Filesystem Extract tab - pulls live files like root explorer."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Scroll area for all content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        
+        scroll_content = QWidget()
+        layout = QVBoxLayout(scroll_content)
+        layout.setSpacing(8)
+        
+        # Warning/Info banner
+        info_banner = QLabel(
+            "🌳 <b>Root Filesystem Extractor</b> - "
+            "Extract the live filesystem just like using Root Explorer on your phone. "
+            "⚠️ <b>Requires ROOT access</b> - Files are organized by partition/mount point."
+        )
+        info_banner.setWordWrap(True)
+        info_banner.setStyleSheet("background: #1a472a; padding: 8px; border-radius: 5px; color: #90EE90;")
+        layout.addWidget(info_banner)
+        
+        # Partition/Path selection
+        paths_group = QGroupBox("📁 Select Paths to Extract")
+        paths_layout = QVBoxLayout(paths_group)
+        paths_layout.setSpacing(4)
+        
+        # Predefined common paths
+        self.root_extract_paths = QListWidget()
+        self.root_extract_paths.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.root_extract_paths.setMinimumHeight(150)
+        self.root_extract_paths.setMaximumHeight(200)
+        
+        # Common Android paths with descriptions
+        common_paths = [
+            ("/system", "System - OS files, apps, framework"),
+            ("/vendor", "Vendor - device drivers/HALs"),
+            ("/product", "Product - OEM customizations"),
+            ("/data", "Data - user apps and data (large!)"),
+            ("/data/data", "App private data only"),
+            ("/data/app", "Installed APKs"),
+            ("/data/misc", "Misc - WiFi, Bluetooth configs"),
+            ("/data/system", "System databases and settings"),
+            ("/sdcard", "Internal storage (user files)"),
+            ("/sdcard/DCIM", "Camera photos/videos"),
+            ("/sdcard/Download", "Downloaded files"),
+            ("/efs", "EFS - IMEI, calibration (Samsung)"),
+            ("/persist", "Persist - calibration data"),
+            ("/mnt/vendor/nvdata", "NVRAM data (MTK)"),
+            ("/mnt/vendor/nvcfg", "NVRAM config (MTK)"),
+            ("/mnt/vendor/protect_f", "Protected data (MTK)"),
+            ("/cache", "Cache partition"),
+            ("/metadata", "Metadata partition"),
+            ("/dev/block/by-name", "List partition block devices"),
+        ]
+        
+        for path, desc in common_paths:
+            item = QListWidgetItem(f"{path}  →  {desc}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.root_extract_paths.addItem(item)
+        
+        # Select common ones by default
+        for i in [0, 1, 2]:  # system, vendor, product
+            self.root_extract_paths.item(i).setSelected(True)
+        
+        paths_layout.addWidget(self.root_extract_paths)
+        
+        # Quick select buttons
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(4)
+        
+        select_all_btn = QPushButton("All")
+        select_all_btn.setMaximumWidth(60)
+        select_all_btn.clicked.connect(lambda: self.root_extract_paths.selectAll())
+        quick_row.addWidget(select_all_btn)
+        
+        select_none_btn = QPushButton("None")
+        select_none_btn.setMaximumWidth(60)
+        select_none_btn.clicked.connect(lambda: self.root_extract_paths.clearSelection())
+        quick_row.addWidget(select_none_btn)
+        
+        select_system_btn = QPushButton("System")
+        select_system_btn.setMaximumWidth(70)
+        select_system_btn.clicked.connect(lambda: self._quick_select_root_paths(["/system", "/vendor", "/product"]))
+        quick_row.addWidget(select_system_btn)
+        
+        select_data_btn = QPushButton("Data")
+        select_data_btn.setMaximumWidth(60)
+        select_data_btn.clicked.connect(lambda: self._quick_select_root_paths(["/data/data", "/data/app", "/data/misc"]))
+        quick_row.addWidget(select_data_btn)
+        
+        # Custom path input inline
+        quick_row.addWidget(QLabel("Custom:"))
+        self.root_custom_path = QLineEdit()
+        self.root_custom_path.setPlaceholderText("/path/to/extract")
+        self.root_custom_path.setMaximumWidth(200)
+        quick_row.addWidget(self.root_custom_path)
+        add_path_btn = QPushButton("+")
+        add_path_btn.setMaximumWidth(30)
+        add_path_btn.clicked.connect(self._add_custom_root_path)
+        quick_row.addWidget(add_path_btn)
+        
+        quick_row.addStretch()
+        paths_layout.addLayout(quick_row)
+        
+        layout.addWidget(paths_group)
+        
+        # Output directory and Options in same row
+        settings_row = QHBoxLayout()
+        
+        # Output directory
+        output_group = QGroupBox("📥 Output Directory")
+        output_layout = QHBoxLayout(output_group)
+        output_layout.setContentsMargins(8, 8, 8, 8)
+        self.root_extract_output = QLineEdit(os.path.expanduser("~/phone_filesystem"))
+        output_layout.addWidget(self.root_extract_output)
+        browse_btn = QPushButton("...")
+        browse_btn.setMaximumWidth(30)
+        browse_btn.clicked.connect(lambda: self._browse_dir(self.root_extract_output))
+        output_layout.addWidget(browse_btn)
+        settings_row.addWidget(output_group, 2)
+        
+        # Options - more compact
+        options_group = QGroupBox("⚙️ Options")
+        options_layout = QVBoxLayout(options_group)
+        options_layout.setContentsMargins(8, 8, 8, 8)
+        options_layout.setSpacing(2)
+        
+        self.root_preserve_perms = QCheckBox("Save permissions")
+        self.root_preserve_perms.setChecked(True)
+        options_layout.addWidget(self.root_preserve_perms)
+        
+        self.root_skip_errors = QCheckBox("Skip unreadable")
+        self.root_skip_errors.setChecked(True)
+        options_layout.addWidget(self.root_skip_errors)
+        
+        self.root_include_symlinks = QCheckBox("Include symlinks")
+        self.root_include_symlinks.setChecked(True)
+        options_layout.addWidget(self.root_include_symlinks)
+        
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Max MB:"))
+        self.root_max_file_size = QSpinBox()
+        self.root_max_file_size.setRange(0, 10000)
+        self.root_max_file_size.setValue(500)
+        self.root_max_file_size.setMaximumWidth(80)
+        size_row.addWidget(self.root_max_file_size)
+        size_row.addStretch()
+        options_layout.addLayout(size_row)
+        
+        settings_row.addWidget(options_group, 1)
+        layout.addLayout(settings_row)
+        
+        # Progress
+        progress_group = QGroupBox("📊 Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        progress_layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.root_extract_progress = QProgressBar()
+        self.root_extract_progress.setFormat("%v / %m files (%p%)")
+        progress_layout.addWidget(self.root_extract_progress)
+        
+        self.root_extract_status = QLabel("Ready")
+        self.root_extract_status.setStyleSheet("color: #888;")
+        progress_layout.addWidget(self.root_extract_status)
+        
+        layout.addWidget(progress_group)
+        
+        # Action buttons
+        btn_row = QHBoxLayout()
+        
+        self.root_extract_btn = QPushButton("🌳 Extract Filesystem (Root Required)")
+        self.root_extract_btn.setMinimumHeight(36)
+        self.root_extract_btn.setStyleSheet("background: #2e7d32; font-weight: bold;")
+        self.root_extract_btn.clicked.connect(self._start_root_extract)
+        btn_row.addWidget(self.root_extract_btn)
+        
+        self.root_cancel_btn = QPushButton("⛔ Cancel")
+        self.root_cancel_btn.setMinimumHeight(36)
+        self.root_cancel_btn.setEnabled(False)
+        self.root_cancel_btn.clicked.connect(self._cancel_root_extract)
+        btn_row.addWidget(self.root_cancel_btn)
+        
+        layout.addLayout(btn_row)
+        layout.addStretch()
+        
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
+        
+        return tab
+    
+    def _quick_select_root_paths(self, paths: list):
+        """Quick select specific paths in the root extract list."""
+        self.root_extract_paths.clearSelection()
+        for i in range(self.root_extract_paths.count()):
+            item = self.root_extract_paths.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) in paths:
+                item.setSelected(True)
+    
+    def _add_custom_root_path(self):
+        """Add a custom path to the extraction list."""
+        path = self.root_custom_path.text().strip()
+        if not path:
+            return
+        if not path.startswith('/'):
+            path = '/' + path
+        
+        # Check if already exists
+        for i in range(self.root_extract_paths.count()):
+            if self.root_extract_paths.item(i).data(Qt.ItemDataRole.UserRole) == path:
+                QMessageBox.information(self.parent_window, "Info", f"Path {path} already in list")
+                return
+        
+        item = QListWidgetItem(f"{path}  →  (custom)")
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.root_extract_paths.addItem(item)
+        item.setSelected(True)
+        self.root_custom_path.clear()
+    
+    def _start_root_extract(self):
+        """Start the root filesystem extraction."""
+        device = self._get_device()
+        if not device:
+            QMessageBox.warning(self.parent_window, "No Device", "Please connect a device first.")
+            return
+        
+        # Get selected paths
+        selected_paths = []
+        for item in self.root_extract_paths.selectedItems():
+            selected_paths.append(item.data(Qt.ItemDataRole.UserRole))
+        
+        if not selected_paths:
+            QMessageBox.warning(self.parent_window, "No Paths", "Please select at least one path to extract.")
+            return
+        
+        output_dir = self.root_extract_output.text()
+        if not output_dir:
+            QMessageBox.warning(self.parent_window, "No Output", "Please select an output directory.")
+            return
+        
+        # Confirm
+        msg = f"Extract {len(selected_paths)} path(s) to:\n{output_dir}\n\nThis requires ROOT access. Continue?"
+        reply = QMessageBox.question(self.parent_window, "Confirm Extraction", msg)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Update UI
+        self.root_extract_btn.setEnabled(False)
+        self.root_cancel_btn.setEnabled(True)
+        self.root_extract_progress.setValue(0)
+        self.root_extract_progress.setMaximum(100)
+        
+        # Start worker
+        self.root_extract_worker = RootExtractWorker(
+            device=device,
+            paths=selected_paths,
+            output_dir=output_dir,
+            save_permissions=self.root_preserve_perms.isChecked(),
+            skip_errors=self.root_skip_errors.isChecked(),
+            include_symlinks=self.root_include_symlinks.isChecked(),
+            max_file_mb=self.root_max_file_size.value()
+        )
+        self.root_extract_worker.progress.connect(self._on_root_extract_progress)
+        self.root_extract_worker.status.connect(self._on_root_extract_status)
+        self.root_extract_worker.log.connect(self._log)
+        self.root_extract_worker.finished.connect(self._on_root_extract_finished)
+        self.root_extract_worker.start()
+    
+    def _cancel_root_extract(self):
+        """Cancel the extraction."""
+        if hasattr(self, 'root_extract_worker') and self.root_extract_worker.isRunning():
+            self.root_extract_worker.cancel()
+            self.root_extract_status.setText("Cancelling...")
+    
+    def _on_root_extract_progress(self, current, total):
+        """Update progress bar."""
+        self.root_extract_progress.setMaximum(total)
+        self.root_extract_progress.setValue(current)
+    
+    def _on_root_extract_status(self, msg):
+        """Update status label."""
+        self.root_extract_status.setText(msg)
+    
+    def _on_root_extract_finished(self, success, message):
+        """Handle extraction completion."""
+        self.root_extract_btn.setEnabled(True)
+        self.root_cancel_btn.setEnabled(False)
+        self.root_extract_status.setText(message)
+        self._log(message)
+        
+        if success:
+            QMessageBox.information(self.parent_window, "Complete", message)
+
     # ===== REBOOT TAB =====
     def _create_reboot_tab(self):
         tab = QWidget()
