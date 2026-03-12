@@ -29,9 +29,7 @@
         "fusepy"
     ],
     "bundled_binaries": [],
-    "setup_commands": [
-        "pip install ."
-    ],
+    "setup_commands": [],
     "enabled": true,
     "remote_capable": true
 }
