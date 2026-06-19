@@ -21,5 +21,25 @@ class TestUnmangleCrlf(unittest.TestCase):
         self.assertEqual(rep["bytes_removed"], 0)
 
 
+class TestTrimPartition(unittest.TestCase):
+    def test_auto_strips_padding_to_sector(self):
+        data = b"REALDATA" + b"\xff" * 2000  # 8 + 2000 = 2008 bytes
+        trimmed, rep = MtkDumpTools.trim_partition(data)
+        self.assertEqual(rep["mode"], "auto")
+        self.assertEqual(rep["content_end"], 8)
+        self.assertEqual(len(trimmed), 512)          # 8 rounded up to next 512
+        self.assertTrue(rep["sector_aligned"])
+        self.assertEqual(trimmed[:8], b"REALDATA")
+
+    def test_explicit_size_flags_content_cut(self):
+        data = b"ABCD" + b"\xff" * 4
+        trimmed, rep = MtkDumpTools.trim_partition(data, target_size=4)
+        self.assertEqual(trimmed, b"ABCD")
+        self.assertFalse(rep["cut_real_content"])
+        trimmed2, rep2 = MtkDumpTools.trim_partition(b"ABCDEF", target_size=3)
+        self.assertEqual(trimmed2, b"ABC")
+        self.assertTrue(rep2["cut_real_content"])
+
+
 if __name__ == "__main__":
     unittest.main()
