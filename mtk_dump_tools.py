@@ -51,3 +51,24 @@ class MtkDumpTools:
             "padding_byte": (f"0x{pad:02x}" if pad is not None else None),
             "sector_aligned": len(trimmed) % 512 == 0,
         }
+
+    @staticmethod
+    def build_emi(data):
+        data = bytes(data)
+        bld = MtkDumpTools.BLOADER
+        b = data.find(bld)
+        if b == -1:
+            return None, {"ok": False, "reason": "no MTK_BLOADER_INFO_v marker found"}
+        ver = data[b + len(bld): b + len(bld) + 2].rstrip(b"\x00").decode("latin1", "replace")
+        found = None
+        for p in range(b + 0x200, min(b + 0x4000, len(data) - 4)):
+            if int.from_bytes(data[p:p + 4], "little") == (p - b):
+                found = p
+                break
+        if found is None:
+            return None, {"ok": False, "reason": "no EMI length field found after marker", "version": ver}
+        block = data[b:found]
+        return block, {
+            "ok": True, "version": ver, "emi_offset": b, "emi_length": len(block),
+            "length_field_offset": found, "parses": block.startswith(bld),
+        }

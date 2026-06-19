@@ -41,5 +41,29 @@ class TestTrimPartition(unittest.TestCase):
         self.assertTrue(rep2["cut_real_content"])
 
 
+import struct
+
+def _make_preloader(version=b"38", emi_len=600, pre=64):
+    head = b"MTK_BLOADER_INFO_v" + version + b"\x00\x00"
+    block = head + b"\xAA" * (emi_len - len(head))     # payload won't collide with length value
+    assert len(block) == emi_len
+    return b"\x00" * pre + block + struct.pack("<I", emi_len) + b"\x00" * 32
+
+class TestBuildEmi(unittest.TestCase):
+    def test_extracts_block_and_version(self):
+        data = _make_preloader(emi_len=600, pre=64)
+        emi, rep = MtkDumpTools.build_emi(data)
+        self.assertTrue(rep["ok"])
+        self.assertEqual(rep["version"], "38")
+        self.assertEqual(rep["emi_length"], 600)
+        self.assertTrue(rep["parses"])
+        self.assertTrue(emi.startswith(b"MTK_BLOADER_INFO_v38"))
+
+    def test_no_marker_returns_none(self):
+        emi, rep = MtkDumpTools.build_emi(b"\x00" * 4096)
+        self.assertIsNone(emi)
+        self.assertFalse(rep["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()
