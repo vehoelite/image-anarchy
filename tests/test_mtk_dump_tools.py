@@ -65,5 +65,28 @@ class TestBuildEmi(unittest.TestCase):
         self.assertFalse(rep["ok"])
 
 
+class TestInspectDump(unittest.TestCase):
+    def test_wiped_detected(self):
+        rep = MtkDumpTools.inspect_dump(b"\x00" * 4096)
+        self.assertTrue(rep["all_zero"])
+        self.assertEqual(rep["verdict"], "wiped (all zeros)")
+
+    def test_mangled_detected(self):
+        original = bytes(range(256)) * 400
+        mangled = original.replace(b"\x0a", b"\x0d\x0a")
+        rep = MtkDumpTools.inspect_dump(mangled)
+        self.assertTrue(rep["crlf_mangled"])
+        self.assertEqual(rep["verdict"], "crlf-mangled")
+
+    def test_clean_preloader_reports_emi(self):
+        data = _make_preloader(emi_len=600, pre=64)
+        # pad to a 512 boundary so it isn't flagged oversized/odd
+        data = data + b"\xff" * (512 - (len(data) % 512))
+        rep = MtkDumpTools.inspect_dump(data)
+        self.assertTrue(rep["has_emi"])
+        self.assertEqual(rep["bloader_version"], "38")
+        self.assertFalse(rep["crlf_mangled"])
+
+
 if __name__ == "__main__":
     unittest.main()
