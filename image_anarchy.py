@@ -73,6 +73,8 @@ import urllib.parse
 import uuid
 import webbrowser
 import zipfile
+
+from mtk_dump_tools import MtkDumpTools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
@@ -13344,6 +13346,31 @@ def create_gui_app():
                     f"New version downloaded to:\n{self.final_path}\n\nPlease run it manually.")
                 self.accept()
 
+    class _DumpSurgeonWorker(QThread):
+        """Runs a Dump Surgeon op on a large file off the UI thread."""
+        finished_ok = pyqtSignal(bytes, dict)   # output bytes, report
+        failed = pyqtSignal(str)
+
+        def __init__(self, op, in_path, target_size=None):
+            super().__init__()
+            self.op = op            # "unmangle" or "trim"
+            self.in_path = in_path
+            self.target_size = target_size
+
+        def run(self):
+            try:
+                with open(self.in_path, "rb") as f:
+                    data = f.read()
+                if self.op == "unmangle":
+                    out, rep = MtkDumpTools.unmangle_crlf(data)
+                elif self.op == "trim":
+                    out, rep = MtkDumpTools.trim_partition(data, self.target_size)
+                else:
+                    raise ValueError(f"unknown op {self.op}")
+                self.finished_ok.emit(out, rep)
+            except Exception as e:  # noqa: BLE001 - surface any failure to UI
+                self.failed.emit(str(e))
+
     class ImageAnarchyGUI(QMainWindow):
         """Main application window."""
         
@@ -15473,14 +15500,134 @@ def create_gui_app():
             scatter_layout.addWidget(scatter_preview_group)
             
             self.tab_widget.addTab(scatter_tab, "📄 Scatter Gen")
-            
+            self.tab_widget.addTab(self.create_dump_surgeon_tab(), "🔪 Dump Surgeon")
+
             main_layout.addWidget(self.tab_widget)
             
             # Status bar
             self.status_bar = QStatusBar()
             self.setStatusBar(self.status_bar)
             self.status_bar.showMessage("Ready - Ⓐ Image Anarchy | Extract, create, and manipulate Android images")
-        
+
+        def create_dump_surgeon_tab(self):
+            from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                                         QLineEdit, QPushButton, QTextEdit, QTabWidget,
+                                         QFileDialog, QSpinBox, QGroupBox, QFormLayout)
+            tab = QWidget()
+            root = QVBoxLayout(tab)
+            root.addWidget(QLabel("🔪 Dump Surgeon — offline MTK/eMMC dump repair (Ⓐ break the chains)"))
+            inner = QTabWidget()
+            self.dsurg_report = QTextEdit(); self.dsurg_report.setReadOnly(True)
+
+            def report(d):
+                self.dsurg_report.append("\n".join(f"  {k}: {v}" for k, v in d.items()))
+                self.dsurg_report.append("─" * 40)
+
+            def pick_in(line):
+                p, _ = QFileDialog.getOpenFileName(self, "Select dump file", "",
+                                                   "Dumps (*.img *.bin);;All Files (*.*)")
+                if p:
+                    line.setText(p)
+
+            def out_path(in_path, suffix):
+                base, ext = os.path.splitext(in_path)
+                return f"{base}{suffix}{ext or '.bin'}"
+
+            # --- Inspector ---
+            insp = QWidget(); il = QVBoxLayout(insp)
+            self.dsurg_insp_in = QLineEdit(); insp_btn = QPushButton("Browse")
+            insp_btn.clicked.connect(lambda: pick_in(self.dsurg_insp_in))
+            run_insp = QPushButton("🔍 Inspect")
+            def do_inspect():
+                p = self.dsurg_insp_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                with open(p, "rb") as f:
+                    report(MtkDumpTools.inspect_dump(f.read()))
+            run_insp.clicked.connect(do_inspect)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_insp_in); row.addWidget(insp_btn)
+            il.addLayout(row); il.addWidget(run_insp); il.addStretch()
+            inner.addTab(insp, "🔍 Inspect")
+
+            # --- EMI Builder ---
+            emi = QWidget(); el = QVBoxLayout(emi)
+            self.dsurg_emi_in = QLineEdit(); emi_btn = QPushButton("Browse")
+            emi_btn.clicked.connect(lambda: pick_in(self.dsurg_emi_in))
+            run_emi = QPushButton("⚡ Build EMI")
+            def do_emi():
+                p = self.dsurg_emi_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                with open(p, "rb") as f:
+                    block, rep = MtkDumpTools.build_emi(f.read())
+                if block is None:
+                    report(rep); return
+                outp = out_path(p, "_emi")
+                with open(outp, "wb") as f:
+                    f.write(block)
+                rep["written"] = outp
+                report(rep)
+            run_emi.clicked.connect(do_emi)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_emi_in); row.addWidget(emi_btn)
+            el.addLayout(row); el.addWidget(run_emi); el.addStretch()
+            inner.addTab(emi, "⚡ EMI Builder")
+
+            # --- Trim ---
+            trim = QWidget(); tl = QVBoxLayout(trim)
+            self.dsurg_trim_in = QLineEdit(); trim_btn = QPushButton("Browse")
+            trim_btn.clicked.connect(lambda: pick_in(self.dsurg_trim_in))
+            self.dsurg_trim_size = QSpinBox(); self.dsurg_trim_size.setMaximum(2_000_000_000)
+            self.dsurg_trim_size.setSpecialValueText("auto (strip padding)")
+            run_trim = QPushButton("✂️ Trim")
+            def do_trim():
+                p = self.dsurg_trim_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                size = self.dsurg_trim_size.value() or None
+                self._dsurg_worker = _DumpSurgeonWorker("trim", p, size)
+                self._dsurg_worker.finished_ok.connect(lambda out, rep, ip=p: self._dsurg_save(out, rep, ip, "_trimmed"))
+                self._dsurg_worker.failed.connect(lambda m: report({"error": m}))
+                self._dsurg_worker.start()
+            run_trim.clicked.connect(do_trim)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_trim_in); row.addWidget(trim_btn)
+            tl.addLayout(row)
+            form = QFormLayout(); form.addRow("Target size (bytes):", self.dsurg_trim_size)
+            tl.addLayout(form); tl.addWidget(run_trim); tl.addStretch()
+            inner.addTab(trim, "✂️ Trim")
+
+            # --- Un-mangle ---
+            unm = QWidget(); ul = QVBoxLayout(unm)
+            self.dsurg_unm_in = QLineEdit(); unm_btn = QPushButton("Browse")
+            unm_btn.clicked.connect(lambda: pick_in(self.dsurg_unm_in))
+            run_unm = QPushButton("🩹 Un-mangle CRLF")
+            def do_unm():
+                p = self.dsurg_unm_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                self._dsurg_worker = _DumpSurgeonWorker("unmangle", p)
+                self._dsurg_worker.finished_ok.connect(lambda out, rep, ip=p: self._dsurg_save(out, rep, ip, "_recovered"))
+                self._dsurg_worker.failed.connect(lambda m: report({"error": m}))
+                self._dsurg_worker.start()
+            run_unm.clicked.connect(do_unm)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_unm_in); row.addWidget(unm_btn)
+            ul.addLayout(row); ul.addWidget(run_unm); ul.addStretch()
+            inner.addTab(unm, "🩹 Un-mangle")
+
+            root.addWidget(inner)
+            root.addWidget(QLabel("Report:"))
+            root.addWidget(self.dsurg_report)
+            self.dump_surgeon_tab = tab
+            return tab
+
+        def _dsurg_save(self, out_bytes, report_dict, in_path, suffix):
+            base, ext = os.path.splitext(in_path)
+            outp = f"{base}{suffix}{ext or '.bin'}"
+            with open(outp, "wb") as f:
+                f.write(out_bytes)
+            report_dict["written"] = outp
+            self.dsurg_report.append("\n".join(f"  {k}: {v}" for k, v in report_dict.items()))
+            self.dsurg_report.append("─" * 40)
+
         def _apply_styles(self):
             self.setStyleSheet(self.STYLESHEET + """
                 QTabWidget::pane {

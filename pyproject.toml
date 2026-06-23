@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "image-anarchy"
-version = "3.2.0"
+version = "3.3.0"
 description = "Android Image Swiss Army Knife — Extract, create, and manipulate Android images with anarchic freedom."
 readme = "README.md"
 license = "MIT"
