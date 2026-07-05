@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
-Version: 3.3
+Version: 3.4
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -73,6 +73,8 @@ import urllib.parse
 import uuid
 import webbrowser
 import zipfile
+
+from mtk_dump_tools import MtkDumpTools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
@@ -13344,6 +13346,31 @@ def create_gui_app():
                     f"New version downloaded to:\n{self.final_path}\n\nPlease run it manually.")
                 self.accept()
 
+    class _DumpSurgeonWorker(QThread):
+        """Runs a Dump Surgeon op on a large file off the UI thread."""
+        finished_ok = pyqtSignal(bytes, dict)   # output bytes, report
+        failed = pyqtSignal(str)
+
+        def __init__(self, op, in_path, target_size=None):
+            super().__init__()
+            self.op = op            # "unmangle" or "trim"
+            self.in_path = in_path
+            self.target_size = target_size
+
+        def run(self):
+            try:
+                with open(self.in_path, "rb") as f:
+                    data = f.read()
+                if self.op == "unmangle":
+                    out, rep = MtkDumpTools.unmangle_crlf(data)
+                elif self.op == "trim":
+                    out, rep = MtkDumpTools.trim_partition(data, self.target_size)
+                else:
+                    raise ValueError(f"unknown op {self.op}")
+                self.finished_ok.emit(out, rep)
+            except Exception as e:  # noqa: BLE001 - surface any failure to UI
+                self.failed.emit(str(e))
+
     class ImageAnarchyGUI(QMainWindow):
         """Main application window."""
         
@@ -13728,8 +13755,11 @@ def create_gui_app():
         
         def _setup_ui(self):
             self.setWindowTitle(f"Image Anarchy {APP_VERSION} - Android Image Swiss Army Knife")
+            # ~1/3 larger default launch size — several plugin views (e.g. the
+            # ADB Toolkit Shell tab's command panel) are cramped at the old
+            # 1400x1000 default.
             self.setMinimumSize(1280, 900)
-            self.resize(1400, 1000)
+            self.resize(1867, 1333)
             
             central = QWidget()
             self.setCentralWidget(central)
@@ -15364,6 +15394,11 @@ def create_gui_app():
             scatter_export_btn.clicked.connect(self._scatter_export)
             export_row.addWidget(scatter_export_btn)
             
+            scatter_export_gpt_btn = QPushButton("💽 Export GPT")
+            scatter_export_gpt_btn.setToolTip("Export partition layout as a GPT binary (gpt_main.bin)")
+            scatter_export_gpt_btn.clicked.connect(self._scatter_export_gpt)
+            export_row.addWidget(scatter_export_gpt_btn)
+            
             scatter_preview_btn = QPushButton("👁️ Preview")
             scatter_preview_btn.setToolTip("Preview the scatter file contents")
             scatter_preview_btn.clicked.connect(self._scatter_preview)
@@ -15420,7 +15455,14 @@ def create_gui_app():
                 "Size", "Region", "Type", "Operation Type",
                 "Download", "Reserved"
             ])
-            self.scatter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            # Only "File Name" stretches to fill remaining space — having two
+            # Stretch columns (this used to include "Partition Name" too) made
+            # Qt split space between them without regard to actual content
+            # length, so partition names like "preloader_a" were squeezed into
+            # a sliver while File Name got the lion's share. Partition names
+            # are short and bounded, so ResizeToContents (like the other
+            # columns) fits them properly instead.
+            self.scatter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
             self.scatter_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             for col in range(2, 9):
                 self.scatter_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
@@ -15473,14 +15515,134 @@ def create_gui_app():
             scatter_layout.addWidget(scatter_preview_group)
             
             self.tab_widget.addTab(scatter_tab, "📄 Scatter Gen")
-            
+            self.tab_widget.addTab(self.create_dump_surgeon_tab(), "🔪 Dump Surgeon")
+
             main_layout.addWidget(self.tab_widget)
             
             # Status bar
             self.status_bar = QStatusBar()
             self.setStatusBar(self.status_bar)
             self.status_bar.showMessage("Ready - Ⓐ Image Anarchy | Extract, create, and manipulate Android images")
-        
+
+        def create_dump_surgeon_tab(self):
+            from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                                         QLineEdit, QPushButton, QTextEdit, QTabWidget,
+                                         QFileDialog, QSpinBox, QGroupBox, QFormLayout)
+            tab = QWidget()
+            root = QVBoxLayout(tab)
+            root.addWidget(QLabel("🔪 Dump Surgeon — offline MTK/eMMC dump repair (Ⓐ break the chains)"))
+            inner = QTabWidget()
+            self.dsurg_report = QTextEdit(); self.dsurg_report.setReadOnly(True)
+
+            def report(d):
+                self.dsurg_report.append("\n".join(f"  {k}: {v}" for k, v in d.items()))
+                self.dsurg_report.append("─" * 40)
+
+            def pick_in(line):
+                p, _ = QFileDialog.getOpenFileName(self, "Select dump file", "",
+                                                   "Dumps (*.img *.bin);;All Files (*.*)")
+                if p:
+                    line.setText(p)
+
+            def out_path(in_path, suffix):
+                base, ext = os.path.splitext(in_path)
+                return f"{base}{suffix}{ext or '.bin'}"
+
+            # --- Inspector ---
+            insp = QWidget(); il = QVBoxLayout(insp)
+            self.dsurg_insp_in = QLineEdit(); insp_btn = QPushButton("Browse")
+            insp_btn.clicked.connect(lambda: pick_in(self.dsurg_insp_in))
+            run_insp = QPushButton("🔍 Inspect")
+            def do_inspect():
+                p = self.dsurg_insp_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                with open(p, "rb") as f:
+                    report(MtkDumpTools.inspect_dump(f.read()))
+            run_insp.clicked.connect(do_inspect)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_insp_in); row.addWidget(insp_btn)
+            il.addLayout(row); il.addWidget(run_insp); il.addStretch()
+            inner.addTab(insp, "🔍 Inspect")
+
+            # --- EMI Builder ---
+            emi = QWidget(); el = QVBoxLayout(emi)
+            self.dsurg_emi_in = QLineEdit(); emi_btn = QPushButton("Browse")
+            emi_btn.clicked.connect(lambda: pick_in(self.dsurg_emi_in))
+            run_emi = QPushButton("⚡ Build EMI")
+            def do_emi():
+                p = self.dsurg_emi_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                with open(p, "rb") as f:
+                    block, rep = MtkDumpTools.build_emi(f.read())
+                if block is None:
+                    report(rep); return
+                outp = out_path(p, "_emi")
+                with open(outp, "wb") as f:
+                    f.write(block)
+                rep["written"] = outp
+                report(rep)
+            run_emi.clicked.connect(do_emi)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_emi_in); row.addWidget(emi_btn)
+            el.addLayout(row); el.addWidget(run_emi); el.addStretch()
+            inner.addTab(emi, "⚡ EMI Builder")
+
+            # --- Trim ---
+            trim = QWidget(); tl = QVBoxLayout(trim)
+            self.dsurg_trim_in = QLineEdit(); trim_btn = QPushButton("Browse")
+            trim_btn.clicked.connect(lambda: pick_in(self.dsurg_trim_in))
+            self.dsurg_trim_size = QSpinBox(); self.dsurg_trim_size.setMaximum(2_000_000_000)
+            self.dsurg_trim_size.setSpecialValueText("auto (strip padding)")
+            run_trim = QPushButton("✂️ Trim")
+            def do_trim():
+                p = self.dsurg_trim_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                size = self.dsurg_trim_size.value() or None
+                self._dsurg_worker = _DumpSurgeonWorker("trim", p, size)
+                self._dsurg_worker.finished_ok.connect(lambda out, rep, ip=p: self._dsurg_save(out, rep, ip, "_trimmed"))
+                self._dsurg_worker.failed.connect(lambda m: report({"error": m}))
+                self._dsurg_worker.start()
+            run_trim.clicked.connect(do_trim)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_trim_in); row.addWidget(trim_btn)
+            tl.addLayout(row)
+            form = QFormLayout(); form.addRow("Target size (bytes):", self.dsurg_trim_size)
+            tl.addLayout(form); tl.addWidget(run_trim); tl.addStretch()
+            inner.addTab(trim, "✂️ Trim")
+
+            # --- Un-mangle ---
+            unm = QWidget(); ul = QVBoxLayout(unm)
+            self.dsurg_unm_in = QLineEdit(); unm_btn = QPushButton("Browse")
+            unm_btn.clicked.connect(lambda: pick_in(self.dsurg_unm_in))
+            run_unm = QPushButton("🩹 Un-mangle CRLF")
+            def do_unm():
+                p = self.dsurg_unm_in.text().strip()
+                if not os.path.isfile(p):
+                    report({"error": "file not found"}); return
+                self._dsurg_worker = _DumpSurgeonWorker("unmangle", p)
+                self._dsurg_worker.finished_ok.connect(lambda out, rep, ip=p: self._dsurg_save(out, rep, ip, "_recovered"))
+                self._dsurg_worker.failed.connect(lambda m: report({"error": m}))
+                self._dsurg_worker.start()
+            run_unm.clicked.connect(do_unm)
+            row = QHBoxLayout(); row.addWidget(self.dsurg_unm_in); row.addWidget(unm_btn)
+            ul.addLayout(row); ul.addWidget(run_unm); ul.addStretch()
+            inner.addTab(unm, "🩹 Un-mangle")
+
+            root.addWidget(inner)
+            root.addWidget(QLabel("Report:"))
+            root.addWidget(self.dsurg_report)
+            self.dump_surgeon_tab = tab
+            return tab
+
+        def _dsurg_save(self, out_bytes, report_dict, in_path, suffix):
+            base, ext = os.path.splitext(in_path)
+            outp = f"{base}{suffix}{ext or '.bin'}"
+            with open(outp, "wb") as f:
+                f.write(out_bytes)
+            report_dict["written"] = outp
+            self.dsurg_report.append("\n".join(f"  {k}: {v}" for k, v in report_dict.items()))
+            self.dsurg_report.append("─" * 40)
+
         def _apply_styles(self):
             self.setStyleSheet(self.STYLESHEET + """
                 QTabWidget::pane {
@@ -18635,6 +18797,233 @@ def create_gui_app():
                 f"Project: {self.scatter_project.text()}\n"
                 f"Storage: {self.scatter_storage.currentText()}"
             )
+        
+        def _scatter_export_gpt(self):
+            """Export the current partition table as a GPT binary file."""
+            partitions = self._scatter_get_table_data()
+            if not partitions:
+                QMessageBox.warning(self, "Error", "No partitions defined. Add partitions or load a template first.")
+                return
+            
+            # Filter to only EMMC_USER / UFS_LU2 partitions (GPT doesn't include BOOT regions)
+            user_partitions = [p for p in partitions if p['region'] not in (
+                'EMMC_BOOT1_BOOT2', 'EMMC_BOOT1', 'EMMC_BOOT2', 'UFS_LU1'
+            )]
+            
+            if not user_partitions:
+                QMessageBox.warning(self, "Error",
+                    "No USER-region partitions found.\n"
+                    "GPT only covers the main storage area (EMMC_USER / UFS_LU2).\n"
+                    "BOOT region partitions (preloader) are not included in GPT.")
+                return
+            
+            platform = self.scatter_platform.currentText().strip()
+            project = self.scatter_project.text().strip() or "project"
+            default_name = f"{platform}_{project}_gpt_main.bin"
+            
+            path, _ = QFileDialog.getSaveFileName(
+                self, "💽 Export GPT Binary", default_name,
+                "GPT Binary (*.bin);;All Files (*)"
+            )
+            if not path:
+                return
+            
+            try:
+                gpt_data = self._scatter_build_gpt(user_partitions)
+                with open(path, 'wb') as f:
+                    f.write(gpt_data)
+                
+                self.scatter_preview_text.setPlainText(
+                    f"✅ GPT binary exported!\n"
+                    f"   File: {os.path.basename(path)}\n"
+                    f"   Size: {len(gpt_data)} bytes ({len(gpt_data) // 512} sectors)\n"
+                    f"   Partitions: {len(user_partitions)}\n\n"
+                    f"   Contains: Protective MBR + GPT Header + Partition Entries\n"
+                    f"   Sector size: 512 bytes\n\n"
+                    f"   💡 This file can be flashed with SP Flash Tool or\n"
+                    f"   imported back via 'Import GPT' in this tool."
+                )
+                QMessageBox.information(self, "Success",
+                    f"GPT binary saved!\n\n{path}\n\n"
+                    f"{len(user_partitions)} partitions written.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to export GPT binary:\n{e}")
+        
+        def _scatter_build_gpt(self, partitions: list) -> bytes:
+            """Build a complete GPT binary (Protective MBR + GPT Header + Entries).
+            
+            Creates a standards-compliant GUID Partition Table binary that can be
+            flashed to eMMC/UFS storage or imported back into this tool.
+            
+            Args:
+                partitions: List of partition dicts from _scatter_get_table_data(),
+                            pre-filtered to USER region only.
+            
+            Returns:
+                bytes: Complete GPT binary (MBR + header + entries, typically 34 sectors).
+            """
+            import struct
+            import uuid
+            import zlib
+            
+            SECTOR_SIZE = 512
+            MAX_ENTRIES = 128
+            ENTRY_SIZE = 128
+            
+            # Well-known GPT type GUIDs
+            LINUX_FILESYSTEM_GUID = uuid.UUID('0FC63DAF-8483-4772-8E79-3D69D8477DE4')
+            EFI_SYSTEM_GUID = uuid.UUID('C12A7328-F81F-11D2-BA4B-00A0C93EC93B')
+            ANDROID_BOOT_GUID = uuid.UUID('49A4D17F-93A3-45C1-A0DE-F50B2EBE2599')
+            ANDROID_RECOVERY_GUID = uuid.UUID('4177C722-9E92-4AAB-8644-43502BFD5506')
+            ANDROID_MISC_GUID = uuid.UUID('EF32A33B-A409-486C-9141-9FFB711F6266')
+            ANDROID_USERDATA_GUID = uuid.UUID('1B81E7E6-F50D-419B-A739-2AEEF51A0275')
+            ANDROID_CACHE_GUID = uuid.UUID('5594C694-C871-4B5F-90B1-690A6F68E0F7')
+            ANDROID_VENDOR_GUID = uuid.UUID('C5A0AEEC-13EA-11E5-A1B1-001E67CA0C3C')
+            ANDROID_SYSTEM_GUID = uuid.UUID('97D7B011-54DA-4835-B3EF-7F97B2F1B550')
+            ANDROID_META_GUID = uuid.UUID('19A710A2-B3CA-11E4-B026-10604B889DCF')  # metadata/misc
+            MTK_NVRAM_GUID = uuid.UUID('AB400B18-E46C-4441-B1AB-21F7C8E4E2AD')  # custom for MTK nvram
+            
+            # Map partition names to appropriate type GUIDs
+            def get_type_guid(name: str) -> uuid.UUID:
+                name_lower = name.lower()
+                if name_lower in ('boot', 'boot_a', 'boot_b'):
+                    return ANDROID_BOOT_GUID
+                elif name_lower in ('recovery', 'recovery_a', 'recovery_b'):
+                    return ANDROID_RECOVERY_GUID
+                elif name_lower in ('userdata',):
+                    return ANDROID_USERDATA_GUID
+                elif name_lower in ('cache',):
+                    return ANDROID_CACHE_GUID
+                elif name_lower in ('system', 'system_a', 'system_b'):
+                    return ANDROID_SYSTEM_GUID
+                elif name_lower in ('vendor', 'vendor_a', 'vendor_b'):
+                    return ANDROID_VENDOR_GUID
+                elif name_lower in ('metadata',):
+                    return ANDROID_META_GUID
+                elif name_lower in ('para', 'misc'):
+                    return ANDROID_MISC_GUID
+                elif name_lower in ('nvram',):
+                    return MTK_NVRAM_GUID
+                else:
+                    return LINUX_FILESYSTEM_GUID
+            
+            # -- Parse partition addresses/sizes into LBAs --
+            entries_data = []
+            for part in partitions:
+                try:
+                    start_bytes = int(part['linear_start_addr'], 16)
+                except (ValueError, TypeError):
+                    start_bytes = 0
+                try:
+                    size_bytes = int(part['partition_size'], 16)
+                except (ValueError, TypeError):
+                    size_bytes = 0
+                
+                first_lba = start_bytes // SECTOR_SIZE
+                if size_bytes == 0xFFFFFFFF or size_bytes == 0:
+                    # userdata or unknown — use a large default (remaining space)
+                    last_lba = first_lba + (4 * 1024 * 1024 * 1024 // SECTOR_SIZE) - 1  # 4GB default
+                else:
+                    size_sectors = size_bytes // SECTOR_SIZE
+                    last_lba = first_lba + size_sectors - 1 if size_sectors > 0 else first_lba
+                
+                entries_data.append({
+                    'name': part['name'],
+                    'type_guid': get_type_guid(part['name']),
+                    'unique_guid': uuid.uuid4(),
+                    'first_lba': first_lba,
+                    'last_lba': last_lba,
+                    'attributes': 0,
+                })
+            
+            # Determine disk geometry
+            if entries_data:
+                max_lba = max(e['last_lba'] for e in entries_data)
+            else:
+                max_lba = 0
+            # Backup GPT at end of disk; total sectors = max_lba + 1 + 33 (backup GPT)
+            total_sectors = max_lba + 1 + 33
+            
+            # -- 1. Build Protective MBR (LBA 0) --
+            mbr = bytearray(SECTOR_SIZE)
+            # Boot code area: zeros (no bootloader)
+            # Partition entry 1 at offset 446 (protective MBR entry)
+            mbr_entry = struct.pack('<BBBBBBBBII',
+                0x00,       # status (not active)
+                0x00,       # CHS start head
+                0x02,       # CHS start sector/cylinder (sector 2)
+                0x00,       # CHS start cylinder
+                0xEE,       # partition type = GPT protective
+                0xFF,       # CHS end head
+                0xFF,       # CHS end sector/cylinder
+                0xFF,       # CHS end cylinder
+                1,          # LBA start (GPT header at LBA 1)
+                min(total_sectors - 1, 0xFFFFFFFF),  # size in sectors (capped at 32-bit)
+            )
+            mbr[446:446+16] = mbr_entry
+            mbr[510] = 0x55  # MBR signature
+            mbr[511] = 0xAA
+            
+            # -- 2. Build partition entries (128 entries x 128 bytes = 16384 bytes = 32 sectors) --
+            entries_blob = bytearray(MAX_ENTRIES * ENTRY_SIZE)
+            for idx, entry in enumerate(entries_data):
+                if idx >= MAX_ENTRIES:
+                    break
+                offset = idx * ENTRY_SIZE
+                
+                # Type GUID (mixed-endian)
+                type_guid_bytes = entry['type_guid'].bytes_le
+                # Unique GUID (mixed-endian)
+                unique_guid_bytes = entry['unique_guid'].bytes_le
+                
+                struct.pack_into('<16s16sQQQ', entries_blob, offset,
+                    type_guid_bytes,
+                    unique_guid_bytes,
+                    entry['first_lba'],
+                    entry['last_lba'],
+                    entry['attributes'],
+                )
+                
+                # Partition name: UTF-16LE, up to 36 characters (72 bytes)
+                name_encoded = entry['name'].encode('utf-16-le')[:72]
+                entries_blob[offset + 56:offset + 56 + len(name_encoded)] = name_encoded
+            
+            # -- 3. Build GPT Header (LBA 1) --
+            disk_guid = uuid.uuid4()
+            
+            # Calculate partition entries CRC32
+            entries_crc = zlib.crc32(bytes(entries_blob)) & 0xFFFFFFFF
+            
+            # GPT header fields
+            header_data = struct.pack('<8sIIIIQQQQ16sQIII',
+                b'EFI PART',           # Signature
+                0x00010000,            # Revision 1.0
+                92,                    # Header size
+                0,                     # Header CRC32 (placeholder, filled below)
+                0,                     # Reserved
+                1,                     # My LBA (primary header at LBA 1)
+                total_sectors - 1,     # Alternate LBA (backup header at last sector)
+                34,                    # First usable LBA (after MBR + header + 32 entry sectors)
+                total_sectors - 34,    # Last usable LBA
+                disk_guid.bytes_le,    # Disk GUID
+                2,                     # Partition entry start LBA
+                MAX_ENTRIES,           # Number of partition entries
+                ENTRY_SIZE,            # Size of each entry
+                entries_crc,           # Partition entries CRC32
+            )
+            
+            # Calculate header CRC32
+            header_bytes = bytearray(header_data)
+            header_crc = zlib.crc32(bytes(header_bytes)) & 0xFFFFFFFF
+            struct.pack_into('<I', header_bytes, 16, header_crc)  # Offset 16 = header CRC field
+            
+            # Pad header to full sector
+            gpt_header = bytes(header_bytes) + b'\x00' * (SECTOR_SIZE - len(header_bytes))
+            
+            # -- 4. Assemble: MBR (LBA 0) + GPT Header (LBA 1) + Entries (LBA 2-33) --
+            result = bytes(mbr) + gpt_header + bytes(entries_blob)
+            
+            return result
         
         def _scatter_import_gpt(self):
             """Import partition layout from a binary GPT dump."""
