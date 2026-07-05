@@ -30,8 +30,89 @@ from PyQt6.QtWidgets import (
     QFormLayout, QCheckBox, QSpinBox, QScrollArea, QFrame, QSplitter,
     QTableWidget, QTableWidgetItem, QHeaderView, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
+from PyQt6.QtWidgets import QLayout, QSizePolicy
+
+
+class FlowLayout(QLayout):
+    """A layout that wraps its children onto multiple rows as needed,
+    instead of running them off the edge of the widget (what QHBoxLayout
+    does). Used for the Shell tab's command button groups — several
+    categories (e.g. "Direct Action") have enough buttons that a single
+    QHBoxLayout row forced a permanent horizontal scrollbar and clipped
+    buttons off-screen. Standard pattern from Qt's own FlowLayout example."""
+
+    def __init__(self, parent=None, margin=0, spacing=5):
+        super().__init__(parent)
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+        self._items = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        x = rect.x()
+        y = rect.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self._items:
+            wid = item.widget()
+            space_x = spacing
+            space_y = spacing
+            next_x = x + item.sizeHint().width() + space_x
+            if next_x - space_x > rect.right() and line_height > 0:
+                x = rect.x()
+                y = y + line_height + space_y
+                next_x = x + item.sizeHint().width() + space_x
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+
+            x = next_x
+            line_height = max(line_height, item.sizeHint().height())
+
+        return y + line_height - rect.y()
 
 
 class ShellLineEdit(QLineEdit):
@@ -136,6 +217,14 @@ def find_adb() -> Optional[str]:
     return None
 
 
+def _shell_quote(path: str) -> str:
+    """Single-quote a path for the device's (POSIX) shell, escaping any
+    embedded single quotes. Needed anywhere a path is interpolated into a
+    shell command string sent via `adb shell` — an unquoted path containing
+    a space splits into multiple arguments on the device side."""
+    return "'" + path.replace("'", "'\"'\"'") + "'"
+
+
 def run_adb(args: List[str], device: Optional[str] = None, timeout: int = 30) -> tuple:
     """Run ADB command and return (success, output)."""
     adb_path = find_adb()
@@ -193,6 +282,8 @@ class AdbWorkerThread(QThread):
                 self._push_file()
             elif self.operation == "install_apk":
                 self._install_apk()
+            elif self.operation == "pull_apk":
+                self._pull_apk()
             elif self.operation == "shell":
                 self._run_shell()
             elif self.operation == "screenshot":
@@ -378,13 +469,74 @@ class AdbWorkerThread(QThread):
         args.append(apk_path)
         
         success, output = run_adb(args, device, timeout=120)
-        
+
         if success and "Success" in output:
             self.log.emit("✓ APK installed successfully")
             self.finished_signal.emit(True, "Installed")
         else:
             self.finished_signal.emit(False, output)
-    
+
+    def _pull_apk(self):
+        """Pull an installed app's APK(s) off the device into their own folder.
+
+        Re-queries `pm path` at pull time rather than reusing the single path
+        from `pm list packages -f`, because split APKs (base + per-density/
+        per-ABI config splits — routine on anything from Play Store) have
+        multiple installed files; using only the list-time path would
+        silently pull an incomplete, unreinstallable app.
+        """
+        device = self.kwargs.get('device')
+        package = self.kwargs.get('package')
+        output_dir = self.kwargs.get('output_dir')
+
+        self.log.emit(f"Finding APK path(s) for {package}...")
+        success, output = run_adb(["shell", "pm", "path", package], device)
+
+        if not success or not output.strip():
+            self.finished_signal.emit(False, f"Could not find install path for {package}")
+            return
+
+        remote_paths = [
+            line.split("package:", 1)[1].strip()
+            for line in output.strip().splitlines()
+            if line.startswith("package:")
+        ]
+
+        if not remote_paths:
+            self.finished_signal.emit(False, f"No APK path returned for {package}")
+            return
+
+        app_dir = os.path.join(output_dir, package)
+        os.makedirs(app_dir, exist_ok=True)
+
+        pulled = []
+        failed = []
+        for i, remote_path in enumerate(remote_paths):
+            if self._cancelled:
+                self.finished_signal.emit(False, "Cancelled")
+                return
+
+            local_name = os.path.basename(remote_path)
+            local_path = os.path.join(app_dir, local_name)
+            self.log.emit(f"Pulling [{i + 1}/{len(remote_paths)}]: {local_name}...")
+
+            success, out = run_adb(["pull", remote_path, local_path], device, timeout=300)
+            if success and os.path.exists(local_path):
+                pulled.append(local_name)
+            else:
+                failed.append(local_name)
+
+        if pulled:
+            note = " (split APK — install all files together)" if len(pulled) > 1 else ""
+            self.log.emit(f"✓ Pulled {len(pulled)} file(s) to {app_dir}{note}")
+        if failed:
+            self.log.emit(f"⚠️ Failed to pull: {', '.join(failed)}")
+
+        if pulled:
+            self.finished_signal.emit(True, app_dir)
+        else:
+            self.finished_signal.emit(False, "Failed to pull any APK files")
+
     def _run_shell(self):
         device = self.kwargs.get('device')
         command = self.kwargs.get('command')
@@ -826,7 +978,17 @@ class AdbToolkitPlugin:
     def _log(self, msg: str):
         self.log_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
         self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
-    
+
+    def _shell_append(self, text: str):
+        """Append to the Shell tab's console and scroll to the bottom.
+
+        appendPlainText() alone doesn't move the viewport, so once the
+        console has more content than fits on screen, new command output
+        lands below the visible area and the view appears "stuck" — this is
+        why the shell looked like it wasn't updating after a command."""
+        self.shell_output.appendPlainText(text)
+        self.shell_output.verticalScrollBar().setValue(self.shell_output.verticalScrollBar().maximum())
+
     def _refresh_devices(self):
         self._log("Scanning for devices...")
         self.worker = AdbWorkerThread("list_devices")
@@ -1187,7 +1349,26 @@ class AdbToolkitPlugin:
         opt_row.addWidget(refresh_btn)
         opt_row.addStretch()
         layout.addLayout(opt_row)
-        
+
+        # Pull APK — grabs the installed APK(s) for whatever's selected above.
+        # Handles split APKs (base + config splits) by re-querying `pm path`
+        # at pull time and saving every returned file into one folder.
+        pull_apk_row = QHBoxLayout()
+        pull_apk_btn = QPushButton("📥 Pull Selected APK(s)")
+        pull_apk_btn.setToolTip(
+            "Pull the installed APK file(s) for the selected app(s) off the device.\n"
+            "Split APKs (multiple files per app) are all saved together in one folder."
+        )
+        pull_apk_btn.clicked.connect(self._pull_apk)
+        pull_apk_row.addWidget(pull_apk_btn)
+
+        self.pull_apk_output = QLineEdit(os.path.expanduser("~/adb_apks"))
+        pull_apk_row.addWidget(self.pull_apk_output, 1)
+        pull_apk_browse = QPushButton("Browse...")
+        pull_apk_browse.clicked.connect(lambda: self._browse_dir(self.pull_apk_output))
+        pull_apk_row.addWidget(pull_apk_browse)
+        layout.addLayout(pull_apk_row)
+
         # Install APK
         install_group = QGroupBox("Install APK")
         install_layout = QHBoxLayout(install_group)
@@ -1231,7 +1412,42 @@ class AdbToolkitPlugin:
             item = QListWidgetItem(p['name'])
             item.setData(Qt.ItemDataRole.UserRole, p)
             self.app_list.addItem(item)
-    
+
+    def _pull_apk(self):
+        """Pull the APK(s) for every selected app, one at a time."""
+        device = self._get_device()
+        selected = self.app_list.selectedItems()
+        if not device or not selected:
+            QMessageBox.warning(self.parent_window, "No Selection",
+                "Select one or more apps from the list first.")
+            return
+
+        output_dir = self.pull_apk_output.text().strip() or os.path.expanduser("~/adb_apks")
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._pull_apk_queue = [item.data(Qt.ItemDataRole.UserRole)['name'] for item in selected]
+        self._pull_apk_output_dir = output_dir
+        self._pull_apk_next()
+
+    def _pull_apk_next(self):
+        if not self._pull_apk_queue:
+            self._log("✓ Finished pulling APK(s)")
+            return
+
+        device = self._get_device()
+        package = self._pull_apk_queue.pop(0)
+
+        self.worker = AdbWorkerThread("pull_apk", device=device,
+                                       package=package,
+                                       output_dir=self._pull_apk_output_dir)
+        self.worker.log.connect(self._log)
+        self.worker.finished_signal.connect(self._on_pull_apk_done)
+        self.worker.start()
+
+    def _on_pull_apk_done(self, success, message):
+        self._log(message if success else f"⚠️ {message}")
+        self._pull_apk_next()
+
     def _install_apk(self):
         device = self._get_device()
         if not device or not self.apk_path.text():
@@ -1304,8 +1520,12 @@ class AdbToolkitPlugin:
         commands_layout.addWidget(unchained_header)
         
         # Tabs for Rebel Arsenal and My Manifesto
+        # No fixed max-height here — it used to cap this at 230px regardless
+        # of how much space the splitter below gave it, which combined with
+        # QHBoxLayout's no-wrap behavior forced a permanent horizontal
+        # scrollbar and clipped buttons. Sizing now comes entirely from the
+        # splitter, so dragging it actually grows this panel.
         cmd_tabs = QTabWidget()
-        cmd_tabs.setMaximumHeight(230)
         
         # Built-in Commands Tab
         builtin_widget = QWidget()
@@ -1369,11 +1589,11 @@ class AdbToolkitPlugin:
             cat_label.setStyleSheet("color: #4fc3f7; margin-top: 5px;")
             builtin_grid.addWidget(cat_label)
             
+            # FlowLayout wraps buttons onto new rows as needed, instead of
+            # QHBoxLayout's single-row-that-runs-off-the-edge behavior.
             flow_widget = QWidget()
-            flow_layout = QHBoxLayout(flow_widget)
-            flow_layout.setContentsMargins(0, 0, 0, 0)
-            flow_layout.setSpacing(5)
-            
+            flow_layout = FlowLayout(flow_widget, margin=0, spacing=5)
+
             for name, cmd, icon, has_dialog, fields in commands:
                 btn = QPushButton(f"{icon} {name}")
                 btn.setToolTip(cmd)
@@ -1383,8 +1603,7 @@ class AdbToolkitPlugin:
                 else:
                     btn.clicked.connect(lambda checked, c=cmd: self._execute_quick_command(c))
                 flow_layout.addWidget(btn)
-            
-            flow_layout.addStretch()
+
             builtin_grid.addWidget(flow_widget)
         
         builtin_grid.addStretch()
@@ -1441,8 +1660,10 @@ class AdbToolkitPlugin:
         commands_layout.addWidget(cmd_tabs)
         splitter.addWidget(commands_panel)
         
-        # Set splitter proportions (console takes more space)
-        splitter.setSizes([300, 200])
+        # Set splitter proportions. Commands panel gets more room than
+        # before (was 200px, too tight once buttons wrap onto multiple rows
+        # per category) — still adjustable by dragging the splitter handle.
+        splitter.setSizes([300, 320])
         layout.addWidget(splitter)
         
         # Command input row
@@ -1469,9 +1690,9 @@ class AdbToolkitPlugin:
         layout.addLayout(cmd_row)
         
         # Show welcome message
-        self.shell_output.appendPlainText("⛓️‍💥 UNCHAINED Shell - Break free from restrictive commands.")
-        self.shell_output.appendPlainText("Use the Rebel Arsenal below or write your own Manifesto.")
-        self.shell_output.appendPlainText("Directory persists between commands. Ⓐ Free your device. Ⓐ\n")
+        self._shell_append("⛓️‍💥 UNCHAINED Shell - Break free from restrictive commands.")
+        self._shell_append("Use the Rebel Arsenal below or write your own Manifesto.")
+        self._shell_append("Directory persists between commands. Ⓐ Free your device. Ⓐ\n")
         
         return tab
     
@@ -1568,7 +1789,7 @@ class AdbToolkitPlugin:
         # Show root indicator in prompt if enabled
         root_mode = hasattr(self, 'shell_root_cb') and self.shell_root_cb.isChecked()
         prompt = f"{self._shell_cwd}#" if root_mode else f"{self._shell_cwd}$"
-        self.shell_output.appendPlainText(f"{prompt} {command}")
+        self._shell_append(f"{prompt} {command}")
         
         # Add to history
         if command and (not self._shell_history or self._shell_history[-1] != command):
@@ -1836,7 +2057,7 @@ class AdbToolkitPlugin:
         """Reset shell to root directory."""
         self._shell_cwd = "/"
         self.shell_cwd_label.setText("📁 /")
-        self.shell_output.appendPlainText("\n--- Shell reset to / ---\n")
+        self._shell_append("\n--- Shell reset to / ---\n")
     
     def _run_shell_command(self):
         """Run a shell command with persistent working directory."""
@@ -1853,7 +2074,7 @@ class AdbToolkitPlugin:
         # Show root indicator in prompt if enabled
         root_mode = hasattr(self, 'shell_root_cb') and self.shell_root_cb.isChecked()
         prompt = f"{self._shell_cwd}#" if root_mode else f"{self._shell_cwd}$"
-        self.shell_output.appendPlainText(f"{prompt} {cmd}")
+        self._shell_append(f"{prompt} {cmd}")
         self.shell_input.clear()
         
         # Handle 'cd' command specially to track directory
@@ -1864,9 +2085,9 @@ class AdbToolkitPlugin:
             # cd with no args goes to home (or stay at root for Android)
             self._shell_cwd = "/"
             self.shell_cwd_label.setText("📁 /")
-            self.shell_output.appendPlainText("(changed to /)\n")
+            self._shell_append("(changed to /)\n")
         elif cmd == "pwd":
-            self.shell_output.appendPlainText(self._shell_cwd + "\n")
+            self._shell_append(self._shell_cwd + "\n")
         else:
             # Run command with cd prefix to maintain working directory
             self._run_in_cwd(device, cmd)
@@ -1905,27 +2126,33 @@ class AdbToolkitPlugin:
         
         # Clean up the path
         new_path = new_path.replace("//", "/")
-        
-        # Verify the directory exists
-        success, output = run_adb(["shell", f"cd {new_path} && pwd"], device, timeout=10)
+
+        # Verify the directory exists. The path must be quoted — paths with
+        # spaces (e.g. "/sdcard/My Files") otherwise split into multiple
+        # shell arguments and `cd` fails with "too many arguments", which
+        # then leaves _shell_cwd stuck and breaks every subsequent command
+        # run through _run_in_cwd.
+        success, output = run_adb(["shell", f"cd {_shell_quote(new_path)} && pwd"], device, timeout=10)
         
         if success and output.strip():
             actual_path = output.strip().split('\n')[-1]  # Get last line (pwd output)
             if actual_path and actual_path.startswith("/"):
                 self._shell_cwd = actual_path
                 self.shell_cwd_label.setText(f"📁 {self._shell_cwd}")
-                self.shell_output.appendPlainText("")
+                self._shell_append("")
             else:
                 self._shell_cwd = new_path
                 self.shell_cwd_label.setText(f"📁 {self._shell_cwd}")
-                self.shell_output.appendPlainText("")
+                self._shell_append("")
         else:
-            self.shell_output.appendPlainText(f"cd: {target_dir}: No such file or directory\n")
+            self._shell_append(f"cd: {target_dir}: No such file or directory\n")
     
     def _run_in_cwd(self, device: str, command: str):
         """Run a command in the current working directory."""
-        # Wrap command to run in the current directory
-        full_cmd = f"cd {self._shell_cwd} && {command}"
+        # Wrap command to run in the current directory. The cwd must be
+        # quoted — see the comment in _handle_cd_command for why an
+        # unquoted path with spaces breaks every command run from it.
+        full_cmd = f"cd {_shell_quote(self._shell_cwd)} && {command}"
         
         # If root mode is enabled, wrap with su -c
         if hasattr(self, 'shell_root_cb') and self.shell_root_cb.isChecked():
@@ -1934,7 +2161,7 @@ class AdbToolkitPlugin:
             full_cmd = f"su -c '{escaped_cmd}'"
         
         self.worker = AdbWorkerThread("shell", device=device, command=full_cmd)
-        self.worker.result_data.connect(lambda out: self.shell_output.appendPlainText(out + "\n"))
+        self.worker.result_data.connect(lambda out: self._shell_append(out + "\n"))
         self.worker.start()
     
     # Keep old method for compatibility with other uses
@@ -1944,11 +2171,11 @@ class AdbToolkitPlugin:
         if not device or not cmd:
             return
         
-        self.shell_output.appendPlainText(f"$ {cmd}")
+        self._shell_append(f"$ {cmd}")
         self.shell_input.clear()
         
         self.worker = AdbWorkerThread("shell", device=device, command=cmd)
-        self.worker.result_data.connect(lambda out: self.shell_output.appendPlainText(out))
+        self.worker.result_data.connect(lambda out: self._shell_append(out))
         self.worker.start()
     
     # ===== TOOLS TAB =====
