@@ -19,6 +19,7 @@ import sys
 import subprocess
 import shutil
 import tempfile
+import time
 from typing import Optional, List
 from datetime import datetime
 
@@ -29,8 +30,89 @@ from PyQt6.QtWidgets import (
     QFormLayout, QCheckBox, QSpinBox, QScrollArea, QFrame, QSplitter,
     QTableWidget, QTableWidgetItem, QHeaderView, QPlainTextEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QRect, QSize, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QKeyEvent
+from PyQt6.QtWidgets import QLayout, QSizePolicy
+
+
+class FlowLayout(QLayout):
+    """A layout that wraps its children onto multiple rows as needed,
+    instead of running them off the edge of the widget (what QHBoxLayout
+    does). Used for the Shell tab's command button groups — several
+    categories (e.g. "Direct Action") have enough buttons that a single
+    QHBoxLayout row forced a permanent horizontal scrollbar and clipped
+    buttons off-screen. Standard pattern from Qt's own FlowLayout example."""
+
+    def __init__(self, parent=None, margin=0, spacing=5):
+        super().__init__(parent)
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+        self._items = []
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only):
+        x = rect.x()
+        y = rect.y()
+        line_height = 0
+        spacing = self.spacing()
+
+        for item in self._items:
+            wid = item.widget()
+            space_x = spacing
+            space_y = spacing
+            next_x = x + item.sizeHint().width() + space_x
+            if next_x - space_x > rect.right() and line_height > 0:
+                x = rect.x()
+                y = y + line_height + space_y
+                next_x = x + item.sizeHint().width() + space_x
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), item.sizeHint()))
+
+            x = next_x
+            line_height = max(line_height, item.sizeHint().height())
+
+        return y + line_height - rect.y()
 
 
 class ShellLineEdit(QLineEdit):
@@ -135,6 +217,14 @@ def find_adb() -> Optional[str]:
     return None
 
 
+def _shell_quote(path: str) -> str:
+    """Single-quote a path for the device's (POSIX) shell, escaping any
+    embedded single quotes. Needed anywhere a path is interpolated into a
+    shell command string sent via `adb shell` — an unquoted path containing
+    a space splits into multiple arguments on the device side."""
+    return "'" + path.replace("'", "'\"'\"'") + "'"
+
+
 def run_adb(args: List[str], device: Optional[str] = None, timeout: int = 30) -> tuple:
     """Run ADB command and return (success, output)."""
     adb_path = find_adb()
@@ -192,6 +282,8 @@ class AdbWorkerThread(QThread):
                 self._push_file()
             elif self.operation == "install_apk":
                 self._install_apk()
+            elif self.operation == "pull_apk":
+                self._pull_apk()
             elif self.operation == "shell":
                 self._run_shell()
             elif self.operation == "screenshot":
@@ -204,6 +296,14 @@ class AdbWorkerThread(QThread):
                 self._reboot()
             elif self.operation == "logcat":
                 self._logcat()
+            elif self.operation == "wireless_pair":
+                self._wireless_pair()
+            elif self.operation == "wireless_connect":
+                self._wireless_connect()
+            elif self.operation == "wireless_disconnect":
+                self._wireless_disconnect()
+            elif self.operation == "wireless_enable_tcpip":
+                self._wireless_enable_tcpip()
         except Exception as e:
             self.finished_signal.emit(False, str(e))
     
@@ -298,8 +398,11 @@ class AdbWorkerThread(QThread):
         device = self.kwargs.get('device')
         partition_path = self.kwargs.get('partition_path')
         partition_name = self.kwargs.get('partition_name')
-        output_dir = self.kwargs.get('output_dir')
+        base_output_dir = self.kwargs.get('output_dir')
         
+        # Create partition-specific subfolder (e.g., output/boot/ for boot.img)
+        output_dir = os.path.join(base_output_dir, partition_name)
+        os.makedirs(output_dir, exist_ok=True)
         output_file = os.path.join(output_dir, f"{partition_name}.img")
         self.log.emit(f"Pulling {partition_name}...")
         
@@ -374,13 +477,74 @@ class AdbWorkerThread(QThread):
         args.append(apk_path)
         
         success, output = run_adb(args, device, timeout=120)
-        
+
         if success and "Success" in output:
             self.log.emit("✓ APK installed successfully")
             self.finished_signal.emit(True, "Installed")
         else:
             self.finished_signal.emit(False, output)
-    
+
+    def _pull_apk(self):
+        """Pull an installed app's APK(s) off the device into their own folder.
+
+        Re-queries `pm path` at pull time rather than reusing the single path
+        from `pm list packages -f`, because split APKs (base + per-density/
+        per-ABI config splits — routine on anything from Play Store) have
+        multiple installed files; using only the list-time path would
+        silently pull an incomplete, unreinstallable app.
+        """
+        device = self.kwargs.get('device')
+        package = self.kwargs.get('package')
+        output_dir = self.kwargs.get('output_dir')
+
+        self.log.emit(f"Finding APK path(s) for {package}...")
+        success, output = run_adb(["shell", "pm", "path", package], device)
+
+        if not success or not output.strip():
+            self.finished_signal.emit(False, f"Could not find install path for {package}")
+            return
+
+        remote_paths = [
+            line.split("package:", 1)[1].strip()
+            for line in output.strip().splitlines()
+            if line.startswith("package:")
+        ]
+
+        if not remote_paths:
+            self.finished_signal.emit(False, f"No APK path returned for {package}")
+            return
+
+        app_dir = os.path.join(output_dir, package)
+        os.makedirs(app_dir, exist_ok=True)
+
+        pulled = []
+        failed = []
+        for i, remote_path in enumerate(remote_paths):
+            if self._cancelled:
+                self.finished_signal.emit(False, "Cancelled")
+                return
+
+            local_name = os.path.basename(remote_path)
+            local_path = os.path.join(app_dir, local_name)
+            self.log.emit(f"Pulling [{i + 1}/{len(remote_paths)}]: {local_name}...")
+
+            success, out = run_adb(["pull", remote_path, local_path], device, timeout=300)
+            if success and os.path.exists(local_path):
+                pulled.append(local_name)
+            else:
+                failed.append(local_name)
+
+        if pulled:
+            note = " (split APK — install all files together)" if len(pulled) > 1 else ""
+            self.log.emit(f"✓ Pulled {len(pulled)} file(s) to {app_dir}{note}")
+        if failed:
+            self.log.emit(f"⚠️ Failed to pull: {', '.join(failed)}")
+
+        if pulled:
+            self.finished_signal.emit(True, app_dir)
+        else:
+            self.finished_signal.emit(False, "Failed to pull any APK files")
+
     def _run_shell(self):
         device = self.kwargs.get('device')
         command = self.kwargs.get('command')
@@ -486,6 +650,327 @@ class AdbWorkerThread(QThread):
         self.result_data.emit(output)
         self.finished_signal.emit(success, "Logcat retrieved")
 
+    def _wireless_pair(self):
+        """Pair with a device over Wi-Fi (Android 11+).
+
+        Uses the pairing address:port and 6-digit code shown under
+        Developer Options → Wireless debugging → Pair device with pairing
+        code. `adb pair` reads the code from stdin, so it's fed in rather
+        than passed as an argument."""
+        address = self.kwargs.get('address')
+        code = self.kwargs.get('code')
+        self.log.emit(f"Pairing with {address}...")
+
+        try:
+            proc = subprocess.run(
+                [self.adb_path, "pair", address],
+                input=f"{code}\n", capture_output=True, text=True, timeout=30
+            )
+            output = (proc.stdout + proc.stderr).strip()
+        except subprocess.TimeoutExpired:
+            self.finished_signal.emit(False, "Pairing timed out — check the address and that pairing is still open on the device")
+            return
+
+        if "Successfully paired" in output:
+            self.log.emit(f"✓ {output}")
+            self.finished_signal.emit(True, output)
+        else:
+            self.finished_signal.emit(False, output or "Pairing failed")
+
+    def _wireless_connect(self):
+        """Connect to a device over Wi-Fi at address:port."""
+        address = self.kwargs.get('address')
+        self.log.emit(f"Connecting to {address}...")
+        success, output = run_adb(["connect", address], timeout=30)
+        output = output.strip()
+
+        # `adb connect` returns 0 even on failure ("failed to connect",
+        # "cannot connect"), so success has to be judged from the text.
+        if success and "connected to" in output and "failed" not in output and "cannot" not in output:
+            self.log.emit(f"✓ {output}")
+            self.finished_signal.emit(True, output)
+        else:
+            self.finished_signal.emit(False, output or "Connection failed")
+
+    def _wireless_disconnect(self):
+        """Disconnect one wireless device, or all if no address given."""
+        address = self.kwargs.get('address')
+        args = ["disconnect"]
+        if address:
+            args.append(address)
+        success, output = run_adb(args, timeout=15)
+        self.finished_signal.emit(success, output.strip() or "Disconnected")
+
+    def _wireless_enable_tcpip(self):
+        """Switch a USB-connected device into TCP/IP mode on port 5555.
+
+        This is the pre-Android-11 path: with the device plugged in over
+        USB, restart adbd listening on TCP so it can then be reached
+        wirelessly with `adb connect <ip>:5555` after unplugging."""
+        device = self.kwargs.get('device')
+        port = self.kwargs.get('port', 5555)
+        self.log.emit(f"Restarting adbd in TCP/IP mode on port {port}...")
+        success, output = run_adb(["tcpip", str(port)], device, timeout=15)
+        output = output.strip()
+
+        if not success:
+            self.finished_signal.emit(False, output or "Failed to enable TCP/IP mode")
+            return
+
+        # Grab the device's Wi-Fi IP so the UI can suggest the connect address.
+        ip = None
+        ip_ok, ip_out = run_adb(["shell", "ip", "-f", "inet", "addr", "show", "wlan0"], device, timeout=10)
+        if ip_ok:
+            import re
+            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+            if m:
+                ip = m.group(1)
+
+        self.result_data.emit({'port': port, 'ip': ip})
+        if ip:
+            self.finished_signal.emit(True, f"TCP/IP mode on. Unplug USB, then connect to {ip}:{port}")
+        else:
+            self.finished_signal.emit(True, f"TCP/IP mode on port {port}. Find the device's Wi-Fi IP, then connect.")
+
+
+class RootExtractWorker(QThread):
+    """Worker thread for extracting the live filesystem from a rooted device."""
+    
+    progress = pyqtSignal(int, int)  # current, total
+    status = pyqtSignal(str)
+    log = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)  # success, message
+    
+    def __init__(self, device: str, paths: list, output_dir: str,
+                 save_permissions: bool = True, skip_errors: bool = True,
+                 include_symlinks: bool = True, max_file_mb: int = 500):
+        super().__init__()
+        self.device = device
+        self.paths = paths
+        self.output_dir = output_dir
+        self.save_permissions = save_permissions
+        self.skip_errors = skip_errors
+        self.include_symlinks = include_symlinks
+        self.max_file_mb = max_file_mb
+        self._cancelled = False
+        self.adb_path = find_adb()
+        
+        self.files_extracted = 0
+        self.files_failed = 0
+        self.files_skipped = 0
+        self.total_bytes = 0
+        self.permissions_log = []
+    
+    def cancel(self):
+        self._cancelled = True
+    
+    def run(self):
+        if not self.adb_path:
+            self.finished.emit(False, "ADB not found")
+            return
+        
+        # Check root access
+        self.status.emit("Checking root access...")
+        result = subprocess.run(
+            [self.adb_path, "-s", self.device, "shell", "su", "-c", "id"],
+            capture_output=True, text=True, timeout=10
+        )
+        
+        if "uid=0" not in result.stdout:
+            self.finished.emit(False, "ROOT ACCESS REQUIRED - Device is not rooted or su was denied")
+            return
+        
+        self.log.emit("✓ Root access confirmed")
+        
+        # Create output directory
+        os.makedirs(self.output_dir, exist_ok=True)
+        
+        # Phase 1: Create all tar archives on device
+        total_paths = len(self.paths)
+        self.log.emit(f"\n📦 Phase 1: Creating {total_paths} tar archives on device...")
+        tar_jobs = []  # (remote_tar, local_tar, partition_name, remote_path)
+        
+        for idx, remote_path in enumerate(self.paths):
+            if self._cancelled:
+                break
+            
+            partition_name = self._get_partition_name(remote_path)
+            remote_tar = f"/data/local/tmp/_extract_{partition_name}.tar"
+            local_tar = os.path.join(self.output_dir, f"{partition_name}.tar")
+            
+            pct = int((idx / total_paths) * 33)  # Phase 1 is 0-33%
+            self.progress.emit(pct, 100)
+            self.status.emit(f"[{pct}%] Creating tar [{idx+1}/{total_paths}]: {partition_name}...")
+            self.log.emit(f"   📁 {remote_path} → {partition_name}.tar")
+            
+            # Create tar on device (run as root)
+            tar_cmd = f"su -c \"tar -cf '{remote_tar}' -C / '{remote_path.lstrip('/')}' 2>/dev/null\""
+            subprocess.run(
+                [self.adb_path, "-s", self.device, "shell", tar_cmd],
+                capture_output=True, timeout=600
+            )
+            
+            # Verify tar was created and get size
+            check = subprocess.run(
+                [self.adb_path, "-s", self.device, "shell", f"ls -l '{remote_tar}' 2>/dev/null"],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if remote_tar in check.stdout:
+                try:
+                    size = int(check.stdout.split()[4])
+                    self.log.emit(f"      ✓ {size / 1024 / 1024:.1f} MB")
+                    tar_jobs.append((remote_tar, local_tar, partition_name, remote_path, size))
+                except:
+                    tar_jobs.append((remote_tar, local_tar, partition_name, remote_path, 0))
+            else:
+                self.log.emit(f"      ⚠️ Failed to create tar for {remote_path}")
+                self.files_failed += 1
+        
+        if self._cancelled or not tar_jobs:
+            self.finished.emit(False, "Cancelled or no tars created")
+            return
+        
+        # Phase 2: Pull all tar files
+        total_tar_size = sum(job[4] for job in tar_jobs)
+        self.log.emit(f"\n📥 Phase 2: Pulling {len(tar_jobs)} tar archives ({total_tar_size / 1024 / 1024:.1f} MB total)...")
+        pulled_tars = []
+        pulled_bytes = 0
+        
+        for i, (remote_tar, local_tar, partition_name, remote_path, tar_size) in enumerate(tar_jobs):
+            if self._cancelled:
+                break
+            
+            # Phase 2 is 33-66%
+            pct = 33 + int((i / len(tar_jobs)) * 33)
+            self.progress.emit(pct, 100)
+            self.status.emit(f"[{pct}%] Pulling [{i+1}/{len(tar_jobs)}]: {partition_name}.tar...")
+            
+            pull_result = subprocess.run(
+                [self.adb_path, "-s", self.device, "pull", remote_tar, local_tar],
+                capture_output=True, text=True, timeout=1800
+            )
+            
+            if pull_result.returncode == 0 and os.path.exists(local_tar):
+                size = os.path.getsize(local_tar)
+                self.total_bytes += size
+                pulled_bytes += size
+                self.log.emit(f"   ✓ {partition_name}.tar ({size / 1024 / 1024:.1f} MB)")
+                pulled_tars.append((local_tar, partition_name))
+            else:
+                self.log.emit(f"   ❌ Failed to pull {partition_name}.tar")
+                self.files_failed += 1
+            
+            # Clean up remote tar immediately after pull
+            subprocess.run(
+                [self.adb_path, "-s", self.device, "shell", f"rm -f '{remote_tar}'"],
+                capture_output=True, timeout=10
+            )
+        
+        if self._cancelled:
+            self.finished.emit(False, "Cancelled")
+            return
+        
+        # Phase 3: Extract all tars locally
+        self.log.emit(f"\n📂 Phase 3: Extracting {len(pulled_tars)} archives locally...")
+        import tarfile
+        
+        total_extracted = 0
+        for i, (local_tar, partition_name) in enumerate(pulled_tars):
+            if self._cancelled:
+                break
+            
+            # Phase 3 is 66-100%
+            base_pct = 66 + int((i / len(pulled_tars)) * 34)
+            self.progress.emit(base_pct, 100)
+            self.status.emit(f"[{base_pct}%] Extracting [{i+1}/{len(pulled_tars)}]: {partition_name}...")
+            
+            output_dir = os.path.join(self.output_dir, partition_name)
+            os.makedirs(output_dir, exist_ok=True)
+            
+            try:
+                with tarfile.open(local_tar, 'r') as tar:
+                    members = tar.getmembers()
+                    total = len(members)
+                    self.log.emit(f"   📦 {partition_name}: {total} files")
+                    
+                    for j, member in enumerate(members):
+                        if self._cancelled:
+                            break
+                        
+                        # Update progress within this tar extraction
+                        if j % 100 == 0 or j == total - 1:
+                            inner_pct = int((j / total) * 100) if total > 0 else 100
+                            tar_pct = 66 + int((i / len(pulled_tars)) * 34) + int((1 / len(pulled_tars)) * 34 * (j / total))
+                            self.progress.emit(min(tar_pct, 99), 100)
+                            self.status.emit(f"[{min(tar_pct, 99)}%] {partition_name}: {j}/{total} ({inner_pct}%)")
+                        
+                        try:
+                            tar.extract(member, output_dir)
+                            self.files_extracted += 1
+                        except Exception as e:
+                            self.files_failed += 1
+                    
+                    self.log.emit(f"   ✓ Extracted {partition_name} ({total} files)")
+                    
+            except tarfile.TarError as e:
+                self.log.emit(f"   ⚠️ Tar error for {partition_name}: {e}")
+                self.files_failed += 1
+            
+            # Delete tar after extraction to save space
+            try:
+                os.remove(local_tar)
+            except:
+                pass
+        
+        self.progress.emit(100, 100)
+        
+        # Summary
+        summary = (
+            f"✅ Extraction complete!\n"
+            f"   Files extracted: {self.files_extracted}\n"
+            f"   Files failed: {self.files_failed}\n"
+            f"   Total size: {self.total_bytes / 1024 / 1024:.1f} MB\n"
+            f"   Output: {self.output_dir}"
+        )
+        
+        self.finished.emit(True, summary)
+    
+    def _get_partition_name(self, path: str) -> str:
+        """Get a clean partition/folder name from the path."""
+        # Remove leading slash and get first component
+        parts = path.strip('/').split('/')
+        
+        if len(parts) == 1:
+            return parts[0]
+        
+        # For nested paths like /data/data, use meaningful name
+        if path.startswith('/data/data'):
+            return 'data_app_data'
+        elif path.startswith('/data/app'):
+            return 'data_apps'
+        elif path.startswith('/data/misc'):
+            return 'data_misc'
+        elif path.startswith('/data/system'):
+            return 'data_system'
+        elif path.startswith('/data'):
+            return 'data'
+        elif path.startswith('/sdcard/DCIM'):
+            return 'sdcard_dcim'
+        elif path.startswith('/sdcard/Download'):
+            return 'sdcard_download'
+        elif path.startswith('/sdcard'):
+            return 'sdcard'
+        elif path.startswith('/mnt/vendor/nvdata'):
+            return 'nvdata'
+        elif path.startswith('/mnt/vendor/nvcfg'):
+            return 'nvcfg'
+        elif path.startswith('/mnt/vendor/protect'):
+            return 'protect'
+        
+        # Default: use first path component
+        return parts[0]
+
 
 class AdbToolkitPlugin:
     """Comprehensive ADB Toolkit Plugin."""
@@ -560,7 +1045,13 @@ class AdbToolkitPlugin:
         # Tab 6: Tools
         self.tabs.addTab(self._create_tools_tab(), "🔧 Tools")
         
-        # Tab 7: Reboot
+        # Tab 7: Root Extract (Full Filesystem)
+        self.tabs.addTab(self._create_root_extract_tab(), "🌳 Root Extract")
+
+        # Tab 8: Wireless Debugging (pair/connect over Wi-Fi)
+        self.tabs.addTab(self._create_wireless_tab(), "📡 Wireless")
+
+        # Tab 9: Reboot
         self.tabs.addTab(self._create_reboot_tab(), "🔄 Reboot")
         
         main_layout.addWidget(self.tabs)
@@ -580,7 +1071,17 @@ class AdbToolkitPlugin:
     def _log(self, msg: str):
         self.log_output.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
         self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
-    
+
+    def _shell_append(self, text: str):
+        """Append to the Shell tab's console and scroll to the bottom.
+
+        appendPlainText() alone doesn't move the viewport, so once the
+        console has more content than fits on screen, new command output
+        lands below the visible area and the view appears "stuck" — this is
+        why the shell looked like it wasn't updating after a command."""
+        self.shell_output.appendPlainText(text)
+        self.shell_output.verticalScrollBar().setValue(self.shell_output.verticalScrollBar().maximum())
+
     def _refresh_devices(self):
         self._log("Scanning for devices...")
         self.worker = AdbWorkerThread("list_devices")
@@ -828,23 +1329,21 @@ class AdbToolkitPlugin:
             QMessageBox.warning(self.parent_window, "Error", "Select partitions first")
             return
         
-        # Determine output directory based on setup mode
+        # Determine base output directory
         if self._setup_base_dir:
-            # Setup directories mode - each partition goes to its own folder
-            data = selected[0].data(Qt.ItemDataRole.UserRole)
-            output_dir = os.path.join(self._setup_base_dir, data['name'])
-            os.makedirs(output_dir, exist_ok=True)
+            base_output_dir = self._setup_base_dir
         else:
-            # Manual output directory mode
-            output_dir = self.partition_output.text()
-            os.makedirs(output_dir, exist_ok=True)
+            base_output_dir = self.partition_output.text()
+        
+        os.makedirs(base_output_dir, exist_ok=True)
         
         # Pull first selected (simplified - could queue all)
+        # Note: Worker thread will create partition subfolder automatically
         data = selected[0].data(Qt.ItemDataRole.UserRole)
         self.worker = AdbWorkerThread("pull_partition", device=device,
                                        partition_path=data['path'],
                                        partition_name=data['name'],
-                                       output_dir=output_dir)
+                                       output_dir=base_output_dir)
         self.worker.log.connect(self._log)
         self.worker.finished_signal.connect(lambda s, m: self._log(m))
         self.worker.start()
@@ -943,7 +1442,26 @@ class AdbToolkitPlugin:
         opt_row.addWidget(refresh_btn)
         opt_row.addStretch()
         layout.addLayout(opt_row)
-        
+
+        # Pull APK — grabs the installed APK(s) for whatever's selected above.
+        # Handles split APKs (base + config splits) by re-querying `pm path`
+        # at pull time and saving every returned file into one folder.
+        pull_apk_row = QHBoxLayout()
+        pull_apk_btn = QPushButton("📥 Pull Selected APK(s)")
+        pull_apk_btn.setToolTip(
+            "Pull the installed APK file(s) for the selected app(s) off the device.\n"
+            "Split APKs (multiple files per app) are all saved together in one folder."
+        )
+        pull_apk_btn.clicked.connect(self._pull_apk)
+        pull_apk_row.addWidget(pull_apk_btn)
+
+        self.pull_apk_output = QLineEdit(os.path.expanduser("~/adb_apks"))
+        pull_apk_row.addWidget(self.pull_apk_output, 1)
+        pull_apk_browse = QPushButton("Browse...")
+        pull_apk_browse.clicked.connect(lambda: self._browse_dir(self.pull_apk_output))
+        pull_apk_row.addWidget(pull_apk_browse)
+        layout.addLayout(pull_apk_row)
+
         # Install APK
         install_group = QGroupBox("Install APK")
         install_layout = QHBoxLayout(install_group)
@@ -987,7 +1505,42 @@ class AdbToolkitPlugin:
             item = QListWidgetItem(p['name'])
             item.setData(Qt.ItemDataRole.UserRole, p)
             self.app_list.addItem(item)
-    
+
+    def _pull_apk(self):
+        """Pull the APK(s) for every selected app, one at a time."""
+        device = self._get_device()
+        selected = self.app_list.selectedItems()
+        if not device or not selected:
+            QMessageBox.warning(self.parent_window, "No Selection",
+                "Select one or more apps from the list first.")
+            return
+
+        output_dir = self.pull_apk_output.text().strip() or os.path.expanduser("~/adb_apks")
+        os.makedirs(output_dir, exist_ok=True)
+
+        self._pull_apk_queue = [item.data(Qt.ItemDataRole.UserRole)['name'] for item in selected]
+        self._pull_apk_output_dir = output_dir
+        self._pull_apk_next()
+
+    def _pull_apk_next(self):
+        if not self._pull_apk_queue:
+            self._log("✓ Finished pulling APK(s)")
+            return
+
+        device = self._get_device()
+        package = self._pull_apk_queue.pop(0)
+
+        self.worker = AdbWorkerThread("pull_apk", device=device,
+                                       package=package,
+                                       output_dir=self._pull_apk_output_dir)
+        self.worker.log.connect(self._log)
+        self.worker.finished_signal.connect(self._on_pull_apk_done)
+        self.worker.start()
+
+    def _on_pull_apk_done(self, success, message):
+        self._log(message if success else f"⚠️ {message}")
+        self._pull_apk_next()
+
     def _install_apk(self):
         device = self._get_device()
         if not device or not self.apk_path.text():
@@ -1060,8 +1613,12 @@ class AdbToolkitPlugin:
         commands_layout.addWidget(unchained_header)
         
         # Tabs for Rebel Arsenal and My Manifesto
+        # No fixed max-height here — it used to cap this at 230px regardless
+        # of how much space the splitter below gave it, which combined with
+        # QHBoxLayout's no-wrap behavior forced a permanent horizontal
+        # scrollbar and clipped buttons. Sizing now comes entirely from the
+        # splitter, so dragging it actually grows this panel.
         cmd_tabs = QTabWidget()
-        cmd_tabs.setMaximumHeight(230)
         
         # Built-in Commands Tab
         builtin_widget = QWidget()
@@ -1125,11 +1682,11 @@ class AdbToolkitPlugin:
             cat_label.setStyleSheet("color: #4fc3f7; margin-top: 5px;")
             builtin_grid.addWidget(cat_label)
             
+            # FlowLayout wraps buttons onto new rows as needed, instead of
+            # QHBoxLayout's single-row-that-runs-off-the-edge behavior.
             flow_widget = QWidget()
-            flow_layout = QHBoxLayout(flow_widget)
-            flow_layout.setContentsMargins(0, 0, 0, 0)
-            flow_layout.setSpacing(5)
-            
+            flow_layout = FlowLayout(flow_widget, margin=0, spacing=5)
+
             for name, cmd, icon, has_dialog, fields in commands:
                 btn = QPushButton(f"{icon} {name}")
                 btn.setToolTip(cmd)
@@ -1139,8 +1696,7 @@ class AdbToolkitPlugin:
                 else:
                     btn.clicked.connect(lambda checked, c=cmd: self._execute_quick_command(c))
                 flow_layout.addWidget(btn)
-            
-            flow_layout.addStretch()
+
             builtin_grid.addWidget(flow_widget)
         
         builtin_grid.addStretch()
@@ -1197,8 +1753,10 @@ class AdbToolkitPlugin:
         commands_layout.addWidget(cmd_tabs)
         splitter.addWidget(commands_panel)
         
-        # Set splitter proportions (console takes more space)
-        splitter.setSizes([300, 200])
+        # Set splitter proportions. Commands panel gets more room than
+        # before (was 200px, too tight once buttons wrap onto multiple rows
+        # per category) — still adjustable by dragging the splitter handle.
+        splitter.setSizes([300, 320])
         layout.addWidget(splitter)
         
         # Command input row
@@ -1225,9 +1783,9 @@ class AdbToolkitPlugin:
         layout.addLayout(cmd_row)
         
         # Show welcome message
-        self.shell_output.appendPlainText("⛓️‍💥 UNCHAINED Shell - Break free from restrictive commands.")
-        self.shell_output.appendPlainText("Use the Rebel Arsenal below or write your own Manifesto.")
-        self.shell_output.appendPlainText("Directory persists between commands. Ⓐ Free your device. Ⓐ\n")
+        self._shell_append("⛓️‍💥 UNCHAINED Shell - Break free from restrictive commands.")
+        self._shell_append("Use the Rebel Arsenal below or write your own Manifesto.")
+        self._shell_append("Directory persists between commands. Ⓐ Free your device. Ⓐ\n")
         
         return tab
     
@@ -1324,7 +1882,7 @@ class AdbToolkitPlugin:
         # Show root indicator in prompt if enabled
         root_mode = hasattr(self, 'shell_root_cb') and self.shell_root_cb.isChecked()
         prompt = f"{self._shell_cwd}#" if root_mode else f"{self._shell_cwd}$"
-        self.shell_output.appendPlainText(f"{prompt} {command}")
+        self._shell_append(f"{prompt} {command}")
         
         # Add to history
         if command and (not self._shell_history or self._shell_history[-1] != command):
@@ -1592,7 +2150,7 @@ class AdbToolkitPlugin:
         """Reset shell to root directory."""
         self._shell_cwd = "/"
         self.shell_cwd_label.setText("📁 /")
-        self.shell_output.appendPlainText("\n--- Shell reset to / ---\n")
+        self._shell_append("\n--- Shell reset to / ---\n")
     
     def _run_shell_command(self):
         """Run a shell command with persistent working directory."""
@@ -1609,7 +2167,7 @@ class AdbToolkitPlugin:
         # Show root indicator in prompt if enabled
         root_mode = hasattr(self, 'shell_root_cb') and self.shell_root_cb.isChecked()
         prompt = f"{self._shell_cwd}#" if root_mode else f"{self._shell_cwd}$"
-        self.shell_output.appendPlainText(f"{prompt} {cmd}")
+        self._shell_append(f"{prompt} {cmd}")
         self.shell_input.clear()
         
         # Handle 'cd' command specially to track directory
@@ -1620,9 +2178,9 @@ class AdbToolkitPlugin:
             # cd with no args goes to home (or stay at root for Android)
             self._shell_cwd = "/"
             self.shell_cwd_label.setText("📁 /")
-            self.shell_output.appendPlainText("(changed to /)\n")
+            self._shell_append("(changed to /)\n")
         elif cmd == "pwd":
-            self.shell_output.appendPlainText(self._shell_cwd + "\n")
+            self._shell_append(self._shell_cwd + "\n")
         else:
             # Run command with cd prefix to maintain working directory
             self._run_in_cwd(device, cmd)
@@ -1661,27 +2219,33 @@ class AdbToolkitPlugin:
         
         # Clean up the path
         new_path = new_path.replace("//", "/")
-        
-        # Verify the directory exists
-        success, output = run_adb(["shell", f"cd {new_path} && pwd"], device, timeout=10)
+
+        # Verify the directory exists. The path must be quoted — paths with
+        # spaces (e.g. "/sdcard/My Files") otherwise split into multiple
+        # shell arguments and `cd` fails with "too many arguments", which
+        # then leaves _shell_cwd stuck and breaks every subsequent command
+        # run through _run_in_cwd.
+        success, output = run_adb(["shell", f"cd {_shell_quote(new_path)} && pwd"], device, timeout=10)
         
         if success and output.strip():
             actual_path = output.strip().split('\n')[-1]  # Get last line (pwd output)
             if actual_path and actual_path.startswith("/"):
                 self._shell_cwd = actual_path
                 self.shell_cwd_label.setText(f"📁 {self._shell_cwd}")
-                self.shell_output.appendPlainText("")
+                self._shell_append("")
             else:
                 self._shell_cwd = new_path
                 self.shell_cwd_label.setText(f"📁 {self._shell_cwd}")
-                self.shell_output.appendPlainText("")
+                self._shell_append("")
         else:
-            self.shell_output.appendPlainText(f"cd: {target_dir}: No such file or directory\n")
+            self._shell_append(f"cd: {target_dir}: No such file or directory\n")
     
     def _run_in_cwd(self, device: str, command: str):
         """Run a command in the current working directory."""
-        # Wrap command to run in the current directory
-        full_cmd = f"cd {self._shell_cwd} && {command}"
+        # Wrap command to run in the current directory. The cwd must be
+        # quoted — see the comment in _handle_cd_command for why an
+        # unquoted path with spaces breaks every command run from it.
+        full_cmd = f"cd {_shell_quote(self._shell_cwd)} && {command}"
         
         # If root mode is enabled, wrap with su -c
         if hasattr(self, 'shell_root_cb') and self.shell_root_cb.isChecked():
@@ -1690,7 +2254,7 @@ class AdbToolkitPlugin:
             full_cmd = f"su -c '{escaped_cmd}'"
         
         self.worker = AdbWorkerThread("shell", device=device, command=full_cmd)
-        self.worker.result_data.connect(lambda out: self.shell_output.appendPlainText(out + "\n"))
+        self.worker.result_data.connect(lambda out: self._shell_append(out + "\n"))
         self.worker.start()
     
     # Keep old method for compatibility with other uses
@@ -1700,11 +2264,11 @@ class AdbToolkitPlugin:
         if not device or not cmd:
             return
         
-        self.shell_output.appendPlainText(f"$ {cmd}")
+        self._shell_append(f"$ {cmd}")
         self.shell_input.clear()
         
         self.worker = AdbWorkerThread("shell", device=device, command=cmd)
-        self.worker.result_data.connect(lambda out: self.shell_output.appendPlainText(out))
+        self.worker.result_data.connect(lambda out: self._shell_append(out))
         self.worker.start()
     
     # ===== TOOLS TAB =====
@@ -1955,20 +2519,11 @@ class AdbToolkitPlugin:
             return
         
         self._log("Checking OEM unlock status...")
-        print("[OEM Check] Gathering device unlock information...")
         
         state = self._get_oem_state(device, adb_path)
         
-        print(f"[OEM Check] Settings value: {state['settings_value']}")
-        print(f"[OEM Check] Runtime value: {state['runtime_value']}")
-        print(f"[OEM Check] Is truly enabled: {state['is_truly_enabled']}")
-        print(f"[OEM Check] Needs reboot: {state['needs_reboot']}")
-        if state['blocked_reason']:
-            print(f"[OEM Check] Blocked reason: {state['blocked_reason']}")
-        
         self.oem_status_label.setText(self._format_oem_status(state))
         self._log("OEM status check complete")
-        print("[OEM Check] Status check complete")
     
     def _enable_oem_unlock(self):
         """Attempt to enable OEM unlocking via settings"""
@@ -1995,7 +2550,6 @@ class AdbToolkitPlugin:
             return
         
         self._log("Attempting to enable OEM unlock...")
-        print("[OEM Unlock] Attempting to enable OEM unlock setting...")
         
         try:
             result = subprocess.run(
@@ -2011,7 +2565,6 @@ class AdbToolkitPlugin:
                 )
                 return
             
-            print("[OEM Unlock] Command executed, checking new state...")
             after_state = self._get_oem_state(device, adb_path)
             
             if after_state['is_truly_enabled']:
@@ -2065,7 +2618,6 @@ class AdbToolkitPlugin:
                 
         except Exception as e:
             self._log(f"✗ Error: {e}")
-            print(f"[OEM Unlock] ✗ Exception: {e}")
             self.oem_status_label.setText(f"✗ <b style='color:#f44747'>Error: {e}</b>")
     
     def _reboot_and_wait_for_oem(self, device, adb_path):
@@ -2167,7 +2719,6 @@ class AdbToolkitPlugin:
             return
         
         self._log("Opening Developer Options...")
-        print("[OEM] Opening Developer Options on device...")
         
         try:
             # Try the standard developer options intent
@@ -2179,7 +2730,6 @@ class AdbToolkitPlugin:
             
             if result.returncode == 0 and "Error" not in result.stdout:
                 self._log("✓ Developer Options opened on device")
-                print("[OEM] ✓ Developer Options opened")
             else:
                 # Try alternate method
                 result2 = subprocess.run(
@@ -2189,14 +2739,11 @@ class AdbToolkitPlugin:
                 )
                 if result2.returncode == 0:
                     self._log("✓ Developer Options opened on device")
-                    print("[OEM] ✓ Developer Options opened (alternate)")
                 else:
                     self._log("⚠ Could not open Developer Options directly")
-                    print(f"[OEM] ⚠ Could not open: {result.stdout} {result2.stdout}")
                     
         except Exception as e:
             self._log(f"✗ Error: {e}")
-            print(f"[OEM] ✗ Error opening Developer Options: {e}")
     
     def _take_screenshot(self):
         device = self._get_device()
@@ -2220,6 +2767,500 @@ class AdbToolkitPlugin:
         self.worker.finished_signal.connect(lambda s, m: self._log(m))
         self.worker.start()
     
+    # ===== ROOT EXTRACT TAB =====
+    def _create_root_extract_tab(self):
+        """Create the Root Filesystem Extract tab - pulls live files like root explorer."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Scroll area for all content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        
+        scroll_content = QWidget()
+        layout = QVBoxLayout(scroll_content)
+        layout.setSpacing(8)
+        
+        # Warning/Info banner
+        info_banner = QLabel(
+            "🌳 <b>Root Filesystem Extractor</b> - "
+            "Extract the live filesystem just like using Root Explorer on your phone. "
+            "⚠️ <b>Requires ROOT access</b> - Files are organized by partition/mount point."
+        )
+        info_banner.setWordWrap(True)
+        info_banner.setStyleSheet("background: #1a472a; padding: 8px; border-radius: 5px; color: #90EE90;")
+        layout.addWidget(info_banner)
+        
+        # Partition/Path selection
+        paths_group = QGroupBox("📁 Select Paths to Extract")
+        paths_layout = QVBoxLayout(paths_group)
+        paths_layout.setSpacing(4)
+        
+        # Predefined common paths
+        self.root_extract_paths = QListWidget()
+        self.root_extract_paths.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.root_extract_paths.setMinimumHeight(150)
+        self.root_extract_paths.setMaximumHeight(200)
+        
+        # Common Android paths with descriptions
+        common_paths = [
+            ("/system", "System - OS files, apps, framework"),
+            ("/vendor", "Vendor - device drivers/HALs"),
+            ("/product", "Product - OEM customizations"),
+            ("/data", "Data - user apps and data (large!)"),
+            ("/data/data", "App private data only"),
+            ("/data/app", "Installed APKs"),
+            ("/data/misc", "Misc - WiFi, Bluetooth configs"),
+            ("/data/system", "System databases and settings"),
+            ("/sdcard", "Internal storage (user files)"),
+            ("/sdcard/DCIM", "Camera photos/videos"),
+            ("/sdcard/Download", "Downloaded files"),
+            ("/efs", "EFS - IMEI, calibration (Samsung)"),
+            ("/persist", "Persist - calibration data"),
+            ("/mnt/vendor/nvdata", "NVRAM data (MTK)"),
+            ("/mnt/vendor/nvcfg", "NVRAM config (MTK)"),
+            ("/mnt/vendor/protect_f", "Protected data (MTK)"),
+            ("/cache", "Cache partition"),
+            ("/metadata", "Metadata partition"),
+            ("/dev/block/by-name", "List partition block devices"),
+        ]
+        
+        for path, desc in common_paths:
+            item = QListWidgetItem(f"{path}  →  {desc}")
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.root_extract_paths.addItem(item)
+        
+        # Select common ones by default
+        for i in [0, 1, 2]:  # system, vendor, product
+            self.root_extract_paths.item(i).setSelected(True)
+        
+        paths_layout.addWidget(self.root_extract_paths)
+        
+        # Quick select buttons
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(4)
+        
+        select_all_btn = QPushButton("All")
+        select_all_btn.setMaximumWidth(60)
+        select_all_btn.clicked.connect(lambda: self.root_extract_paths.selectAll())
+        quick_row.addWidget(select_all_btn)
+        
+        select_none_btn = QPushButton("None")
+        select_none_btn.setMaximumWidth(60)
+        select_none_btn.clicked.connect(lambda: self.root_extract_paths.clearSelection())
+        quick_row.addWidget(select_none_btn)
+        
+        select_system_btn = QPushButton("System")
+        select_system_btn.setMaximumWidth(70)
+        select_system_btn.clicked.connect(lambda: self._quick_select_root_paths(["/system", "/vendor", "/product"]))
+        quick_row.addWidget(select_system_btn)
+        
+        select_data_btn = QPushButton("Data")
+        select_data_btn.setMaximumWidth(60)
+        select_data_btn.clicked.connect(lambda: self._quick_select_root_paths(["/data/data", "/data/app", "/data/misc"]))
+        quick_row.addWidget(select_data_btn)
+        
+        # Custom path input inline
+        quick_row.addWidget(QLabel("Custom:"))
+        self.root_custom_path = QLineEdit()
+        self.root_custom_path.setPlaceholderText("/path/to/extract")
+        self.root_custom_path.setMaximumWidth(200)
+        quick_row.addWidget(self.root_custom_path)
+        add_path_btn = QPushButton("+")
+        add_path_btn.setMaximumWidth(30)
+        add_path_btn.clicked.connect(self._add_custom_root_path)
+        quick_row.addWidget(add_path_btn)
+        
+        quick_row.addStretch()
+        paths_layout.addLayout(quick_row)
+        
+        layout.addWidget(paths_group)
+        
+        # Output directory and Options in same row
+        settings_row = QHBoxLayout()
+        
+        # Output directory
+        output_group = QGroupBox("📥 Output Directory")
+        output_layout = QHBoxLayout(output_group)
+        output_layout.setContentsMargins(8, 8, 8, 8)
+        self.root_extract_output = QLineEdit(os.path.expanduser("~/phone_filesystem"))
+        output_layout.addWidget(self.root_extract_output)
+        browse_btn = QPushButton("...")
+        browse_btn.setMaximumWidth(30)
+        browse_btn.clicked.connect(lambda: self._browse_dir(self.root_extract_output))
+        output_layout.addWidget(browse_btn)
+        settings_row.addWidget(output_group, 2)
+        
+        # Options - more compact
+        options_group = QGroupBox("⚙️ Options")
+        options_layout = QVBoxLayout(options_group)
+        options_layout.setContentsMargins(8, 8, 8, 8)
+        options_layout.setSpacing(2)
+        
+        self.root_preserve_perms = QCheckBox("Save permissions")
+        self.root_preserve_perms.setChecked(True)
+        options_layout.addWidget(self.root_preserve_perms)
+        
+        self.root_skip_errors = QCheckBox("Skip unreadable")
+        self.root_skip_errors.setChecked(True)
+        options_layout.addWidget(self.root_skip_errors)
+        
+        self.root_include_symlinks = QCheckBox("Include symlinks")
+        self.root_include_symlinks.setChecked(True)
+        options_layout.addWidget(self.root_include_symlinks)
+        
+        size_row = QHBoxLayout()
+        size_row.addWidget(QLabel("Max MB:"))
+        self.root_max_file_size = QSpinBox()
+        self.root_max_file_size.setRange(0, 10000)
+        self.root_max_file_size.setValue(500)
+        self.root_max_file_size.setMaximumWidth(80)
+        size_row.addWidget(self.root_max_file_size)
+        size_row.addStretch()
+        options_layout.addLayout(size_row)
+        
+        settings_row.addWidget(options_group, 1)
+        layout.addLayout(settings_row)
+        
+        # Progress
+        progress_group = QGroupBox("📊 Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        progress_layout.setContentsMargins(8, 8, 8, 8)
+        
+        self.root_extract_progress = QProgressBar()
+        self.root_extract_progress.setFormat("%v / %m files (%p%)")
+        progress_layout.addWidget(self.root_extract_progress)
+        
+        self.root_extract_status = QLabel("Ready")
+        self.root_extract_status.setStyleSheet("color: #888;")
+        progress_layout.addWidget(self.root_extract_status)
+        
+        layout.addWidget(progress_group)
+        
+        # Action buttons
+        btn_row = QHBoxLayout()
+        
+        self.root_extract_btn = QPushButton("🌳 Extract Filesystem (Root Required)")
+        self.root_extract_btn.setMinimumHeight(36)
+        self.root_extract_btn.setStyleSheet("background: #2e7d32; font-weight: bold;")
+        self.root_extract_btn.clicked.connect(self._start_root_extract)
+        btn_row.addWidget(self.root_extract_btn)
+        
+        self.root_cancel_btn = QPushButton("⛔ Cancel")
+        self.root_cancel_btn.setMinimumHeight(36)
+        self.root_cancel_btn.setEnabled(False)
+        self.root_cancel_btn.clicked.connect(self._cancel_root_extract)
+        btn_row.addWidget(self.root_cancel_btn)
+        
+        layout.addLayout(btn_row)
+        layout.addStretch()
+        
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
+        
+        return tab
+    
+    def _quick_select_root_paths(self, paths: list):
+        """Quick select specific paths in the root extract list."""
+        self.root_extract_paths.clearSelection()
+        for i in range(self.root_extract_paths.count()):
+            item = self.root_extract_paths.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) in paths:
+                item.setSelected(True)
+    
+    def _add_custom_root_path(self):
+        """Add a custom path to the extraction list."""
+        path = self.root_custom_path.text().strip()
+        if not path:
+            return
+        if not path.startswith('/'):
+            path = '/' + path
+        
+        # Check if already exists
+        for i in range(self.root_extract_paths.count()):
+            if self.root_extract_paths.item(i).data(Qt.ItemDataRole.UserRole) == path:
+                QMessageBox.information(self.parent_window, "Info", f"Path {path} already in list")
+                return
+        
+        item = QListWidgetItem(f"{path}  →  (custom)")
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.root_extract_paths.addItem(item)
+        item.setSelected(True)
+        self.root_custom_path.clear()
+    
+    def _start_root_extract(self):
+        """Start the root filesystem extraction."""
+        device = self._get_device()
+        if not device:
+            QMessageBox.warning(self.parent_window, "No Device", "Please connect a device first.")
+            return
+        
+        # Get selected paths
+        selected_paths = []
+        for item in self.root_extract_paths.selectedItems():
+            selected_paths.append(item.data(Qt.ItemDataRole.UserRole))
+        
+        if not selected_paths:
+            QMessageBox.warning(self.parent_window, "No Paths", "Please select at least one path to extract.")
+            return
+        
+        output_dir = self.root_extract_output.text()
+        if not output_dir:
+            QMessageBox.warning(self.parent_window, "No Output", "Please select an output directory.")
+            return
+        
+        # Confirm
+        msg = f"Extract {len(selected_paths)} path(s) to:\n{output_dir}\n\nThis requires ROOT access. Continue?"
+        reply = QMessageBox.question(self.parent_window, "Confirm Extraction", msg)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Update UI
+        self.root_extract_btn.setEnabled(False)
+        self.root_cancel_btn.setEnabled(True)
+        self.root_extract_progress.setValue(0)
+        self.root_extract_progress.setMaximum(100)
+        
+        # Start worker
+        self.root_extract_worker = RootExtractWorker(
+            device=device,
+            paths=selected_paths,
+            output_dir=output_dir,
+            save_permissions=self.root_preserve_perms.isChecked(),
+            skip_errors=self.root_skip_errors.isChecked(),
+            include_symlinks=self.root_include_symlinks.isChecked(),
+            max_file_mb=self.root_max_file_size.value()
+        )
+        self.root_extract_worker.progress.connect(self._on_root_extract_progress)
+        self.root_extract_worker.status.connect(self._on_root_extract_status)
+        self.root_extract_worker.log.connect(self._log)
+        self.root_extract_worker.finished.connect(self._on_root_extract_finished)
+        self.root_extract_worker.start()
+    
+    def _cancel_root_extract(self):
+        """Cancel the extraction."""
+        if hasattr(self, 'root_extract_worker') and self.root_extract_worker.isRunning():
+            self.root_extract_worker.cancel()
+            self.root_extract_status.setText("Cancelling...")
+    
+    def _on_root_extract_progress(self, current, total):
+        """Update progress bar."""
+        self.root_extract_progress.setMaximum(total)
+        self.root_extract_progress.setValue(current)
+    
+    def _on_root_extract_status(self, msg):
+        """Update status label."""
+        self.root_extract_status.setText(msg)
+    
+    def _on_root_extract_finished(self, success, message):
+        """Handle extraction completion."""
+        self.root_extract_btn.setEnabled(True)
+        self.root_cancel_btn.setEnabled(False)
+        self.root_extract_status.setText(message)
+        self._log(message)
+        
+        if success:
+            QMessageBox.information(self.parent_window, "Complete", message)
+
+    # ===== WIRELESS DEBUGGING TAB =====
+    def _create_wireless_tab(self):
+        """Wireless debugging: pair + connect over Wi-Fi (Android 11+) and
+        the older USB→TCP/IP path for pre-11 devices."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        scroll_content = QWidget()
+        layout = QVBoxLayout(scroll_content)
+        layout.setSpacing(8)
+
+        # Info banner
+        info_banner = QLabel(
+            "📡 <b>Wireless Debugging</b> — Break free from the USB cable. "
+            "On the device: <b>Settings → Developer Options → Wireless debugging</b> (enable it), "
+            "then use the address, port, and pairing code shown there."
+        )
+        info_banner.setWordWrap(True)
+        info_banner.setStyleSheet("background: #0d3b4f; padding: 8px; border-radius: 5px; color: #4fc3f7;")
+        layout.addWidget(info_banner)
+
+        # --- Step 1: Pair (Android 11+) ---
+        pair_group = QGroupBox("① Pair (Android 11+, first time only)")
+        pair_layout = QFormLayout(pair_group)
+
+        self.wireless_pair_address = QLineEdit()
+        self.wireless_pair_address.setPlaceholderText("192.168.1.42:37123  (from 'Pair device with pairing code')")
+        pair_layout.addRow("Pairing address:port:", self.wireless_pair_address)
+
+        self.wireless_pair_code = QLineEdit()
+        self.wireless_pair_code.setPlaceholderText("6-digit code shown on device")
+        self.wireless_pair_code.setMaxLength(6)
+        pair_layout.addRow("Pairing code:", self.wireless_pair_code)
+
+        pair_btn = QPushButton("🔗 Pair Device")
+        pair_btn.clicked.connect(self._wireless_pair)
+        pair_layout.addRow("", pair_btn)
+
+        pair_hint = QLabel(
+            "Tap <b>“Pair device with pairing code”</b> on the phone — it shows a "
+            "separate address:port and a 6-digit code. Use those here. "
+            "The main Wireless debugging screen's address:port is for Connect below, not pairing."
+        )
+        pair_hint.setWordWrap(True)
+        pair_hint.setStyleSheet("font-size: 11px; color: #888;")
+        pair_layout.addRow(pair_hint)
+
+        layout.addWidget(pair_group)
+
+        # --- Step 2: Connect ---
+        connect_group = QGroupBox("② Connect")
+        connect_layout = QFormLayout(connect_group)
+
+        self.wireless_connect_address = QLineEdit()
+        self.wireless_connect_address.setPlaceholderText("192.168.1.42:5555  (IP:port from Wireless debugging)")
+        connect_layout.addRow("Device address:port:", self.wireless_connect_address)
+
+        connect_btn_row = QHBoxLayout()
+        connect_btn = QPushButton("📶 Connect")
+        connect_btn.clicked.connect(self._wireless_connect)
+        connect_btn_row.addWidget(connect_btn)
+
+        disconnect_btn = QPushButton("✂️ Disconnect")
+        disconnect_btn.setToolTip("Disconnect this address (leave blank to disconnect all wireless devices)")
+        disconnect_btn.clicked.connect(self._wireless_disconnect)
+        connect_btn_row.addWidget(disconnect_btn)
+
+        disconnect_all_btn = QPushButton("Disconnect All")
+        disconnect_all_btn.clicked.connect(lambda: self._wireless_disconnect(all_devices=True))
+        connect_btn_row.addWidget(disconnect_all_btn)
+        connect_btn_row.addStretch()
+        connect_layout.addRow("", connect_btn_row)
+
+        layout.addWidget(connect_group)
+
+        # --- Older devices: USB → TCP/IP ---
+        tcpip_group = QGroupBox("Older devices (pre-Android 11): USB → Wi-Fi")
+        tcpip_layout = QVBoxLayout(tcpip_group)
+
+        tcpip_info = QLabel(
+            "No pairing on older devices. Plug in over USB and select it in the "
+            "<b>Device</b> dropdown up top, then click below to restart adbd on TCP/IP. "
+            "The device's Wi-Fi IP is auto-filled into Connect above — unplug USB and hit Connect."
+        )
+        tcpip_info.setWordWrap(True)
+        tcpip_info.setStyleSheet("font-size: 11px; color: #888;")
+        tcpip_layout.addWidget(tcpip_info)
+
+        tcpip_row = QHBoxLayout()
+        tcpip_row.addWidget(QLabel("Port:"))
+        self.wireless_tcpip_port = QSpinBox()
+        self.wireless_tcpip_port.setRange(1024, 65535)
+        self.wireless_tcpip_port.setValue(5555)
+        self.wireless_tcpip_port.setMaximumWidth(90)
+        tcpip_row.addWidget(self.wireless_tcpip_port)
+
+        tcpip_btn = QPushButton("🔌 Enable TCP/IP over USB")
+        tcpip_btn.clicked.connect(self._wireless_enable_tcpip)
+        tcpip_row.addWidget(tcpip_btn)
+        tcpip_row.addStretch()
+        tcpip_layout.addLayout(tcpip_row)
+
+        layout.addWidget(tcpip_group)
+
+        layout.addStretch()
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
+        return tab
+
+    def _wireless_pair(self):
+        address = self.wireless_pair_address.text().strip()
+        code = self.wireless_pair_code.text().strip()
+        if not address or ":" not in address:
+            QMessageBox.warning(self.parent_window, "Pairing Address",
+                "Enter the pairing address as host:port (from 'Pair device with pairing code').")
+            return
+        if not code or len(code) != 6 or not code.isdigit():
+            QMessageBox.warning(self.parent_window, "Pairing Code",
+                "Enter the 6-digit pairing code shown on the device.")
+            return
+
+        self._log(f"Pairing with {address}...")
+        self.worker = AdbWorkerThread("wireless_pair", address=address, code=code)
+        self.worker.log.connect(self._log)
+        self.worker.finished_signal.connect(self._on_wireless_pair_done)
+        self.worker.start()
+
+    def _on_wireless_pair_done(self, success, message):
+        self._log(message)
+        if success:
+            self.wireless_pair_code.clear()
+            # Pre-fill the connect address with the same host so the next
+            # step is one field away. The connect port usually differs from
+            # the pairing port, so only the host is carried over.
+            host = self.wireless_pair_address.text().strip().split(":")[0]
+            if host and not self.wireless_connect_address.text().strip():
+                self.wireless_connect_address.setText(f"{host}:")
+            QMessageBox.information(self.parent_window, "Paired",
+                f"{message}\n\nNow enter the device's address:port from the main "
+                "Wireless debugging screen under ② Connect.")
+        else:
+            QMessageBox.warning(self.parent_window, "Pairing Failed", message)
+
+    def _wireless_connect(self):
+        address = self.wireless_connect_address.text().strip()
+        if not address or ":" not in address:
+            QMessageBox.warning(self.parent_window, "Connect Address",
+                "Enter the device address as host:port (e.g. 192.168.1.42:5555).")
+            return
+
+        self._log(f"Connecting to {address}...")
+        self.worker = AdbWorkerThread("wireless_connect", address=address)
+        self.worker.log.connect(self._log)
+        self.worker.finished_signal.connect(self._on_wireless_connect_done)
+        self.worker.start()
+
+    def _on_wireless_connect_done(self, success, message):
+        self._log(message)
+        if success:
+            self._refresh_devices()  # New wireless device shows in the dropdown
+        else:
+            QMessageBox.warning(self.parent_window, "Connection Failed", message)
+
+    def _wireless_disconnect(self, all_devices: bool = False):
+        address = "" if all_devices else self.wireless_connect_address.text().strip()
+        self._log("Disconnecting wireless device(s)...")
+        self.worker = AdbWorkerThread("wireless_disconnect", address=address)
+        self.worker.finished_signal.connect(lambda s, m: [self._log(m), self._refresh_devices()])
+        self.worker.start()
+
+    def _wireless_enable_tcpip(self):
+        device = self._get_device()
+        if not device:
+            QMessageBox.warning(self.parent_window, "No Device",
+                "Plug in the device over USB and select it in the Device dropdown first.")
+            return
+
+        self._log("Enabling TCP/IP mode over USB...")
+        self.worker = AdbWorkerThread("wireless_enable_tcpip", device=device,
+                                       port=self.wireless_tcpip_port.value())
+        self.worker.log.connect(self._log)
+        self.worker.result_data.connect(self._on_tcpip_result)
+        self.worker.finished_signal.connect(lambda s, m: self._log(m))
+        self.worker.start()
+
+    def _on_tcpip_result(self, data):
+        """Auto-fill the connect address once we know the device's Wi-Fi IP."""
+        ip = data.get('ip')
+        port = data.get('port', 5555)
+        if ip:
+            self.wireless_connect_address.setText(f"{ip}:{port}")
+
     # ===== REBOOT TAB =====
     def _create_reboot_tab(self):
         tab = QWidget()

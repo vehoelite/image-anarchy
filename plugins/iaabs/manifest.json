@@ -18,6 +18,5 @@
         "https://imageanarchy.com/platform-tools/libwinpthread-1.dll"
     ],
     "setup_commands": [],
-    "enabled": true,
-    "remote_capable": true
+    "enabled": true
 }

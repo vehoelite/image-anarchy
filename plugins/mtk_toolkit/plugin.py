@@ -233,48 +233,6 @@ _shim_installed = _install_pyside6_shim()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FUSE shim — prevent OSError crash when libfuse is missing
-# ═══════════════════════════════════════════════════════════════════════════════
-# Official mtkclient's mtkdafs.py does `from fuse import Operations, LoggingMixIn`
-# which crashes with OSError (not ImportError) when fusepy is installed but the
-# system libfuse library is missing. The upstream code only catches ImportError,
-# so the OSError kills the entire mtkclient import chain even though FUSE is only
-# used for one optional feature (filesystem mounting).
-#
-# We can't modify the official mtkclient files, so we pre-test the fuse import
-# and install a stub module if it fails, allowing everything else to work.
-def _install_fuse_shim():
-    """Install a stub 'fuse' module if the real one can't load (missing libfuse)."""
-    try:
-        import fuse  # noqa: F401 — test if it loads without OSError
-        return False  # Real fuse works fine, no shim needed
-    except (ImportError, OSError):
-        pass
-
-    # Create stub classes that mtkclient expects
-    fuse_shim = types.ModuleType('fuse')
-    fuse_shim.__package__ = 'fuse'
-    fuse_shim._is_shim = True
-
-    class _StubOperations:
-        """Stub base class so MtkDaFS(LoggingMixIn, Operations) doesn't crash."""
-        pass
-
-    class _StubLoggingMixIn:
-        """Stub base class for FUSE logging mixin."""
-        pass
-
-    fuse_shim.Operations = _StubOperations
-    fuse_shim.LoggingMixIn = _StubLoggingMixIn
-    fuse_shim.FUSE = None  # mtk_da_handler checks `if FUSE is not None`
-
-    sys.modules['fuse'] = fuse_shim
-    return True
-
-_fuse_shimmed = _install_fuse_shim()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Now safe to import mtkclient
 # ═══════════════════════════════════════════════════════════════════════════════
 _mtkclient_available = False
@@ -766,7 +724,11 @@ class MtkDeviceHandler(QObject):
     def connect_device(self, directory: str = ".") -> bool:
         """
         Connect to MTK device and configure DA.
-        This is equivalent to configure_da() in the original.
+        Upstream mtkclient split the old configure_da(mtk, directory) into:
+          1. connect(mtk, directory)  - USB + preloader init
+          2. configure_da(mtk)       - security bypass + DA upload
+        We call both in sequence, with a fallback for older bundled versions
+        that still use the single-method API.
         """
         if not self.mtk or not self.da_handler:
             if not self.initialize():
@@ -779,8 +741,16 @@ class MtkDeviceHandler(QObject):
             self._emit_log("💡 Device must be in BROM or Preloader mode")
             self._emit_log("💡 Hold Volume buttons while connecting USB")
             
-            # Configure DA (this does the actual connection)
-            self.mtk = self.da_handler.configure_da(self.mtk, directory)
+            # Upstream mtkclient split configure_da into connect() + configure_da()
+            # Support both old (single method) and new (two method) APIs
+            if hasattr(self.da_handler, 'connect') and callable(getattr(self.da_handler, 'connect')):
+                # New API: connect first, then configure_da (no directory arg)
+                self.mtk = self.da_handler.connect(self.mtk, directory)
+                if self.mtk is not None:
+                    self.mtk = self.da_handler.configure_da(self.mtk)
+            else:
+                # Old API: single configure_da(mtk, directory)
+                self.mtk = self.da_handler.configure_da(self.mtk, directory)
             
             if self.mtk is not None:
                 self.connected = True

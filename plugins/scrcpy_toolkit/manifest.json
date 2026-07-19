@@ -9,6 +9,7 @@
     "website": "https://github.com/vehoelite/image-anarchy",
     "support_url": "https://github.com/vehoelite/image-anarchy/issues",
     "min_version": "2.0",
+    "git_clone": null,
     "requirements": [],
     "bundled_binaries": [
         "https://imageanarchy.com/scrcpy.exe",
@@ -23,6 +24,6 @@
         "https://imageanarchy.com/SDL2.dll",
         "https://imageanarchy.com/swresample-5.dll"
     ],
-    "dependencies": [],
+    "setup_commands": [],
     "enabled": true
 }

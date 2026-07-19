@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Image Anarchy - Android Image Swiss Army Knife
-Version: 3.3
+Version: 3.4
 
 A modern PyQt6 application for extracting, creating, and manipulating
 Android OTA payloads and image formats.
@@ -13755,8 +13755,11 @@ def create_gui_app():
         
         def _setup_ui(self):
             self.setWindowTitle(f"Image Anarchy {APP_VERSION} - Android Image Swiss Army Knife")
+            # ~1/3 larger default launch size — several plugin views (e.g. the
+            # ADB Toolkit Shell tab's command panel) are cramped at the old
+            # 1400x1000 default.
             self.setMinimumSize(1280, 900)
-            self.resize(1400, 1000)
+            self.resize(1867, 1333)
             
             central = QWidget()
             self.setCentralWidget(central)
@@ -15452,7 +15455,14 @@ def create_gui_app():
                 "Size", "Region", "Type", "Operation Type",
                 "Download", "Reserved"
             ])
-            self.scatter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            # Only "File Name" stretches to fill remaining space — having two
+            # Stretch columns (this used to include "Partition Name" too) made
+            # Qt split space between them without regard to actual content
+            # length, so partition names like "preloader_a" were squeezed into
+            # a sliver while File Name got the lion's share. Partition names
+            # are short and bounded, so ResizeToContents (like the other
+            # columns) fits them properly instead.
+            self.scatter_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
             self.scatter_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
             for col in range(2, 9):
                 self.scatter_table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
