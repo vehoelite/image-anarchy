@@ -1,0 +1,23 @@
+{
+    "id": "qualcomm_edl_toolkit",
+    "name": "Qualcomm EDL Toolkit",
+    "version": "0.1.0",
+    "description": "QPST-class Qualcomm EDL suite: WinUSB auto-bind, EDL entry, Sahara auto-ident (chip/PK-hash/HWID/serial), Firehose loader match/upload, and (later) partition R/W + OEM unlock. Powered by edlclient.",
+    "author": "Image Anarchy Team",
+    "icon": "🔌",
+    "license_type": "free",
+    "website": "https://github.com/bkerler/edl",
+    "support_url": "https://github.com/vehoelite/image-anarchy/issues",
+    "min_version": "3.0",
+    "git_clone": { "repo": "https://github.com/bkerler/edl.git", "target": "edl" },
+    "requirements": ["wheel","setuptools","pyusb","pyserial","docopt","pycryptodome","pycryptodomex","colorama","lxml","requests"],
+    "bundled_binaries": [
+        "https://imageanarchy.com/platform-tools/adb.exe",
+        "https://imageanarchy.com/platform-tools/AdbWinApi.dll",
+        "https://imageanarchy.com/platform-tools/AdbWinUsbApi.dll",
+        "https://imageanarchy.com/platform-tools/libwinpthread-1.dll"
+    ],
+    "setup_commands": [],
+    "enabled": true,
+    "remote_capable": false
+}
