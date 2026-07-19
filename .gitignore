@@ -65,3 +65,10 @@ drivers/
 
 # Secrets
 plugin_store_auth.json
+
+# Qualcomm EDL Toolkit vendored engine (git_clone at install)
+plugins/qualcomm_edl_toolkit/edl/
+plugins/qualcomm_edl_toolkit/loaders/*
+!plugins/qualcomm_edl_toolkit/loaders/.keep
+plugins/qualcomm_edl_toolkit/**/__pycache__/
+plugins/qualcomm_edl_toolkit/.pytest_cache/
