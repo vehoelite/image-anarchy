@@ -3,7 +3,10 @@ import os
 import subprocess
 import sys
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QGroupBox, QLabel,
+    QPushButton, QTextEdit, QFormLayout, QFileDialog, QListWidget
+)
 from PyQt6.QtCore import QThread, pyqtSignal
 
 # Sibling imports must work both as a package (tests import
@@ -109,8 +112,146 @@ class EdlWorker(QThread):
 class PluginWidget(QWidget):
     def __init__(self, parent_window=None):
         super().__init__()
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("🔌 Qualcomm EDL Toolkit — loading…"))
+        self.parent_window = parent_window
+        self.worker = None
+        self.current_ident = None
+        self._loaders_cache = []
+
+        root = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+
+        # --- Device tab ---
+        dev = QWidget(); dl = QVBoxLayout(dev)
+        row = QHBoxLayout()
+        self.btn_edl = QPushButton("💥 Reboot to EDL")
+        self.btn_bind = QPushButton("🔧 Bind WinUSB")
+        self.btn_ident = QPushButton("🔎 Identify")
+        for b in (self.btn_edl, self.btn_bind, self.btn_ident):
+            row.addWidget(b)
+        dl.addLayout(row)
+        self.driver_lbl = QLabel("Driver: unknown")
+        dl.addWidget(self.driver_lbl)
+        box = QGroupBox("Device (Sahara)"); form = QFormLayout(box)
+        self.lbl_serial = QLabel("—"); self.lbl_hwid = QLabel("—")
+        self.lbl_pk = QLabel("—"); self.lbl_sb = QLabel("—")
+        self.lbl_pk.setWordWrap(True)
+        form.addRow("Serial:", self.lbl_serial)
+        form.addRow("HWID:", self.lbl_hwid)
+        form.addRow("PK-hash:", self.lbl_pk)
+        form.addRow("Secure boot:", self.lbl_sb)
+        dl.addWidget(box); dl.addStretch()
+        self.tabs.addTab(dev, "Device")
+
+        # --- Loaders tab ---
+        ld = QWidget(); ll = QVBoxLayout(ld)
+        self.match_lbl = QLabel("No device identified yet.")
+        ll.addWidget(self.match_lbl)
+        self.loader_list = QListWidget(); ll.addWidget(self.loader_list)
+        lr = QHBoxLayout()
+        self.btn_import = QPushButton("📥 Import Loader…")
+        self.btn_upload = QPushButton("⬆️ Upload Selected")
+        lr.addWidget(self.btn_import); lr.addWidget(self.btn_upload)
+        ll.addLayout(lr)
+        self.tabs.addTab(ld, "Loaders")
+
+        # --- Log tab ---
+        lg = QWidget(); gl = QVBoxLayout(lg)
+        self.logbox = QTextEdit(); self.logbox.setReadOnly(True)
+        gl.addWidget(self.logbox)
+        self.tabs.addTab(lg, "Log")
+
+        self.btn_edl.clicked.connect(lambda: self._run("enter_edl"))
+        self.btn_ident.clicked.connect(lambda: self._run("identify"))
+        self.btn_bind.clicked.connect(self._bind)
+        self.btn_import.clicked.connect(self._import_loader)
+        self.btn_upload.clicked.connect(self._upload_selected)
+
+        self._refresh_driver()
+        self._refresh_loaders([])
+
+    def _loaders_dir(self):
+        return os.path.join(edl_paths.plugin_dir(), "loaders")
+
+    def _log(self, msg):
+        self.logbox.append(msg)
+
+    def _refresh_driver(self):
+        st = driver_manager.is_ready()
+        if not st["present"]:
+            self.driver_lbl.setText("Driver: no 9008 device present")
+        elif st["winusb"]:
+            self.driver_lbl.setText("Driver: ✅ WinUSB bound")
+        else:
+            self.driver_lbl.setText("Driver: ⚠️ 9008 present, NOT WinUSB — bind it")
+
+    def _refresh_loaders(self, ranked):
+        self.loader_list.clear()
+        allld = loader_manager.index_loaders([self._loaders_dir()])
+        show = ranked if ranked else allld
+        for ld in show:
+            self.loader_list.addItem(f"{ld['name']}   [{ld['hwid']} / {ld['pkhash']}]")
+        self._loaders_cache = show
+
+    def _run(self, op, params=None):
+        if self.worker is not None:
+            self._log("⏳ Busy…"); return
+        self.worker = EdlWorker(op, params)
+        self.worker.log.connect(self._log)
+        self.worker.ident_ready.connect(self._on_ident)
+        self.worker.finished_op.connect(self._on_finished)
+        self.worker.start()
+
+    def _on_finished(self, ok, msg):
+        self._log(("✅ " if ok else "❌ ") + msg)
+        self._refresh_driver()
+        if self.worker:
+            self.worker.deleteLater()
+            self.worker = None
+
+    def _on_ident(self, info):
+        self.current_ident = info
+        self.lbl_serial.setText(info["serial"] or "—")
+        self.lbl_hwid.setText(info["hwid"] or "—")
+        self.lbl_pk.setText(info["pkhash"] or "—")
+        self.lbl_sb.setText("yes" if info["secureboot"] else "no")
+        ranked = loader_manager.match(
+            loader_manager.index_loaders([self._loaders_dir()]),
+            info["hwid"], info["pkhash"])
+        if ranked:
+            self.match_lbl.setText(f"✅ {len(ranked)} candidate loader(s) matched.")
+        else:
+            self.match_lbl.setText(
+                f"⚠️ No loader for PK-hash {info['pkhash'][:16]}… — import a signed loader.")
+        self._refresh_loaders(ranked)
+
+    def _bind(self):
+        st = driver_manager.is_ready()
+        if not st["present"]:
+            self._log("No 9008 device to bind."); return
+        ok, msg = driver_manager.bind_winusb(st["instance_id"])
+        self._log(("✅ " if ok else "❌ ") + "WinUSB bind: " + msg)
+        self._refresh_driver()
+
+    def _import_loader(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Firehose loader", "",
+                                              "Loaders (*.bin *.elf *.mbn)")
+        if not path:
+            return
+        dest = loader_manager.import_byo(path, self._loaders_dir())
+        self._log(f"📥 Imported {os.path.basename(dest)}")
+        hwid = self.current_ident["hwid"] if self.current_ident else ""
+        pk = self.current_ident["pkhash"] if self.current_ident else ""
+        ranked = loader_manager.match(
+            loader_manager.index_loaders([self._loaders_dir()]), hwid, pk)
+        self._refresh_loaders(ranked)
+
+    def _upload_selected(self):
+        idx = self.loader_list.currentRow()
+        if idx < 0 or idx >= len(self._loaders_cache):
+            self._log("Select a loader first."); return
+        loader = self._loaders_cache[idx]["path"]
+        self._run("upload_loader", {"loader": loader})
 
 
 class Plugin:
