@@ -957,6 +957,21 @@ git commit -m "feat(qedl): Device/Loaders/Log UI with auto-match + live log"
 - **Placeholders:** none — every code step has full code; the only deferred artifact is `drivers/winusb_9008.inf` (a packaging asset) and `bind_winusb` degrades gracefully without it, with an explicit implementer note.
 - **Type consistency:** ident dict keys (`ok/serial/hwid/pkhash/secureboot/error`) are identical across `qedl_ident.py`, `ident.parse_ident_json`, `EdlWorker._identify`, and `PluginWidget._on_ident`. Loader dict keys (`hwid/pkhash/path/name`) consistent across `loader_manager` and UI. `EdlWorker` signal names (`log/progress/ident_ready/finished_op`) match every connection in `PluginWidget`.
 
+## Implementation Findings (2026-07-19, validated on onn 8Core)
+
+- **Plugin loads, "Reboot to EDL" (adb) works live** in Image Anarchy. Detection correctly reports
+  driver state. All 13 unit tests green.
+- **Serial mode rejected.** edl `--serial --portname=COMxx` over Qualcomm's `qcusbser` COM port
+  reaches "Mode detected: sahara" but the initial Sahara HELLO comes back empty/mis-framed, so
+  command-mode identity reads never complete (hangs). Over **WinUSB**, the same reads succeed
+  cleanly. Conclusion: WinUSB is required; serial is not a viable substitute for this device.
+- **WinUSB auto-bind needs libwdi, not pnputil.** `pnputil /add-driver <unsigned>.inf /install`
+  is rejected ("does not contain digital signature information"), and Qualcomm's signed `qcusbser`
+  out-ranks a generic WinUSB inf on re-enumeration. The robust one-click bind must bundle **libwdi
+  (`wdi-simple.exe`)** — the self-signing + force-install engine Zadig uses. Until then,
+  `bind_winusb` short-circuits when already bound and otherwise returns actionable Zadig guidance.
+  **→ Phase 1.1 task: bundle libwdi and drive it from `driver_manager.bind_winusb`.**
+
 ## Notes for Phase 2/3
 
 Phase 2 adds `printgpt`/GPT browser + partition read/dump + `devinfo` OEM-unlock (`is_unlocked`/`is_unlock_critical`) once a loader that authenticates is available. Phase 3 adds write/erase/flash/restore + peek/poke behind a dry-run gate. The onn 8Core stays blocked until an OEM-signed khaje loader is sourced — the plugin is ready for it.
