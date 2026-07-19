@@ -17,3 +17,13 @@ def test_parse_present_not_winusb():
 def test_parse_absent():
     st = dm.parse_9008_state(["OK|WinUSB|USB\\VID_1234&PID_5678\\x"])
     assert not st["present"] and st["instance_id"] is None
+
+
+def test_bind_shortcircuits_when_already_winusb(monkeypatch):
+    if dm.os.name != "nt":
+        import pytest
+        pytest.skip("bind is Windows-only")
+    monkeypatch.setattr(dm, "is_ready",
+                        lambda: {"present": True, "winusb": True, "instance_id": "x"})
+    ok, msg = dm.bind_winusb("x")
+    assert ok and "already" in msg.lower()

@@ -54,6 +54,9 @@ def bind_winusb(instance_id: str):
     Returns (ok, message). Windows only. Requires the bundled winusb inf in plugin_dir()."""
     if os.name != "nt":
         return (False, "WinUSB bind is Windows-only")
+    st = is_ready()
+    if st["present"] and st["winusb"]:
+        return (True, "already bound to WinUSB")
     inf = os.path.join(edl_paths.plugin_dir(), "drivers", "winusb_9008.inf")
     if not os.path.isfile(inf):
         return (False, "Bundled WinUSB inf not found (drivers/winusb_9008.inf)")
@@ -62,7 +65,14 @@ def bind_winusb(instance_id: str):
             ["pnputil", "/add-driver", inf, "/install"],
             capture_output=True, text=True, timeout=60,
         )
-        ok = r.returncode == 0
-        return (ok, (r.stdout + r.stderr).strip())
+        out = (r.stdout + r.stderr)
+        if "Added driver packages:  1" in out or "Driver package added" in out:
+            return (True, "WinUSB installed — replug the device if it doesn't switch")
+        if "digital signature" in out.lower() or "signature" in out.lower():
+            return (False,
+                    "Windows rejected the unsigned WinUSB inf. Use Zadig (or the bundled "
+                    "libwdi installer) to set WinUSB on 'VID_05C6&PID_9008', or plug the "
+                    "device into the USB port you previously bound.")
+        return (False, out.strip() or "pnputil failed")
     except Exception as e:
         return (False, str(e))

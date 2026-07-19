@@ -72,3 +72,7 @@ plugins/qualcomm_edl_toolkit/loaders/*
 !plugins/qualcomm_edl_toolkit/loaders/.keep
 plugins/qualcomm_edl_toolkit/**/__pycache__/
 plugins/qualcomm_edl_toolkit/.pytest_cache/
+
+# Qualcomm EDL Toolkit install-provided binaries (bundled_binaries at install)
+plugins/qualcomm_edl_toolkit/adb.exe
+plugins/qualcomm_edl_toolkit/*.dll
