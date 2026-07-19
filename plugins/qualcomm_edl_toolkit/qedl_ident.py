@@ -22,7 +22,7 @@ def main():
         print(json.dumps(res)); return
     try:
         import logging
-        from edlclient.Library.usblib import usb_class
+        from edlclient.Library.Connection.usblib import usb_class
         from edlclient.Library.sahara import sahara
         cdc = usb_class(portconfig=[[0x05c6, 0x9008, -1]], loglevel=logging.WARNING)
         if not cdc.connect():
