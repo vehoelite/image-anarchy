@@ -14,13 +14,14 @@ from PyQt6.QtCore import QThread, pyqtSignal
 # plugin.py via importlib.spec_from_file_location, without a package context and
 # without the plugin dir on sys.path).
 try:
-    from . import edl_paths, ident, driver_manager, loader_manager
+    from . import edl_paths, ident, driver_manager, loader_manager, edl_util
 except ImportError:  # pragma: no cover - runtime top-level context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import edl_paths
     import ident
     import driver_manager
     import loader_manager
+    import edl_util
 
 manifest = None  # set by PluginManager
 
@@ -36,9 +37,28 @@ class EdlWorker(QThread):
         super().__init__()  # never pass parent to a QThread
         self.op = op
         self.params = params or {}
+        self._proc = None
+        self._cancel = False
 
     def _python(self) -> str:
         return sys.executable
+
+    def cancel(self):
+        """Request cancellation and kill any running subprocess."""
+        self._cancel = True
+        self._terminate_proc()
+
+    def _terminate_proc(self):
+        p = self._proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
 
     def run(self):
         try:
@@ -87,20 +107,34 @@ class EdlWorker(QThread):
         if not loader or not os.path.isfile(loader):
             self.finished_op.emit(False, "no loader selected"); return
         self.log.emit(f"⬆️  Uploading loader {os.path.basename(loader)} …")
-        proc = subprocess.Popen(
+        self._proc = subprocess.Popen(
             [self._python(), os.path.join(edl_dir, "edl.py"),
              "printgpt", f"--loader={loader}", "--memory=eMMC", "--lun=0"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=edl_dir,
         )
         dropped = False
-        for line in proc.stdout:
+        drop_streak = 0
+        MAX_DROP_LINES = 3   # after this many consecutive drop lines, the device is gone
+        for line in self._proc.stdout:
+            if self._cancel:
+                break
             line = line.rstrip()
-            if line:
-                self.log.emit(line)
-            if "No such device" in line or "Pipe error" in line:
+            if edl_util.is_drop_line(line):
                 dropped = True
-        proc.wait()
-        if dropped:
+                drop_streak += 1
+                if drop_streak <= MAX_DROP_LINES:
+                    self.log.emit(line)
+                elif drop_streak == MAX_DROP_LINES + 1:
+                    self.log.emit("… device dropped off USB — stopping (suppressing repeated errors)")
+                    break  # do NOT keep reading the infinite USBError stream
+            else:
+                drop_streak = 0
+                if line:
+                    self.log.emit(line)
+        self._terminate_proc()
+        if self._cancel:
+            self.finished_op.emit(False, "Cancelled")
+        elif dropped:
             self.finished_op.emit(
                 False,
                 "Loader rejected — device dropped during read. Secure boot is enforced; "
@@ -127,9 +161,12 @@ class PluginWidget(QWidget):
         self.btn_edl = QPushButton("💥 Reboot to EDL")
         self.btn_bind = QPushButton("🔧 Bind WinUSB")
         self.btn_ident = QPushButton("🔎 Identify")
-        for b in (self.btn_edl, self.btn_bind, self.btn_ident):
+        self.btn_stop = QPushButton("🛑 Stop")
+        self.btn_stop.setEnabled(False)
+        for b in (self.btn_edl, self.btn_bind, self.btn_ident, self.btn_stop):
             row.addWidget(b)
         dl.addLayout(row)
+        self._action_buttons = [self.btn_edl, self.btn_bind, self.btn_ident]
         self.driver_lbl = QLabel("Driver: unknown")
         dl.addWidget(self.driver_lbl)
         box = QGroupBox("Device (Sahara)"); form = QFormLayout(box)
@@ -166,6 +203,8 @@ class PluginWidget(QWidget):
         self.btn_bind.clicked.connect(self._bind)
         self.btn_import.clicked.connect(self._import_loader)
         self.btn_upload.clicked.connect(self._upload_selected)
+        self.btn_stop.clicked.connect(self._stop)
+        self._action_buttons += [self.btn_import, self.btn_upload]
 
         self._refresh_driver()
         self._refresh_loaders([])
@@ -200,11 +239,23 @@ class PluginWidget(QWidget):
         self.worker.log.connect(self._log)
         self.worker.ident_ready.connect(self._on_ident)
         self.worker.finished_op.connect(self._on_finished)
+        self._set_busy(True)
         self.worker.start()
+
+    def _set_busy(self, busy):
+        for b in self._action_buttons:
+            b.setEnabled(not busy)
+        self.btn_stop.setEnabled(busy)
+
+    def _stop(self):
+        if self.worker is not None:
+            self._log("🛑 Stopping…")
+            self.worker.cancel()
 
     def _on_finished(self, ok, msg):
         self._log(("✅ " if ok else "❌ ") + msg)
         self._refresh_driver()
+        self._set_busy(False)
         if self.worker:
             self.worker.deleteLater()
             self.worker = None
