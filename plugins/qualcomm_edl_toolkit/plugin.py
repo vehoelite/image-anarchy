@@ -412,7 +412,13 @@ class PluginWidget(QWidget):
             loader_manager.index_loaders([self._loaders_dir()]),
             info["hwid"], info["pkhash"])
         if ranked:
-            self.match_lbl.setText(f"✅ {len(ranked)} candidate loader(s) matched.")
+            exact = any(l["hwid"] == (info["hwid"] or "").lower() for l in ranked)
+            if exact:
+                self.match_lbl.setText(f"✅ {len(ranked)} candidate loader(s) matched (exact HWID).")
+            else:
+                self.match_lbl.setText(
+                    f"✅ {len(ranked)} loader(s) match this signing key — pick the one for "
+                    "your SoC (same key ≠ same chip; wrong-SoC loaders upload but won't run).")
         else:
             self.match_lbl.setText(
                 f"⚠️ No loader for PK-hash {info['pkhash'][:16]}… — import a signed loader.")

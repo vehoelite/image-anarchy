@@ -34,17 +34,34 @@ def index_loaders(dirs):
 
 
 def match(loaders, hwid_hex, pkhash_hex):
+    """Rank loaders for a device by (HWID, PK-hash). Tiers, best first:
+
+      1. exact  — same HWID *and* same PK-hash (right SoC + right signing key).
+      2. pkhash — same PK-hash only (same signing key → the loader is ACCEPTED by
+                  secure boot; the SoC may differ, so the right-SoC one among these
+                  is what actually runs — e.g. an LG 8998 device matches every
+                  LG-signed loader here regardless of the HWID string in the name).
+      3. hwid   — same HWID, different key (right SoC, wrong key: rejected on a
+                  secure-boot device, but valid on a non-secure device).
+
+    A loader appears only in its highest tier. Without the pkhash tier, a device
+    whose HWID string doesn't literally equal any loader's HWID (common: HWID is
+    reported as the JTAG msm_id while loaders are named with the HW_ID1 form)
+    would wrongly show "no loader" despite same-key loaders being present.
+    """
     hwid = (hwid_hex or "").lower()
     pk16 = (pkhash_hex or "").lower()[:16]
-    exact, hwid_only = [], []
+    exact, pk_only, hwid_only = [], [], []
     for ld in loaders:
-        if ld["hwid"] != hwid:
-            continue
-        if ld["pkhash"] == pk16:
+        h_match = bool(hwid) and ld["hwid"] == hwid
+        p_match = bool(pk16) and ld["pkhash"] == pk16
+        if h_match and p_match:
             exact.append(ld)
-        else:
+        elif p_match:
+            pk_only.append(ld)
+        elif h_match:
             hwid_only.append(ld)
-    return exact + hwid_only
+    return exact + pk_only + hwid_only
 
 
 def import_byo(src_path: str, dest_dir: str) -> str:
