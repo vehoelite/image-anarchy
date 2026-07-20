@@ -49,8 +49,53 @@ def is_ready():
         return {"present": False, "winusb": False, "instance_id": None}
 
 
+# INSTALLFLAG_FORCE — makes UpdateDriverForPlugAndPlayDevicesW replace an
+# already-bound, higher-ranked (WHQL-signed) driver with our unsigned WinUSB inf.
+# Plain `pnputil /add-driver /install` only STAGES the inf; the signed qcusbser
+# (oem*.inf) driver still wins on rank, so the device never actually switches.
+# This is the same force-install Zadig/libwdi perform, via newdev.dll directly.
+_FORCE_BIND_PS = r"""
+$ErrorActionPreference = 'Stop'
+$src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class IAForceDrv {
+    [DllImport("newdev.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+    public static extern bool UpdateDriverForPlugAndPlayDevicesW(
+        IntPtr hwnd, string hwid, string inf, uint flags, out bool reboot);
+    public static int Bind(string hwid, string inf) {
+        bool rb;
+        bool ok = UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hwid, inf, 0x1, out rb);
+        if (!ok) return Marshal.GetLastWin32Error();
+        return 0;
+    }
+}
+'@
+Add-Type -TypeDefinition $src -Language CSharp | Out-Null
+exit ([IAForceDrv]::Bind('USB\VID_05C6&PID_9008', %INF%))
+"""
+
+
+def force_bind(inf_path: str):
+    """Force our WinUSB inf onto the 9008 device via newdev.dll
+    UpdateDriverForPlugAndPlayDevicesW (INSTALLFLAG_FORCE) — overrides the
+    signed qcusbser driver that plain pnputil cannot. Returns (rc, output);
+    rc 0 = success, 259 = no matching device present."""
+    if os.name != "nt":
+        return (1, "force bind is Windows-only")
+    script = _FORCE_BIND_PS.replace("%INF%", "'" + inf_path.replace("'", "''") + "'")
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True, text=True, timeout=90,
+        )
+        return (r.returncode, (r.stdout + r.stderr).strip())
+    except Exception as e:
+        return (1, str(e))
+
+
 def bind_winusb(instance_id: str):
-    """Bind WinUSB to the 9008 interface using the bundled inf via pnputil.
+    """Bind WinUSB to the 9008 interface using the bundled inf.
     Returns (ok, message). Windows only. Requires the bundled winusb inf in plugin_dir()."""
     if os.name != "nt":
         return (False, "WinUSB bind is Windows-only")
@@ -60,19 +105,24 @@ def bind_winusb(instance_id: str):
     inf = os.path.join(edl_paths.plugin_dir(), "drivers", "winusb_9008.inf")
     if not os.path.isfile(inf):
         return (False, "Bundled WinUSB inf not found (drivers/winusb_9008.inf)")
+    # Stage the inf in the driver store first (trusts the cert once enforcement is
+    # off), then FORCE it onto the device to beat the signed qcusbser driver on rank.
     try:
-        r = subprocess.run(
+        subprocess.run(
             ["pnputil", "/add-driver", inf, "/install"],
             capture_output=True, text=True, timeout=60,
         )
-        out = (r.stdout + r.stderr)
-        if "Added driver packages:  1" in out or "Driver package added" in out:
-            return (True, "WinUSB installed — replug the device if it doesn't switch")
-        if "digital signature" in out.lower() or "signature" in out.lower():
-            return (False,
-                    "Windows rejected the unsigned WinUSB inf. Use Zadig (or the bundled "
-                    "libwdi installer) to set WinUSB on 'VID_05C6&PID_9008', or plug the "
-                    "device into the USB port you previously bound.")
-        return (False, out.strip() or "pnputil failed")
-    except Exception as e:
-        return (False, str(e))
+    except Exception:
+        pass  # staging is best-effort; the force bind below does the real work
+    rc, out = force_bind(inf)
+    st2 = is_ready()
+    if st2["present"] and st2["winusb"]:
+        return (True, "WinUSB force-bound ✅")
+    if rc == 259:  # ERROR_NO_MORE_ITEMS — no matching device on the bus
+        return (False, "No 9008 device on the bus to bind (enter EDL first)")
+    low = (out or "").lower()
+    if "digital signature" in low or "publisher" in low or "signature" in low:
+        return (False,
+                "Windows blocked the unsigned WinUSB driver. Disable driver-signature "
+                "enforcement (Image Anarchy's startup dialog explains how) and try again.")
+    return (False, out or f"force bind failed (rc={rc})")
