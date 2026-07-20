@@ -3,9 +3,12 @@ import os
 import subprocess
 import sys
 
+import tempfile
+import time
+
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QGroupBox, QLabel,
-    QPushButton, QTextEdit, QFormLayout, QFileDialog, QListWidget
+    QPushButton, QTextEdit, QFormLayout, QFileDialog, QListWidget, QMessageBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -14,7 +17,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 # plugin.py via importlib.spec_from_file_location, without a package context and
 # without the plugin dir on sys.path).
 try:
-    from . import edl_paths, ident, driver_manager, loader_manager, edl_util
+    from . import edl_paths, ident, driver_manager, loader_manager, edl_util, devinfo
 except ImportError:  # pragma: no cover - runtime top-level context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import edl_paths
@@ -22,6 +25,7 @@ except ImportError:  # pragma: no cover - runtime top-level context
     import driver_manager
     import loader_manager
     import edl_util
+    import devinfo
 
 manifest = None  # set by PluginManager
 
@@ -31,6 +35,7 @@ class EdlWorker(QThread):
     log = pyqtSignal(str)
     progress = pyqtSignal(int, int)
     ident_ready = pyqtSignal(dict)
+    devinfo_state = pyqtSignal(dict)
     finished_op = pyqtSignal(bool, str)
 
     def __init__(self, op: str, params: dict = None):
@@ -68,6 +73,8 @@ class EdlWorker(QThread):
                 self._identify()
             elif self.op == "upload_loader":
                 self._upload_loader()
+            elif self.op == "devinfo":
+                self._devinfo()
             else:
                 self.finished_op.emit(False, f"unknown op {self.op}")
         except Exception as e:
@@ -107,15 +114,25 @@ class EdlWorker(QThread):
         if not loader or not os.path.isfile(loader):
             self.finished_op.emit(False, "no loader selected"); return
         self.log.emit(f"⬆️  Uploading loader {os.path.basename(loader)} …")
-        self._proc = subprocess.Popen(
-            [self._python(), os.path.join(edl_dir, "edl.py"),
-             "printgpt", f"--loader={loader}", "--memory=eMMC", "--lun=0"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=edl_dir,
-        )
+        dropped, _ = self._edl(edl_dir, ["printgpt"], loader=loader)
+        if self._cancel:
+            self.finished_op.emit(False, "Cancelled")
+        elif dropped:
+            self.finished_op.emit(
+                False,
+                "Loader rejected — device dropped during read. Secure boot is enforced; "
+                "you need a Firehose loader signed for this device's PK-hash.")
+        else:
+            self.finished_op.emit(True, "Firehose loader accepted")
+
+    def _pump(self, proc):
+        """Forward proc stdout to the log; stop early if the device drops off the bus.
+        Returns True if a drop was detected (rejected/unsigned loader spews an otherwise
+        infinite USBError stream). Shared by every edl.py invocation."""
         dropped = False
         drop_streak = 0
         MAX_DROP_LINES = 3   # after this many consecutive drop lines, the device is gone
-        for line in self._proc.stdout:
+        for line in proc.stdout:
             if self._cancel:
                 break
             line = line.rstrip()
@@ -132,15 +149,96 @@ class EdlWorker(QThread):
                 if line:
                     self.log.emit(line)
         self._terminate_proc()
+        return dropped
+
+    def _edl(self, edl_dir, args, loader=None, storage=True):
+        """Run one edl.py subcommand, pumping its output. Returns (dropped, returncode).
+        A second/third edl.py call re-detects firehose mode (edl.py handles an
+        already-loaded device), so read→write→reset works as separate invocations."""
+        cmd = [self._python(), os.path.join(edl_dir, "edl.py"), *args]
+        if loader:
+            cmd.append(f"--loader={loader}")
+        if storage:
+            cmd += ["--memory=eMMC", "--lun=0"]
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=edl_dir)
+        dropped = self._pump(self._proc)
+        return dropped, self._proc.poll()
+
+    def _devinfo(self):
+        """Read (and optionally patch) the devinfo partition to flip the bootloader
+        unlock flags. action = read | unlock | relock. Requires a matched loader."""
+        edl_dir = edl_paths.get_edl_dir()
+        loader = self.params.get("loader")
+        action = self.params.get("action", "read")
+        if not edl_dir:
+            self.finished_op.emit(False, "vendored edl/ not found"); return
+        if not loader or not os.path.isfile(loader):
+            self.finished_op.emit(False, "No matched loader — import/select one first"); return
+
+        tmp = os.path.join(tempfile.gettempdir(), "ia_devinfo_read.bin")
+        self.log.emit("📖 Reading devinfo …")
+        dropped, _ = self._edl(edl_dir, ["r", "devinfo", tmp], loader=loader)
         if self._cancel:
-            self.finished_op.emit(False, "Cancelled")
-        elif dropped:
+            self.finished_op.emit(False, "Cancelled"); return
+        if dropped:
             self.finished_op.emit(
-                False,
-                "Loader rejected — device dropped during read. Secure boot is enforced; "
-                "you need a Firehose loader signed for this device's PK-hash.")
+                False, "Loader rejected (secure boot) — need a loader signed for this PK-hash."); return
+        if not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+            self.finished_op.emit(False, "devinfo read failed (no data)"); return
+
+        with open(tmp, "rb") as f:
+            data = f.read()
+        st = devinfo.read_state(data)
+        if not st["found"]:
+            self.finished_op.emit(
+                False, "device_info magic not found — unexpected layout, aborting (nothing written)."); return
+        self.log.emit(f"   is_unlocked={st['is_unlocked']}  is_unlock_critical="
+                      f"{st['is_unlock_critical']}  tampered={st['is_tampered']}")
+
+        # Always back up the original before any write.
+        bdir = os.path.join(edl_paths.plugin_dir(), "backups")
+        os.makedirs(bdir, exist_ok=True)
+        bpath = os.path.join(bdir, f"devinfo_{int(time.time())}.bin")
+        with open(bpath, "wb") as f:
+            f.write(data)
+        self.log.emit(f"   🗄  backed up original → {os.path.relpath(bpath, edl_paths.plugin_dir())}")
+        self.devinfo_state.emit({**st, "action": action})
+
+        if action == "read":
+            self.finished_op.emit(True, f"devinfo read (unlocked={st['is_unlocked']})"); return
+
+        patched = devinfo.patch_unlock(data) if action == "unlock" else devinfo.patch_relock(data)
+        changes = devinfo.diff(data, patched)
+        if not changes:
+            self.finished_op.emit(True, "devinfo already in requested state (no change)"); return
+        self.log.emit("   ✏  " + ", ".join(f"@{o}:{a}→{n}" for o, a, n in changes))
+
+        ppath = os.path.join(tempfile.gettempdir(), "ia_devinfo_patched.bin")
+        with open(ppath, "wb") as f:
+            f.write(patched)
+        self.log.emit("💾 Writing patched devinfo …")
+        dropped, _ = self._edl(edl_dir, ["w", "devinfo", ppath], loader=loader)
+        if dropped:
+            self.finished_op.emit(
+                False, "Device dropped during write — state uncertain. Re-read devinfo before rebooting."); return
+
+        # Verify by reading it back BEFORE we reset.
+        self.log.emit("🔁 Verifying …")
+        vtmp = os.path.join(tempfile.gettempdir(), "ia_devinfo_verify.bin")
+        self._edl(edl_dir, ["r", "devinfo", vtmp], loader=loader)
+        vst = devinfo.read_state(open(vtmp, "rb").read()) if os.path.isfile(vtmp) else {"found": False}
+        want = 1 if action == "unlock" else 0
+        if vst.get("found") and vst.get("is_unlocked") == want:
+            self.devinfo_state.emit({**vst, "action": action})
+            self.log.emit("✅ Verified on-device.")
+            self._edl(edl_dir, ["reset"], loader=loader, storage=False)
+            verb = "UNLOCKED" if action == "unlock" else "re-locked"
+            self.finished_op.emit(
+                True, f"devinfo {verb} + reset sent. Device may factory-reset on first boot.")
         else:
-            self.finished_op.emit(True, "Firehose loader accepted")
+            self.finished_op.emit(
+                False, "Write did not verify — devinfo unchanged or layout mismatch. NOT rebooting.")
 
 
 class PluginWidget(QWidget):
@@ -192,6 +290,30 @@ class PluginWidget(QWidget):
         ll.addLayout(lr)
         self.tabs.addTab(ld, "Loaders")
 
+        # --- Unlock tab (devinfo OEM-unlock) ---
+        un = QWidget(); ul = QVBoxLayout(un)
+        warn = QLabel(
+            "⚠️  Writes the <b>devinfo</b> partition to flip the bootloader unlock "
+            "flags — for <b>devices you own</b>. The device will likely "
+            "<b>factory-reset</b> on first boot. The original devinfo is backed up first. "
+            "Requires a Firehose loader matched to this device's PK-hash.")
+        warn.setWordWrap(True)
+        ul.addWidget(warn)
+        ubox = QGroupBox("devinfo state"); uform = QFormLayout(ubox)
+        self.lbl_unlocked = QLabel("—"); self.lbl_ucrit = QLabel("—"); self.lbl_tamper = QLabel("—")
+        uform.addRow("is_unlocked:", self.lbl_unlocked)
+        uform.addRow("is_unlock_critical:", self.lbl_ucrit)
+        uform.addRow("is_tampered:", self.lbl_tamper)
+        ul.addWidget(ubox)
+        ur = QHBoxLayout()
+        self.btn_read_devinfo = QPushButton("📖 Read devinfo")
+        self.btn_unlock = QPushButton("🔓 Unlock")
+        self.btn_relock = QPushButton("🔒 Re-lock")
+        for b in (self.btn_read_devinfo, self.btn_unlock, self.btn_relock):
+            ur.addWidget(b)
+        ul.addLayout(ur); ul.addStretch()
+        self.tabs.addTab(un, "Unlock")
+
         # --- Log tab ---
         lg = QWidget(); gl = QVBoxLayout(lg)
         self.logbox = QTextEdit(); self.logbox.setReadOnly(True)
@@ -204,7 +326,11 @@ class PluginWidget(QWidget):
         self.btn_import.clicked.connect(self._import_loader)
         self.btn_upload.clicked.connect(self._upload_selected)
         self.btn_stop.clicked.connect(self._stop)
-        self._action_buttons += [self.btn_import, self.btn_upload]
+        self.btn_read_devinfo.clicked.connect(lambda: self._devinfo_action("read"))
+        self.btn_unlock.clicked.connect(lambda: self._devinfo_action("unlock"))
+        self.btn_relock.clicked.connect(lambda: self._devinfo_action("relock"))
+        self._action_buttons += [self.btn_import, self.btn_upload,
+                                 self.btn_read_devinfo, self.btn_unlock, self.btn_relock]
 
         self._refresh_driver()
         self._refresh_loaders([])
@@ -238,6 +364,7 @@ class PluginWidget(QWidget):
         self.worker = EdlWorker(op, params)
         self.worker.log.connect(self._log)
         self.worker.ident_ready.connect(self._on_ident)
+        self.worker.devinfo_state.connect(self._on_devinfo_state)
         self.worker.finished_op.connect(self._on_finished)
         self._set_busy(True)
         self.worker.start()
@@ -298,11 +425,44 @@ class PluginWidget(QWidget):
         self._refresh_loaders(ranked)
 
     def _upload_selected(self):
-        idx = self.loader_list.currentRow()
-        if idx < 0 or idx >= len(self._loaders_cache):
+        loader = self._selected_loader_path()
+        if not loader:
             self._log("Select a loader first."); return
-        loader = self._loaders_cache[idx]["path"]
         self._run("upload_loader", {"loader": loader})
+
+    def _selected_loader_path(self):
+        """The highlighted loader, or the single best match if none is highlighted."""
+        idx = self.loader_list.currentRow()
+        if 0 <= idx < len(self._loaders_cache):
+            return self._loaders_cache[idx]["path"]
+        if len(self._loaders_cache) == 1:
+            return self._loaders_cache[0]["path"]
+        return None
+
+    def _on_devinfo_state(self, st):
+        self.lbl_unlocked.setText(str(st.get("is_unlocked", "—")))
+        self.lbl_ucrit.setText(str(st.get("is_unlock_critical", "—")))
+        self.lbl_tamper.setText(str(st.get("is_tampered", "—")))
+
+    def _devinfo_action(self, action):
+        loader = self._selected_loader_path()
+        if not loader:
+            self._log("Select a matched loader on the Loaders tab first."); return
+        if action in ("unlock", "relock"):
+            verb = "UNLOCK" if action == "unlock" else "RE-LOCK"
+            ans = QMessageBox.warning(
+                self, f"{verb} bootloader?",
+                f"This writes the devinfo partition to {verb} the bootloader.\n\n"
+                "• Owner device only.\n"
+                "• The device will likely FACTORY-RESET on first boot.\n"
+                "• A backup of the original devinfo is saved first.\n"
+                "• The change is verified on-device before reboot.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ans != QMessageBox.StandardButton.Yes:
+                self._log("Cancelled."); return
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)  # show Log
+        self._run("devinfo", {"loader": loader, "action": action})
 
 
 class Plugin:
