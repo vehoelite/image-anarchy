@@ -63,6 +63,27 @@ edl.py reset                       # only after verify passes
 - [ ] **T5 — Reversibility.** **🔒 Re-lock** restores `is_unlocked=0`; verify device returns to locked. Confirms the backup/restore story and the owner-device ethos.
 - [ ] **T6 — Docs/memory.** Record the confirmed loader source + any offset corrections in `[[onn8core-edl-unlock]]`; update the plugin `description.html` with the Unlock tab; note the once-per-device factory-reset behavior in the PR.
 
+## Live Validation (2026-07-20, cross-device on LG G7 One)
+
+The full EDL read/write/verify machinery was validated on a **second, expendable device** — a rooted LG G7 One (LM-Q910, **MSM8998/SDM835, UFS**, secure-boot enforced, pkhash `2cf7619a`) — since no onn loader exists yet:
+
+- ✅ Force-bind WinUSB (2nd device), Sahara identify, **signed loader upload**, Firehose connect, partition detect.
+- ✅ **Read `devinfo`** over Firehose (UFS, LUN 4) == an independent `adb root dd` dump **byte-for-byte** (sha1 `82aa8341`). `devinfo.py` parsed it correctly.
+- ✅ `patch_unlock` → **write** → read-back **verify** (`is_unlocked` 0→1 confirmed) → **restore** original → verify identical → **reset** → boots to Android. Fully reversible; device left exactly as found.
+- ✅ Multi-call firehose re-detection confirmed (`Mode detected: firehose` on calls 2–4, no re-Sahara) — the exact behavior `_edl` relies on.
+
+**Fixed as a result (this commit):** `_edl`/`_devinfo`/`_upload_loader` now take a **memory type** (eMMC/ufs, UI selector on the Device tab) and **omit `--lun` for partition-name reads** so edl.py scans all LUNs (UFS `devinfo` is on a non-zero LUN).
+
+**Learned (feeds the caveats below):**
+- **Loader must match SoC, not just key:** an SDM845 LG-signed loader uploaded (signature OK) but crashed (`READ_DATA`) on the 8998; the correct one was the HW_ID1-`3002…` (MSM8998) LG-signed loader.
+- **OEM caveat:** LG's `device_info` was `magic + 0x01@0x90` only, `is_unlocked=0` **despite the device being unlocked** — LG does **not** gate unlock on these flags. The devinfo approach is correct for stock CAF/LK (onn/khaje) but **not universal**; the tool must not claim "unlocked" purely from a verified devinfo write.
+- A failed loader upload leaves the PBL stuck (`Mode detected: error`) → power-cycle; a force-bind re-enumeration mid-Sahara also trips it → bind before identify / rely on sticky WinUSB.
+
+## Remaining Phase 2.1
+
+- [ ] **loader_manager.match():** device reports JTAG msm_id (`0005e0e1…`) but loaders are named in HW_ID1 form (`3002…`) — link both representations (map via edlclient `qualcomm_config`), else same-SoC loaders won't auto-match.
+- [ ] **OEM-unlock caveat in UI/plan:** after a verified devinfo write, message that some OEMs (LG) don't gate unlock on `device_info`; confirm with fastboot/bootloader.
+
 ## Risks / Open Questions
 
 - **Loader is the only blocker.** Everything else is built and unit-tested.

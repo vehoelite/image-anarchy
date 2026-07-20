@@ -8,7 +8,8 @@ import time
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QGroupBox, QLabel,
-    QPushButton, QTextEdit, QFormLayout, QFileDialog, QListWidget, QMessageBox
+    QPushButton, QTextEdit, QFormLayout, QFileDialog, QListWidget, QMessageBox,
+    QComboBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -113,8 +114,9 @@ class EdlWorker(QThread):
             self.finished_op.emit(False, "vendored edl/ not found"); return
         if not loader or not os.path.isfile(loader):
             self.finished_op.emit(False, "no loader selected"); return
-        self.log.emit(f"⬆️  Uploading loader {os.path.basename(loader)} …")
-        dropped, _ = self._edl(edl_dir, ["printgpt"], loader=loader)
+        mem = self.params.get("memory", "eMMC")
+        self.log.emit(f"⬆️  Uploading loader {os.path.basename(loader)} ({mem}) …")
+        dropped, _ = self._edl(edl_dir, ["printgpt"], loader=loader, memory=mem, lun=0)
         if self._cancel:
             self.finished_op.emit(False, "Cancelled")
         elif dropped:
@@ -151,15 +153,20 @@ class EdlWorker(QThread):
         self._terminate_proc()
         return dropped
 
-    def _edl(self, edl_dir, args, loader=None, storage=True):
+    def _edl(self, edl_dir, args, loader=None, memory=None, lun=None):
         """Run one edl.py subcommand, pumping its output. Returns (dropped, returncode).
         A second/third edl.py call re-detects firehose mode (edl.py handles an
-        already-loaded device), so read→write→reset works as separate invocations."""
+        already-loaded device), so read→write→reset works as separate invocations.
+        `memory` is 'eMMC'/'ufs'/'nand' (omit for non-storage cmds like reset).
+        `lun` is omitted for partition-name reads so edl.py scans all LUNs to find
+        the partition (UFS devinfo lives on a non-zero LUN, e.g. LUN 4 on LG 8998)."""
         cmd = [self._python(), os.path.join(edl_dir, "edl.py"), *args]
         if loader:
             cmd.append(f"--loader={loader}")
-        if storage:
-            cmd += ["--memory=eMMC", "--lun=0"]
+        if memory:
+            cmd.append(f"--memory={memory}")
+        if lun is not None:
+            cmd.append(f"--lun={lun}")
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=edl_dir)
         dropped = self._pump(self._proc)
@@ -171,14 +178,15 @@ class EdlWorker(QThread):
         edl_dir = edl_paths.get_edl_dir()
         loader = self.params.get("loader")
         action = self.params.get("action", "read")
+        mem = self.params.get("memory", "eMMC")
         if not edl_dir:
             self.finished_op.emit(False, "vendored edl/ not found"); return
         if not loader or not os.path.isfile(loader):
             self.finished_op.emit(False, "No matched loader — import/select one first"); return
 
         tmp = os.path.join(tempfile.gettempdir(), "ia_devinfo_read.bin")
-        self.log.emit("📖 Reading devinfo …")
-        dropped, _ = self._edl(edl_dir, ["r", "devinfo", tmp], loader=loader)
+        self.log.emit(f"📖 Reading devinfo ({mem}) …")
+        dropped, _ = self._edl(edl_dir, ["r", "devinfo", tmp], loader=loader, memory=mem)
         if self._cancel:
             self.finished_op.emit(False, "Cancelled"); return
         if dropped:
@@ -218,7 +226,7 @@ class EdlWorker(QThread):
         with open(ppath, "wb") as f:
             f.write(patched)
         self.log.emit("💾 Writing patched devinfo …")
-        dropped, _ = self._edl(edl_dir, ["w", "devinfo", ppath], loader=loader)
+        dropped, _ = self._edl(edl_dir, ["w", "devinfo", ppath], loader=loader, memory=mem)
         if dropped:
             self.finished_op.emit(
                 False, "Device dropped during write — state uncertain. Re-read devinfo before rebooting."); return
@@ -226,13 +234,13 @@ class EdlWorker(QThread):
         # Verify by reading it back BEFORE we reset.
         self.log.emit("🔁 Verifying …")
         vtmp = os.path.join(tempfile.gettempdir(), "ia_devinfo_verify.bin")
-        self._edl(edl_dir, ["r", "devinfo", vtmp], loader=loader)
+        self._edl(edl_dir, ["r", "devinfo", vtmp], loader=loader, memory=mem)
         vst = devinfo.read_state(open(vtmp, "rb").read()) if os.path.isfile(vtmp) else {"found": False}
         want = 1 if action == "unlock" else 0
         if vst.get("found") and vst.get("is_unlocked") == want:
             self.devinfo_state.emit({**vst, "action": action})
             self.log.emit("✅ Verified on-device.")
-            self._edl(edl_dir, ["reset"], loader=loader, storage=False)
+            self._edl(edl_dir, ["reset"], loader=loader)
             verb = "UNLOCKED" if action == "unlock" else "re-locked"
             self.finished_op.emit(
                 True, f"devinfo {verb} + reset sent. Device may factory-reset on first boot.")
@@ -267,6 +275,13 @@ class PluginWidget(QWidget):
         self._action_buttons = [self.btn_edl, self.btn_bind, self.btn_ident]
         self.driver_lbl = QLabel("Driver: unknown")
         dl.addWidget(self.driver_lbl)
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Storage:"))
+        self.mem_combo = QComboBox()
+        self.mem_combo.addItems(["eMMC", "ufs"])  # UFS devices (e.g. LG 8998) store devinfo on a non-zero LUN
+        srow.addWidget(self.mem_combo)
+        srow.addStretch()
+        dl.addLayout(srow)
         box = QGroupBox("Device (Sahara)"); form = QFormLayout(box)
         self.lbl_serial = QLabel("—"); self.lbl_hwid = QLabel("—")
         self.lbl_pk = QLabel("—"); self.lbl_sb = QLabel("—")
@@ -424,11 +439,14 @@ class PluginWidget(QWidget):
             loader_manager.index_loaders([self._loaders_dir()]), hwid, pk)
         self._refresh_loaders(ranked)
 
+    def _memory(self):
+        return self.mem_combo.currentText()
+
     def _upload_selected(self):
         loader = self._selected_loader_path()
         if not loader:
             self._log("Select a loader first."); return
-        self._run("upload_loader", {"loader": loader})
+        self._run("upload_loader", {"loader": loader, "memory": self._memory()})
 
     def _selected_loader_path(self):
         """The highlighted loader, or the single best match if none is highlighted."""
@@ -462,7 +480,7 @@ class PluginWidget(QWidget):
             if ans != QMessageBox.StandardButton.Yes:
                 self._log("Cancelled."); return
         self.tabs.setCurrentIndex(self.tabs.count() - 1)  # show Log
-        self._run("devinfo", {"loader": loader, "action": action})
+        self._run("devinfo", {"loader": loader, "action": action, "memory": self._memory()})
 
 
 class Plugin:
