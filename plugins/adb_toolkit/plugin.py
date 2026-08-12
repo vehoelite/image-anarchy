@@ -1052,6 +1052,8 @@ class AdbToolkitPlugin:
         self.tabs.addTab(self._create_wireless_tab(), "📡 Wireless")
 
         # Tab 9: Reboot
+        
+        # Tab 8: Reboot
         self.tabs.addTab(self._create_reboot_tab(), "🔄 Reboot")
         
         main_layout.addWidget(self.tabs)
