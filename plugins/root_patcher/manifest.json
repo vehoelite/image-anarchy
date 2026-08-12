@@ -23,6 +23,5 @@
         "https://imageanarchy.com/Magisk-v25.2.apk"
     ],
     "setup_commands": [],
-    "enabled": true,
-    "remote_capable": true
+    "enabled": true
 }

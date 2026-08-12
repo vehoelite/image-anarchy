@@ -296,6 +296,14 @@ class AdbWorkerThread(QThread):
                 self._reboot()
             elif self.operation == "logcat":
                 self._logcat()
+            elif self.operation == "wireless_pair":
+                self._wireless_pair()
+            elif self.operation == "wireless_connect":
+                self._wireless_connect()
+            elif self.operation == "wireless_disconnect":
+                self._wireless_disconnect()
+            elif self.operation == "wireless_enable_tcpip":
+                self._wireless_enable_tcpip()
         except Exception as e:
             self.finished_signal.emit(False, str(e))
     
@@ -642,6 +650,88 @@ class AdbWorkerThread(QThread):
         self.result_data.emit(output)
         self.finished_signal.emit(success, "Logcat retrieved")
 
+    def _wireless_pair(self):
+        """Pair with a device over Wi-Fi (Android 11+).
+
+        Uses the pairing address:port and 6-digit code shown under
+        Developer Options → Wireless debugging → Pair device with pairing
+        code. `adb pair` reads the code from stdin, so it's fed in rather
+        than passed as an argument."""
+        address = self.kwargs.get('address')
+        code = self.kwargs.get('code')
+        self.log.emit(f"Pairing with {address}...")
+
+        try:
+            proc = subprocess.run(
+                [self.adb_path, "pair", address],
+                input=f"{code}\n", capture_output=True, text=True, timeout=30
+            )
+            output = (proc.stdout + proc.stderr).strip()
+        except subprocess.TimeoutExpired:
+            self.finished_signal.emit(False, "Pairing timed out — check the address and that pairing is still open on the device")
+            return
+
+        if "Successfully paired" in output:
+            self.log.emit(f"✓ {output}")
+            self.finished_signal.emit(True, output)
+        else:
+            self.finished_signal.emit(False, output or "Pairing failed")
+
+    def _wireless_connect(self):
+        """Connect to a device over Wi-Fi at address:port."""
+        address = self.kwargs.get('address')
+        self.log.emit(f"Connecting to {address}...")
+        success, output = run_adb(["connect", address], timeout=30)
+        output = output.strip()
+
+        # `adb connect` returns 0 even on failure ("failed to connect",
+        # "cannot connect"), so success has to be judged from the text.
+        if success and "connected to" in output and "failed" not in output and "cannot" not in output:
+            self.log.emit(f"✓ {output}")
+            self.finished_signal.emit(True, output)
+        else:
+            self.finished_signal.emit(False, output or "Connection failed")
+
+    def _wireless_disconnect(self):
+        """Disconnect one wireless device, or all if no address given."""
+        address = self.kwargs.get('address')
+        args = ["disconnect"]
+        if address:
+            args.append(address)
+        success, output = run_adb(args, timeout=15)
+        self.finished_signal.emit(success, output.strip() or "Disconnected")
+
+    def _wireless_enable_tcpip(self):
+        """Switch a USB-connected device into TCP/IP mode on port 5555.
+
+        This is the pre-Android-11 path: with the device plugged in over
+        USB, restart adbd listening on TCP so it can then be reached
+        wirelessly with `adb connect <ip>:5555` after unplugging."""
+        device = self.kwargs.get('device')
+        port = self.kwargs.get('port', 5555)
+        self.log.emit(f"Restarting adbd in TCP/IP mode on port {port}...")
+        success, output = run_adb(["tcpip", str(port)], device, timeout=15)
+        output = output.strip()
+
+        if not success:
+            self.finished_signal.emit(False, output or "Failed to enable TCP/IP mode")
+            return
+
+        # Grab the device's Wi-Fi IP so the UI can suggest the connect address.
+        ip = None
+        ip_ok, ip_out = run_adb(["shell", "ip", "-f", "inet", "addr", "show", "wlan0"], device, timeout=10)
+        if ip_ok:
+            import re
+            m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", ip_out)
+            if m:
+                ip = m.group(1)
+
+        self.result_data.emit({'port': port, 'ip': ip})
+        if ip:
+            self.finished_signal.emit(True, f"TCP/IP mode on. Unplug USB, then connect to {ip}:{port}")
+        else:
+            self.finished_signal.emit(True, f"TCP/IP mode on port {port}. Find the device's Wi-Fi IP, then connect.")
+
 
 class RootExtractWorker(QThread):
     """Worker thread for extracting the live filesystem from a rooted device."""
@@ -957,6 +1047,11 @@ class AdbToolkitPlugin:
         
         # Tab 7: Root Extract (Full Filesystem)
         self.tabs.addTab(self._create_root_extract_tab(), "🌳 Root Extract")
+
+        # Tab 8: Wireless Debugging (pair/connect over Wi-Fi)
+        self.tabs.addTab(self._create_wireless_tab(), "📡 Wireless")
+
+        # Tab 9: Reboot
         
         # Tab 8: Reboot
         self.tabs.addTab(self._create_reboot_tab(), "🔄 Reboot")
@@ -2970,6 +3065,203 @@ class AdbToolkitPlugin:
         
         if success:
             QMessageBox.information(self.parent_window, "Complete", message)
+
+    # ===== WIRELESS DEBUGGING TAB =====
+    def _create_wireless_tab(self):
+        """Wireless debugging: pair + connect over Wi-Fi (Android 11+) and
+        the older USB→TCP/IP path for pre-11 devices."""
+        tab = QWidget()
+        main_layout = QVBoxLayout(tab)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+
+        scroll_content = QWidget()
+        layout = QVBoxLayout(scroll_content)
+        layout.setSpacing(8)
+
+        # Info banner
+        info_banner = QLabel(
+            "📡 <b>Wireless Debugging</b> — Break free from the USB cable. "
+            "On the device: <b>Settings → Developer Options → Wireless debugging</b> (enable it), "
+            "then use the address, port, and pairing code shown there."
+        )
+        info_banner.setWordWrap(True)
+        info_banner.setStyleSheet("background: #0d3b4f; padding: 8px; border-radius: 5px; color: #4fc3f7;")
+        layout.addWidget(info_banner)
+
+        # --- Step 1: Pair (Android 11+) ---
+        pair_group = QGroupBox("① Pair (Android 11+, first time only)")
+        pair_layout = QFormLayout(pair_group)
+
+        self.wireless_pair_address = QLineEdit()
+        self.wireless_pair_address.setPlaceholderText("192.168.1.42:37123  (from 'Pair device with pairing code')")
+        pair_layout.addRow("Pairing address:port:", self.wireless_pair_address)
+
+        self.wireless_pair_code = QLineEdit()
+        self.wireless_pair_code.setPlaceholderText("6-digit code shown on device")
+        self.wireless_pair_code.setMaxLength(6)
+        pair_layout.addRow("Pairing code:", self.wireless_pair_code)
+
+        pair_btn = QPushButton("🔗 Pair Device")
+        pair_btn.clicked.connect(self._wireless_pair)
+        pair_layout.addRow("", pair_btn)
+
+        pair_hint = QLabel(
+            "Tap <b>“Pair device with pairing code”</b> on the phone — it shows a "
+            "separate address:port and a 6-digit code. Use those here. "
+            "The main Wireless debugging screen's address:port is for Connect below, not pairing."
+        )
+        pair_hint.setWordWrap(True)
+        pair_hint.setStyleSheet("font-size: 11px; color: #888;")
+        pair_layout.addRow(pair_hint)
+
+        layout.addWidget(pair_group)
+
+        # --- Step 2: Connect ---
+        connect_group = QGroupBox("② Connect")
+        connect_layout = QFormLayout(connect_group)
+
+        self.wireless_connect_address = QLineEdit()
+        self.wireless_connect_address.setPlaceholderText("192.168.1.42:5555  (IP:port from Wireless debugging)")
+        connect_layout.addRow("Device address:port:", self.wireless_connect_address)
+
+        connect_btn_row = QHBoxLayout()
+        connect_btn = QPushButton("📶 Connect")
+        connect_btn.clicked.connect(self._wireless_connect)
+        connect_btn_row.addWidget(connect_btn)
+
+        disconnect_btn = QPushButton("✂️ Disconnect")
+        disconnect_btn.setToolTip("Disconnect this address (leave blank to disconnect all wireless devices)")
+        disconnect_btn.clicked.connect(self._wireless_disconnect)
+        connect_btn_row.addWidget(disconnect_btn)
+
+        disconnect_all_btn = QPushButton("Disconnect All")
+        disconnect_all_btn.clicked.connect(lambda: self._wireless_disconnect(all_devices=True))
+        connect_btn_row.addWidget(disconnect_all_btn)
+        connect_btn_row.addStretch()
+        connect_layout.addRow("", connect_btn_row)
+
+        layout.addWidget(connect_group)
+
+        # --- Older devices: USB → TCP/IP ---
+        tcpip_group = QGroupBox("Older devices (pre-Android 11): USB → Wi-Fi")
+        tcpip_layout = QVBoxLayout(tcpip_group)
+
+        tcpip_info = QLabel(
+            "No pairing on older devices. Plug in over USB and select it in the "
+            "<b>Device</b> dropdown up top, then click below to restart adbd on TCP/IP. "
+            "The device's Wi-Fi IP is auto-filled into Connect above — unplug USB and hit Connect."
+        )
+        tcpip_info.setWordWrap(True)
+        tcpip_info.setStyleSheet("font-size: 11px; color: #888;")
+        tcpip_layout.addWidget(tcpip_info)
+
+        tcpip_row = QHBoxLayout()
+        tcpip_row.addWidget(QLabel("Port:"))
+        self.wireless_tcpip_port = QSpinBox()
+        self.wireless_tcpip_port.setRange(1024, 65535)
+        self.wireless_tcpip_port.setValue(5555)
+        self.wireless_tcpip_port.setMaximumWidth(90)
+        tcpip_row.addWidget(self.wireless_tcpip_port)
+
+        tcpip_btn = QPushButton("🔌 Enable TCP/IP over USB")
+        tcpip_btn.clicked.connect(self._wireless_enable_tcpip)
+        tcpip_row.addWidget(tcpip_btn)
+        tcpip_row.addStretch()
+        tcpip_layout.addLayout(tcpip_row)
+
+        layout.addWidget(tcpip_group)
+
+        layout.addStretch()
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
+        return tab
+
+    def _wireless_pair(self):
+        address = self.wireless_pair_address.text().strip()
+        code = self.wireless_pair_code.text().strip()
+        if not address or ":" not in address:
+            QMessageBox.warning(self.parent_window, "Pairing Address",
+                "Enter the pairing address as host:port (from 'Pair device with pairing code').")
+            return
+        if not code or len(code) != 6 or not code.isdigit():
+            QMessageBox.warning(self.parent_window, "Pairing Code",
+                "Enter the 6-digit pairing code shown on the device.")
+            return
+
+        self._log(f"Pairing with {address}...")
+        self.worker = AdbWorkerThread("wireless_pair", address=address, code=code)
+        self.worker.log.connect(self._log)
+        self.worker.finished_signal.connect(self._on_wireless_pair_done)
+        self.worker.start()
+
+    def _on_wireless_pair_done(self, success, message):
+        self._log(message)
+        if success:
+            self.wireless_pair_code.clear()
+            # Pre-fill the connect address with the same host so the next
+            # step is one field away. The connect port usually differs from
+            # the pairing port, so only the host is carried over.
+            host = self.wireless_pair_address.text().strip().split(":")[0]
+            if host and not self.wireless_connect_address.text().strip():
+                self.wireless_connect_address.setText(f"{host}:")
+            QMessageBox.information(self.parent_window, "Paired",
+                f"{message}\n\nNow enter the device's address:port from the main "
+                "Wireless debugging screen under ② Connect.")
+        else:
+            QMessageBox.warning(self.parent_window, "Pairing Failed", message)
+
+    def _wireless_connect(self):
+        address = self.wireless_connect_address.text().strip()
+        if not address or ":" not in address:
+            QMessageBox.warning(self.parent_window, "Connect Address",
+                "Enter the device address as host:port (e.g. 192.168.1.42:5555).")
+            return
+
+        self._log(f"Connecting to {address}...")
+        self.worker = AdbWorkerThread("wireless_connect", address=address)
+        self.worker.log.connect(self._log)
+        self.worker.finished_signal.connect(self._on_wireless_connect_done)
+        self.worker.start()
+
+    def _on_wireless_connect_done(self, success, message):
+        self._log(message)
+        if success:
+            self._refresh_devices()  # New wireless device shows in the dropdown
+        else:
+            QMessageBox.warning(self.parent_window, "Connection Failed", message)
+
+    def _wireless_disconnect(self, all_devices: bool = False):
+        address = "" if all_devices else self.wireless_connect_address.text().strip()
+        self._log("Disconnecting wireless device(s)...")
+        self.worker = AdbWorkerThread("wireless_disconnect", address=address)
+        self.worker.finished_signal.connect(lambda s, m: [self._log(m), self._refresh_devices()])
+        self.worker.start()
+
+    def _wireless_enable_tcpip(self):
+        device = self._get_device()
+        if not device:
+            QMessageBox.warning(self.parent_window, "No Device",
+                "Plug in the device over USB and select it in the Device dropdown first.")
+            return
+
+        self._log("Enabling TCP/IP mode over USB...")
+        self.worker = AdbWorkerThread("wireless_enable_tcpip", device=device,
+                                       port=self.wireless_tcpip_port.value())
+        self.worker.log.connect(self._log)
+        self.worker.result_data.connect(self._on_tcpip_result)
+        self.worker.finished_signal.connect(lambda s, m: self._log(m))
+        self.worker.start()
+
+    def _on_tcpip_result(self, data):
+        """Auto-fill the connect address once we know the device's Wi-Fi IP."""
+        ip = data.get('ip')
+        port = data.get('port', 5555)
+        if ip:
+            self.wireless_connect_address.setText(f"{ip}:{port}")
 
     # ===== REBOOT TAB =====
     def _create_reboot_tab(self):

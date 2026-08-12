@@ -1,0 +1,40 @@
+; winusb_9008.inf — bind the in-box WinUSB driver to the Qualcomm 9008 (EDL) interface.
+; Uses Windows' built-in, Microsoft-signed WinUSB (no custom .sys), so it can be
+; installed with:  pnputil /add-driver winusb_9008.inf /install
+; NOTE: on systems with Driver Signature Enforcement, an unsigned .inf catalog may be
+; rejected; a libwdi/Zadig-style self-signed install is the fully robust path.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+DriverVer   = 07/19/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NTamd64,NTarm64
+
+[Standard.NTamd64]
+%DeviceName% = USB_Install, USB\VID_05C6&PID_9008
+
+[Standard.NTarm64]
+%DeviceName% = USB_Install, USB\VID_05C6&PID_9008
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{d0f3f0a1-9c6b-4b8a-8b1a-9008ec15a291}"
+
+[Strings]
+ProviderName = "Image Anarchy"
+DeviceName   = "Qualcomm HS-USB QDLoader 9008 (WinUSB)"

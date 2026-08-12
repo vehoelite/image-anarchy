@@ -57,10 +57,15 @@ def get_base_path() -> Path:
 
 
 def find_adb_toolkit_path() -> Optional[str]:
-    """Find ADB executable from ADB Toolkit plugin."""
+    """Find ADB executable from ADB Toolkit plugin or bundled with scrcpy."""
     base_path = get_base_path()
     
-    # Check ADB Toolkit plugin path (primary source)
+    # Check scrcpy plugin's own bundled adb.exe FIRST (downloaded via bundled_binaries)
+    scrcpy_adb = base_path / 'plugins' / 'scrcpy_toolkit' / 'adb.exe'
+    if scrcpy_adb.exists():
+        return str(scrcpy_adb)
+    
+    # Check ADB Toolkit plugin path
     adb_toolkit_path = base_path / 'plugins' / 'adb_toolkit' / 'platform-tools' / 'adb.exe'
     if adb_toolkit_path.exists():
         return str(adb_toolkit_path)
@@ -70,7 +75,12 @@ def find_adb_toolkit_path() -> Optional[str]:
     if root_adb.exists():
         return str(root_adb)
     
-    # Linux/Mac paths
+    # Linux/Mac paths - scrcpy plugin's bundled adb
+    scrcpy_adb_unix = base_path / 'plugins' / 'scrcpy_toolkit' / 'adb'
+    if scrcpy_adb_unix.exists():
+        return str(scrcpy_adb_unix)
+    
+    # Linux/Mac - ADB Toolkit
     adb_toolkit_unix = base_path / 'plugins' / 'adb_toolkit' / 'platform-tools' / 'adb'
     if adb_toolkit_unix.exists():
         return str(adb_toolkit_unix)
@@ -578,7 +588,7 @@ class PluginWidget(QWidget):
         
         path_layout = QHBoxLayout()
         self.scrcpy_path_edit = QLineEdit()
-        self.scrcpy_path_edit.setPlaceholderText("scrcpy path (auto-detected)...")
+        self.scrcpy_path_edit.setPlaceholderText("scrcpy.exe path...")
         self.scrcpy_path_edit.setText(self.scrcpy_path or "")
         path_layout.addWidget(self.scrcpy_path_edit)
         
@@ -679,7 +689,7 @@ class PluginWidget(QWidget):
             deps.append(f"✅ ADB: {Path(self.adb_helper.adb_path).name}")
         else:
             if check_adb_toolkit_installed():
-                deps.append("⚠️ ADB Toolkit installed but adb not found")
+                deps.append("⚠️ ADB Toolkit installed but adb.exe not found")
             else:
                 deps.append("❌ ADB: Install ADB Toolkit plugin from Plugin Store")
             all_ok = False
@@ -800,8 +810,7 @@ class PluginWidget(QWidget):
         
         if not self.scrcpy_path or not Path(self.scrcpy_path).exists():
             QMessageBox.warning(self, "Scrcpy Not Found",
-                "scrcpy not found. Try reinstalling the plugin from Plugin Store,\n"
-                "or install scrcpy via your system package manager.")
+                "scrcpy.exe not found. Try reinstalling the plugin from Plugin Store.")
             return
         
         serial = self.device_combo.currentData()
@@ -920,8 +929,7 @@ class PluginWidget(QWidget):
         
         if not self.scrcpy_path or not Path(self.scrcpy_path).exists():
             QMessageBox.warning(self, "Scrcpy Not Found",
-                "scrcpy not found. Try reinstalling the plugin from Plugin Store,\n"
-                "or install scrcpy via your system package manager.")
+                "scrcpy.exe not found. Try reinstalling the plugin from Plugin Store.")
             return
         
         serial = self.record_device_combo.currentData()

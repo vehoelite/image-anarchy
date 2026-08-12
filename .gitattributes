@@ -1,0 +1,16 @@
+# Firmware images, partition dumps, and binaries must NEVER get EOL/text conversion.
+# (LF->CRLF mangling of binary dumps is exactly what corrupts preloader/userdata backups.)
+*.img    binary
+*.bin    binary
+*.gz     binary
+*.lz4    binary
+*.zst    binary
+*.br     binary
+*.xz     binary
+*.zip    binary
+*.so     binary
+*.dll    binary
+*.exe    binary
+*.pem    -text
+*.payload binary
+*.scatter binary
