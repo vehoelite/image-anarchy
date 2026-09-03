@@ -1,4 +1,3 @@
-<h1>This project is completely created by A.I. As they upgrade, so does the program.</h1>
 <p align="center">
   <img src="https://github.com/vehoelite/image-anarchy/blob/main/icon.png?raw=true" alt="Image Anarchy Logo" width="150">
 </p>
