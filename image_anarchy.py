@@ -22419,7 +22419,7 @@ def create_gui_app():
                 self._add_field("Image Path Variable:", "image_var", "image_path")
 
             elif block.block_type == 'mtk_erase':
-                self._add_field("Partition Name:", "partition", "frp")
+                self._add_field("Partition Name:", "partition", "cache")
 
             elif block.block_type == 'scrcpy_mirror':
                 self._add_field("Window Title:", "title", "Device Screen")

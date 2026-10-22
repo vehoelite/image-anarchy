@@ -15,6 +15,7 @@ Comprehensive ADB tools including:
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -225,8 +226,23 @@ def _shell_quote(path: str) -> str:
     return "'" + path.replace("'", "'\"'\"'") + "'"
 
 
+# Shell-level FRP bypasses: writing to the FRP block device, or marking the
+# setup wizard complete so it never asks for the previous Google account.
+_FRP_ADB_RE = re.compile(
+    r"(of=|>)\s*/dev/block/\S*?(frp|persistent|config)(_[ab])?\b|user_setup_complete|setup_wizard_has_run",
+    re.IGNORECASE,
+)
+
+
+def _frp_blocked(args) -> bool:
+    """True if these adb args would tamper with Factory Reset Protection."""
+    return bool(_FRP_ADB_RE.search(" ".join(str(a) for a in args)))
+
+
 def run_adb(args: List[str], device: Optional[str] = None, timeout: int = 30) -> tuple:
     """Run ADB command and return (success, output)."""
+    if _frp_blocked(args):
+        return False, "⛔ Blocked: Image Anarchy does not tamper with Factory Reset Protection (FRP)."
     adb_path = find_adb()
     if not adb_path:
         return False, "ADB not found"

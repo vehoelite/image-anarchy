@@ -7,7 +7,6 @@ Advanced MediaTek device toolkit including:
 - Flash Write (Partitions & Full ROM)
 - Erase Partitions
 - Unlock/Lock Bootloader
-- FRP/Factory Reset Protection Bypass
 - RPMB Key Extraction
 - Preloader Dumping
 - DA (Download Agent) Operations
@@ -303,8 +302,40 @@ def find_mtk_client() -> Optional[str]:
     return None
 
 
+# ── Ownership policy ─────────────────────────────────────────────────────────
+# Factory Reset Protection is what makes a lost or stolen phone worthless to
+# whoever is holding it. Image Anarchy will not erase or overwrite it, in any
+# mode, for anyone. See ACCEPTABLE_USE_POLICY.md.
+FRP_PARTITIONS = {"frp", "persistent", "config"}  # FRP storage varies by vendor
+FRP_BLOCKED_MSG = ("⛔ Blocked: Image Anarchy does not erase or overwrite Factory Reset "
+                   "Protection (FRP). Sign in with the device's Google account, or use "
+                   "Google account recovery with proof of purchase.")
+
+
+def _is_frp_partition(name: str) -> bool:
+    """True if name is a partition (or partition image file) holding FRP data."""
+    base = os.path.splitext(os.path.basename(str(name)))[0].lower()
+    if base.endswith(("_a", "_b")):
+        base = base[:-2]
+    return base in FRP_PARTITIONS
+
+
+def _frp_blocked(args) -> bool:
+    """True if these mtkclient args would erase or write an FRP partition."""
+    if len(args) < 2:
+        return False
+    cmd = str(args[0]).lower()
+    if cmd in ("e", "w"):
+        return any(_is_frp_partition(p) for p in str(args[1]).split(","))
+    if cmd == "wl" and os.path.isdir(args[1]):
+        return any(_is_frp_partition(f) for f in os.listdir(args[1]))
+    return False
+
+
 def run_mtk_command(args: List[str], callback=None, cwd: str = None) -> Tuple[bool, str]:
     """Run MTK command and return (success, output). No timeout - waits for completion."""
+    if _frp_blocked(args):
+        return False, FRP_BLOCKED_MSG
     mtk_path = find_mtk_client()
     if not mtk_path:
         return False, "MTKClient not found. Please clone it from: git clone https://github.com/bkerler/mtkclient.git"
@@ -475,12 +506,12 @@ class MtkDeviceHandler(QObject):
     _DA_OPS = {
         'read_partition', 'write_partition', 'erase_partition',
         'get_gpt', 'dump_brom', 'dump_preloader',
-        'unlock_bootloader', 'lock_bootloader', 'erase_frp',
+        'unlock_bootloader', 'lock_bootloader',
         'read_full_flash', 'write_full_flash',
         'dump_seccfg', 'reset_seccfg', 'patch_vbmeta',
         'get_rpmb', 'read_rpmb', 'write_rpmb', 'erase_rpmb', 'auth_rpmb',
         'read_efuses', 'memory_dump',
-        'read_imei', 'write_imei', 'patch_modem',
+        'read_imei', 'patch_modem',
         'backup_nvram', 'restore_nvram',
         'backup_modem', 'restore_modem',
         'check_network_lock', 'remove_network_lock', 'scan_sml_data',
@@ -497,7 +528,7 @@ class MtkDeviceHandler(QObject):
     
     # META-specific operations (AT commands over serial - real META protocol)
     _META_AT_OPS = {
-        'meta_read_imei', 'meta_write_imei',
+        'meta_read_imei',
         'meta_check_network_lock', 'meta_remove_network_lock',
         'meta_unlock_network', 'meta_try_engineering_codes',
         'meta_at_command',
@@ -508,7 +539,7 @@ class MtkDeviceHandler(QObject):
         'Preloader': _DA_OPS - {'dump_brom', 'get_rpmb', 'read_efuses', 'memory_dump'},
         'DA': _DA_OPS,
         'META': _META_AT_OPS | {
-            'read_imei', 'write_imei', 'patch_modem',
+            'read_imei', 'patch_modem',
             'backup_nvram', 'restore_nvram',
             'backup_modem', 'restore_modem',
             'check_network_lock', 'remove_network_lock',
@@ -920,6 +951,9 @@ class MtkDeviceHandler(QObject):
     
     def write_partition(self, partition_name: str, input_file: str) -> bool:
         """Write a file to partition."""
+        if _is_frp_partition(partition_name):
+            self._emit_log(FRP_BLOCKED_MSG)
+            return False
         if not self.connected or not self.da_handler:
             self._emit_log("❌ Device not connected")
             return False
@@ -943,6 +977,9 @@ class MtkDeviceHandler(QObject):
     
     def erase_partition(self, partition_name: str) -> bool:
         """Erase a partition."""
+        if _is_frp_partition(partition_name):
+            self._emit_log(FRP_BLOCKED_MSG)
+            return False
         if not self.connected or not self.da_handler:
             self._emit_log("❌ Device not connected")
             return False
@@ -1599,172 +1636,6 @@ class MtkDeviceHandler(QObject):
                 continue
         
         return imei_list
-    
-    def write_imei(self, imei1: str, imei2: str = None, product: str = "thunder") -> bool:
-        """
-        Write IMEI values to device.
-        
-        YOUR device. YOUR identity. This is TRUE ownership.
-        
-        Uses direct nvdata partition reading/writing and encryption (from mtkclient 2.1.2).
-        
-        Args:
-            imei1: Primary IMEI (14-15 digits, checksum auto-calculated)
-            imei2: Secondary IMEI (optional, for dual-SIM devices)
-            product: Product name for CSSD encryption (default: thunder)
-        
-        Returns:
-            True on success
-        
-        WARNING: IMEI manipulation may be illegal in some jurisdictions.
-                 This tool is for device recovery and legitimate repair only.
-        """
-        if not self.connected or not self.da_handler:
-            self._emit_log("❌ Device not connected")
-            return False
-        
-        try:
-            # Import the crypto functions from mtkclient
-            try:
-                from mtkclient.Library.mtk_crypto import (
-                    calc_checksum, encode_imei, make_luhn_checksum,
-                    decrypt_cssd, create_cssd
-                )
-            except ImportError as e:
-                self._emit_log(f"❌ Failed to import mtkclient crypto: {e}")
-                return False
-            
-            # Validate and prepare IMEI(s)
-            imei1 = imei1.strip()
-            if not imei1.isdigit() or len(imei1) < 14 or len(imei1) > 15:
-                self._emit_log(f"❌ Invalid IMEI1 format: must be 14-15 digits")
-                return False
-            
-            imeis = [imei1]
-            if imei2:
-                imei2 = imei2.strip()
-                if not imei2.isdigit() or len(imei2) < 14 or len(imei2) > 15:
-                    self._emit_log(f"❌ Invalid IMEI2 format: must be 14-15 digits")
-                    return False
-                imeis.append(imei2)
-            
-            # Calculate Luhn checksums for all IMEIs
-            for i in range(len(imeis)):
-                preimei = imeis[i][:14] + "0"
-                imeis[i] = preimei[:14] + str(make_luhn_checksum(preimei))
-            
-            self._emit_log("📱 IMEI WRITE - Reclaiming YOUR device identity!")
-            self._emit_log(f"⚠️ Writing IMEI(s): {', '.join(imeis)}")
-            self._emit_log("🏴 You bought it. You own it. Your identity, your rules.")
-            
-            # Read nvdata partition
-            self._emit_log("📥 Reading nvdata partition...")
-            nvdata = bytearray(self.da_handler.da_read_partition(partitionname="nvdata", display=False))
-            
-            if not nvdata or nvdata == b"":
-                self._emit_log("❌ Failed to read nvdata partition")
-                return False
-            
-            self._emit_log(f"✅ Read {len(nvdata)} bytes from nvdata")
-            
-            # Default crypto parameters
-            seed = bytes.fromhex("3132616263646566")
-            aeskey = bytes.fromhex("0102030405060708090A0B0C0D0E0F1011120B1415161718191A1B1C00000000")
-            
-            # Find and update all IMEI markers
-            pos = 0
-            imei_updated = False
-            while True:
-                pos = nvdata.find(b"\x4C\x44\x49\x00\x10\xEF\x0A\x00\x0A", pos + 1)
-                if pos == -1:
-                    break
-                    
-                self._emit_log(f"🔍 Found IMEI data at offset 0x{pos:X}")
-                
-                old_nvitem_data = nvdata[pos:pos + 0x180]
-                nvitem_data = bytearray()
-                
-                # Encode each IMEI
-                x = 0
-                for imei in imeis:
-                    data = encode_imei(imei) + b"\x00\x00"
-                    csum = calc_checksum(data, 0xA)
-                    encoded_imei = data + csum + b"\x00" * 0xE
-                    nvitem_data.extend(encoded_imei)
-                    x += 1
-                
-                # Fill remaining slots with empty entries
-                for i in range(10 - x):
-                    data = b"\xFF" * 0xA
-                    csum = calc_checksum(data, 0xA)
-                    encoded_imei = data + csum + b"\x00" * 0xE
-                    nvitem_data.extend(encoded_imei)
-                
-                # Keep original header
-                header = old_nvitem_data[:0x40]
-                
-                # Encrypt the nvitem data
-                try:
-                    result = self.mtk.daloader.nvitem(
-                        data=header + bytes(nvitem_data),
-                        encrypt=True,
-                        otp=self.mtk.config.get_otp(),
-                        seed=seed,
-                        aeskey=aeskey,
-                        display=False
-                    )
-                    nvitem = header + result
-                    nvdata[pos:pos + 0x180] = nvitem
-                    imei_updated = True
-                    self._emit_log(f"✅ Encrypted and prepared IMEI data")
-                except Exception as e:
-                    self._emit_log(f"⚠️ NVITEM encryption failed: {e}")
-            
-            if not imei_updated:
-                self._emit_log("❌ No IMEI markers found in nvdata")
-                return False
-            
-            # Optionally update CSSD data (if we have keys - usually not available)
-            cssd_pos = 0
-            while True:
-                cssd_pos = nvdata.find(b"devPubKeyModulus", cssd_pos + 1)
-                if cssd_pos == -1:
-                    break
-                    
-                try:
-                    cssd_data = nvdata[cssd_pos - 0x40:cssd_pos - 0x40 + 0x1048]
-                    content = decrypt_cssd(data=cssd_data).config
-                    content["imei_1"] = imeis[0]
-                    if len(imeis) > 1:
-                        content["imei_2"] = imeis[1]
-                    
-                    # Only update CSSD if we have the required private keys
-                    import os
-                    if os.path.exists("private_2048.pem") and os.path.exists("private_1024.pem"):
-                        self._emit_log("🔐 Updating CSSD data with private keys...")
-                        new_cssd_data = create_cssd(content, product=product)
-                        nvdata[cssd_pos - 0x40:cssd_pos - 0x40 + 0x1048] = new_cssd_data
-                    else:
-                        self._emit_log("ℹ️ CSSD update skipped (no private keys)")
-                except Exception as e:
-                    self._emit_log(f"⚠️ CSSD processing failed: {e}")
-            
-            # Write back to nvdata partition
-            self._emit_log("📤 Writing nvdata partition...")
-            if self.da_handler.da_write_partition(partitionname="nvdata", data=bytes(nvdata), display=False):
-                self._emit_log("━" * 45)
-                self._emit_log("✅ IMEI written successfully!")
-                self._emit_log("🏴 Device identity restored to YOUR control!")
-                return True
-            else:
-                self._emit_log("❌ Failed to write nvdata partition")
-                return False
-            
-        except Exception as e:
-            self._emit_log(f"❌ Error writing IMEI: {e}")
-            import traceback
-            self._emit_log(traceback.format_exc())
-            return False
     
     def patch_modem(self) -> bool:
         """
@@ -3006,42 +2877,6 @@ class MtkDeviceHandler(QObject):
             return imeis
         return None
     
-    def meta_write_imei_at(self, imei: str, slot: int = 1) -> bool:
-        """
-        Write IMEI value using META AT commands.
-        
-        AT+EGMR=1,7,"IMEI"  → Write IMEI 1
-        AT+EGMR=1,10,"IMEI" → Write IMEI 2
-        
-        Args:
-            imei: 15-digit IMEI string
-            slot: IMEI slot (1 or 2)
-            
-        Returns:
-            True if write succeeded
-        """
-        if not self.meta_connected:
-            self._emit_log("❌ Not connected in META mode")
-            return False
-        
-        if len(imei) != 15 or not imei.isdigit():
-            self._emit_log("❌ Invalid IMEI: must be exactly 15 digits")
-            return False
-        
-        egmr_id = 7 if slot == 1 else 10
-        self._emit_log(f"✏️ Writing IMEI {slot}: {imei}")
-        
-        resp = self.meta_at_command(f'AT+EGMR=1,{egmr_id},"{imei}"')
-        if resp and "OK" in resp:
-            self._emit_log(f"✅ IMEI {slot} written successfully!")
-            return True
-        elif resp and "ERROR" in resp:
-            self._emit_log(f"❌ IMEI write failed: {resp}")
-            return False
-        else:
-            self._emit_log(f"⚠️ Uncertain response: {resp}")
-            return False
-    
     def meta_check_network_lock_at(self) -> Optional[dict]:
         """
         Check network lock status using META AT commands.
@@ -3916,8 +3751,6 @@ class MtkWorkerThread(QThread):
                 self._unlock_bootloader()
             elif self.operation == "lock_bootloader":
                 self._lock_bootloader()
-            elif self.operation == "erase_frp":
-                self._erase_frp()
             elif self.operation == "dump_preloader":
                 self._dump_preloader()
             elif self.operation == "dump_brom":
@@ -3937,8 +3770,6 @@ class MtkWorkerThread(QThread):
                 self._patch_vbmeta()
             elif self.operation == "read_imei":
                 self._read_imei()
-            elif self.operation == "write_imei":
-                self._write_imei()
             elif self.operation == "patch_modem":
                 self._patch_modem()
             elif self.operation == "read_efuses":
@@ -4437,31 +4268,6 @@ class MtkWorkerThread(QThread):
             self.log.emit("🔴 Device not connected")
             self.finished_signal.emit(False, "Device not connected")
     
-    def _erase_frp(self):
-        """Erase FRP (Factory Reset Protection) using library."""
-        self.log.emit("🏴 BYPASSING Google's grip on YOUR device...")
-        
-        handler = get_device_handler()
-        if handler.is_library_available() and handler.connected:
-            def log_handler(msg):
-                self.log.emit(msg)
-            handler.log_signal.connect(log_handler)
-            try:
-                if handler.erase_partition("frp"):
-                    self.log.emit("🔥 GOOGLE'S CHAINS HAVE BEEN BROKEN!")
-                    self.log.emit("⚡ YOUR DEVICE IS NOW TRULY YOURS!")
-                    self.finished_signal.emit(True, "💀 FRP ANNIHILATED! Freedom restored!")
-                else:
-                    self.finished_signal.emit(False, "Failed to erase FRP")
-            finally:
-                try:
-                    handler.log_signal.disconnect(log_handler)
-                except:
-                    pass
-        else:
-            self.log.emit("🔴 Device not connected")
-            self.finished_signal.emit(False, "Device not connected")
-    
     def _dump_preloader(self):
         """Dump preloader from RAM using library or CLI."""
         output_dir = self.kwargs.get('output_dir', os.getcwd())
@@ -4741,42 +4547,6 @@ class MtkWorkerThread(QThread):
                         self.finished_signal.emit(True, "No IMEI values found")
                 else:
                     self.finished_signal.emit(False, "Failed to read IMEI - check connection")
-            finally:
-                try:
-                    handler.log_signal.disconnect(log_handler)
-                except:
-                    pass
-        else:
-            self.log.emit("🔴 Device not connected")
-            self.finished_signal.emit(False, "Device not connected")
-    
-    def _write_imei(self):
-        """Write IMEI values to device."""
-        self.log.emit("━" * 45)
-        self.log.emit("📱 IMEI WRITE - Reclaiming YOUR device identity!")
-        self.log.emit("🏴 You bought it. You own it. Your IMEI, your rules.")
-        self.log.emit("━" * 45)
-        
-        imei1 = self.kwargs.get('imei1', '')
-        imei2 = self.kwargs.get('imei2', '')
-        product = self.kwargs.get('product', 'thunder')
-        
-        if not imei1:
-            self.log.emit("❌ IMEI1 is required")
-            self.finished_signal.emit(False, "IMEI1 required")
-            return
-        
-        handler = get_device_handler()
-        if handler.is_library_available() and handler.connected:
-            def log_handler(msg):
-                self.log.emit(msg)
-            handler.log_signal.connect(log_handler)
-            try:
-                if handler.write_imei(imei1, imei2 if imei2 else None, product):
-                    self.log.emit("✅ IMEI written! Device identity restored!")
-                    self.finished_signal.emit(True, "IMEI written successfully")
-                else:
-                    self.finished_signal.emit(False, "Failed to write IMEI")
             finally:
                 try:
                     handler.log_signal.disconnect(log_handler)
@@ -5357,20 +5127,17 @@ class PluginWidget(QWidget):
         'restore_btn': 'write_full_flash',
         # Erase operations
         'erase_btn': 'erase_partition',
-        'frp_btn': 'erase_frp',
         'userdata_btn': 'erase_partition',
         'cache_btn': 'erase_partition',
         # Unlock/Security operations
         'unlock_btn': 'unlock_bootloader',
         'lock_btn': 'lock_bootloader',
-        'frp_erase_btn': 'erase_frp',
         'rpmb_btn': 'get_rpmb',
         'dump_sec_btn': 'dump_seccfg',
         'reset_sec_btn': 'reset_seccfg',
         'vbmeta_btn': 'patch_vbmeta',
         # IMEI operations
         'read_imei_btn': 'read_imei',
-        'write_imei_btn': 'write_imei',
         'read_efuse_btn': 'read_efuses',
         'target_config_btn': 'read_full_hw_info',
         'patch_modem_btn': 'patch_modem',
@@ -5689,7 +5456,6 @@ class PluginWidget(QWidget):
             ("Read Recovery", "Auto-detects A/B slots", "🔧", "#00d4ff", lambda: self._read_partition("recovery")),
             ("Read Preloader", "Dump preloader", "⚙️", "#00d4ff", lambda: self._dump_preloader()),
             ("Unlock BL", "Unlock bootloader", "🔓", "#00ff88", lambda: self._unlock_bootloader()),
-            ("Erase FRP", "Remove Google lock", "🗑️", "#ff6b6b", lambda: self._erase_frp()),
             ("Get GPT", "List all partitions", "📋", "#ffa500", lambda: self._get_gpt()),
             ("Patch VBMeta", "Disable AVB (v2.1!)", "⚡", "#00ff88", lambda: self._quick_patch_vbmeta()),
             ("Full Backup", "Backup entire flash", "💾", "#9966ff", lambda: self._read_full_flash()),
@@ -5965,12 +5731,6 @@ class PluginWidget(QWidget):
         
         quick_btns = QHBoxLayout()
         
-        frp_btn = GlowingButton("🗑️ FRP", "#ff6b6b")
-        frp_btn.setToolTip("Erase Factory Reset Protection (Google lock)")
-        frp_btn.clicked.connect(self._erase_frp)
-        quick_btns.addWidget(frp_btn)
-        self._register_button('frp_btn', frp_btn)
-        
         userdata_btn = GlowingButton("🗑️ Userdata", "#ff6b6b")
         userdata_btn.setToolTip("Erase user data (factory reset)")
         userdata_btn.clicked.connect(lambda: self._erase_partition_by_name("userdata"))
@@ -6092,23 +5852,6 @@ class PluginWidget(QWidget):
         
         layout.addWidget(bl_group)
         
-        # FRP
-        frp_group = QGroupBox("🗑️ Factory Reset Protection (FRP)")
-        frp_layout = QVBoxLayout(frp_group)
-        
-        frp_layout.addWidget(QLabel("Erase FRP partition to bypass Google account lock:"))
-        
-        frp_warning = QLabel("⚠️ This should only be used on your own device!")
-        frp_warning.setStyleSheet("color: #ffa500;")
-        frp_layout.addWidget(frp_warning)
-        
-        frp_erase_btn = GlowingButton("🗑️ Erase FRP", "#ff6b6b")
-        frp_erase_btn.clicked.connect(self._erase_frp)
-        frp_layout.addWidget(frp_erase_btn)
-        self._register_button('frp_erase_btn', frp_erase_btn)
-        
-        layout.addWidget(frp_group)
-        
         # RPMB Keys
         rpmb_group = QGroupBox("🔑 RPMB Keys")
         rpmb_layout = QVBoxLayout(rpmb_group)
@@ -6200,39 +5943,13 @@ class PluginWidget(QWidget):
         self._register_button('read_efuse_btn', read_efuse_btn)
         self._register_button('target_config_btn', target_config_btn)
         
-        # IMEI Write section (NEW!)
-        imei_write_group = QGroupBox("✍️ IMEI Write (ADVANCED)")
-        imei_write_layout = QFormLayout(imei_write_group)
-        
-        warning_label = QLabel("⚠️ IMEI modification may be illegal in some jurisdictions.\n"
-                               "This tool is for device recovery and legitimate repair only.")
-        warning_label.setStyleSheet("color: #ff6b6b; font-weight: bold;")
-        imei_write_layout.addRow(warning_label)
-        
-        self.imei1_edit = QLineEdit()
-        self.imei1_edit.setPlaceholderText("Enter IMEI 1 (14-15 digits)")
-        self.imei1_edit.setMaxLength(15)
-        imei_write_layout.addRow("IMEI 1:", self.imei1_edit)
-        
-        self.imei2_edit = QLineEdit()
-        self.imei2_edit.setPlaceholderText("Enter IMEI 2 for dual-SIM (optional)")
-        self.imei2_edit.setMaxLength(15)
-        imei_write_layout.addRow("IMEI 2:", self.imei2_edit)
-        
-        imei_write_btns = QHBoxLayout()
+        # Modem patch
         patch_modem_btn = GlowingButton("📡 Patch Modem", "#ffa500")
-        patch_modem_btn.setToolTip("Required before IMEI write on some devices")
+        patch_modem_btn.setToolTip("Patch modem firmware (md1img)")
         patch_modem_btn.clicked.connect(self._patch_modem_ui)
-        write_imei_btn = GlowingButton("✍️ Write IMEI", "#ff6b6b")
-        write_imei_btn.clicked.connect(self._write_imei_ui)
-        imei_write_btns.addWidget(patch_modem_btn)
-        imei_write_btns.addWidget(write_imei_btn)
-        imei_write_layout.addRow(imei_write_btns)
+        imei_layout.addWidget(patch_modem_btn)
         self._register_button('patch_modem_btn', patch_modem_btn)
-        self._register_button('write_imei_btn', write_imei_btn)
-        
-        imei_layout.addWidget(imei_write_group)
-        
+
         layout.addWidget(imei_group)
         
         return tab
@@ -6696,19 +6413,6 @@ class PluginWidget(QWidget):
         self.imei_display.setToolTip("IMEI will be displayed here after clicking Read IMEI")
         read_imei_layout.addWidget(self.imei_display, 1)
         imei_layout.addLayout(read_imei_layout)
-        
-        # Write IMEI
-        write_imei_layout = QHBoxLayout()
-        write_imei_layout.addWidget(QLabel("New IMEI:"))
-        self.imei_input = QLineEdit()
-        self.imei_input.setPlaceholderText("Enter 15-digit IMEI")
-        self.imei_input.setMaxLength(15)
-        write_imei_layout.addWidget(self.imei_input, 1)
-        
-        meta_write_imei_btn = GlowingButton("✏️ Write IMEI", "#ff6b6b")
-        meta_write_imei_btn.clicked.connect(self._write_imei)
-        write_imei_layout.addWidget(meta_write_imei_btn)
-        imei_layout.addLayout(write_imei_layout)
         
         layout.addWidget(imei_group)
         
@@ -7981,18 +7685,6 @@ class PluginWidget(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self._start_operation("lock_bootloader")
     
-    def _erase_frp(self):
-        """Erase FRP partition."""
-        reply = QMessageBox.question(
-            self, "Confirm FRP Erase",
-            "Are you sure you want to erase the FRP partition?\n\n"
-            "⚠️ Only do this on your own device!",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self._start_operation("erase_frp")
-    
     def _dump_preloader(self):
         """Dump preloader."""
         output_dir = self.dump_output_edit.text() if hasattr(self, 'dump_output_edit') else self.output_dir
@@ -8120,47 +7812,12 @@ class PluginWidget(QWidget):
         output_dir = self.dump_output_edit.text() if hasattr(self, 'dump_output_edit') else self.output_dir
         self._start_operation("read_rpmb", output_dir=output_dir)
     
-    def _write_imei_ui(self):
-        """UI callback for IMEI write."""
-        imei1 = self.imei1_edit.text().strip()
-        imei2 = self.imei2_edit.text().strip()
-        
-        if not imei1:
-            QMessageBox.warning(self, "Missing IMEI", "Please enter IMEI 1")
-            return
-        
-        if not imei1.isdigit() or len(imei1) < 14 or len(imei1) > 15:
-            QMessageBox.warning(self, "Invalid IMEI", "IMEI 1 must be 14-15 digits")
-            return
-        
-        if imei2 and (not imei2.isdigit() or len(imei2) < 14 or len(imei2) > 15):
-            QMessageBox.warning(self, "Invalid IMEI", "IMEI 2 must be 14-15 digits")
-            return
-        
-        # Confirmation dialog with warning
-        reply = QMessageBox.warning(
-            self, "⚠️ IMEI Write Confirmation",
-            f"⚠️ WARNING: IMEI modification may be illegal in some jurisdictions!\n\n"
-            f"This should only be used for:\n"
-            f"• Device recovery after corruption\n"
-            f"• Legitimate repair purposes\n\n"
-            f"IMEI 1: {imei1}\n"
-            f"IMEI 2: {imei2 if imei2 else 'N/A'}\n\n"
-            f"Are you sure you want to proceed?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self._start_operation("write_imei", imei1=imei1, imei2=imei2, product="thunder")
-    
     def _patch_modem_ui(self):
         """UI callback for modem patching."""
         reply = QMessageBox.question(
             self, "Patch Modem",
             "📡 MODEM PATCHING\n\n"
-            "This patches the modem firmware (md1img) to allow IMEI operations.\n"
-            "Required before IMEI write on some devices.\n\n"
+            "This patches the modem firmware (md1img).\n\n"
             "Proceed with modem patching?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
@@ -8390,62 +8047,6 @@ class PluginWidget(QWidget):
         else:
             self._log("📱 Reading IMEI via DA...")
             self._start_operation("read_imei")
-    
-    def _write_imei(self):
-        """Write IMEI to device."""
-        imei = self.imei_input.text().strip()
-        
-        if not imei:
-            QMessageBox.warning(self, "Missing IMEI", "Please enter an IMEI")
-            return
-        
-        if len(imei) != 15 or not imei.isdigit():
-            QMessageBox.warning(self, "Invalid IMEI", "IMEI must be exactly 15 digits")
-            return
-        
-        # Check if we successfully read IMEI first (indicates encryption is working)
-        current_imei = self.imei_display.text().strip()
-        if not current_imei or current_imei == "" or "Click" in self.imei_display.placeholderText():
-            # No IMEI was read - warn strongly
-            reply = QMessageBox.critical(
-                self, "⚠️ DANGER - Read First!",
-                "❌ You have not successfully read the IMEI!\n\n"
-                "If IMEI reading failed, writing is EXTREMELY DANGEROUS:\n"
-                "• The encryption format may not be compatible\n"
-                "• Your device could lose its IMEI permanently\n"
-                "• NVRAM corruption could brick your device\n\n"
-                "STRONGLY RECOMMENDED: Click 'Read IMEI' first.\n"
-                "Only proceed if you have a NVRAM backup.\n\n"
-                "Write anyway? (NOT RECOMMENDED)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No  # Default to No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        
-        reply = QMessageBox.warning(
-            self, "Confirm IMEI Write",
-            f"⚠️ You are about to write IMEI: {imei}\n\n"
-            "Changing IMEI may be illegal in your country!\n"
-            "Make sure you have a NVRAM backup first!\n\n"
-            "Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            handler = get_device_handler()
-            if handler.meta_connected and handler.meta_serial:
-                self._log(f"📝 Writing IMEI via META AT command: {imei}")
-                slot = getattr(self, 'imei_slot_combo', None)
-                slot_num = 1 if (slot and slot.currentIndex() == 1) else 0
-                if handler.meta_write_imei_at(imei, slot_num):
-                    self._log("✅ IMEI written successfully via META!")
-                    self._log("💡 Read IMEI to verify the change")
-                else:
-                    self._log("⚠️ AT write failed, trying DA method...")
-                    self._start_operation("write_imei", imei=imei)
-            else:
-                self._start_operation("write_imei", imei=imei)
     
     def _backup_modem(self):
         """Backup modem partition."""
@@ -8965,8 +8566,6 @@ class MtkToolkitPlugin:
         'dump_preloader':        {'name': 'Dump Preloader',         'risk': 'READ',   'desc': 'Dump preloader partition'},
         # MODIFY operations — change device state
         'patch_modem':           {'name': 'Patch Modem',            'risk': 'MODIFY', 'desc': 'Patch modem for network unlock'},
-        'write_imei':            {'name': 'Write IMEI',             'risk': 'MODIFY', 'desc': 'Write IMEI number to device'},
-        'meta_write_imei':       {'name': 'Write IMEI (META)',      'risk': 'MODIFY', 'desc': 'Write IMEI via META mode'},
         'unlock_bootloader':     {'name': 'Unlock Bootloader',      'risk': 'MODIFY', 'desc': 'Unlock device bootloader'},
         'lock_bootloader':       {'name': 'Lock Bootloader',        'risk': 'MODIFY', 'desc': 'Re-lock device bootloader'},
         'patch_vbmeta':          {'name': 'Patch vbmeta',           'risk': 'MODIFY', 'desc': 'Disable verified boot'},
@@ -8982,7 +8581,6 @@ class MtkToolkitPlugin:
         # DANGER operations — destructive
         'erase_partition':       {'name': 'Erase Partition',        'risk': 'DANGER', 'desc': 'Erase a flash partition'},
         'write_partition':       {'name': 'Write Partition',        'risk': 'DANGER', 'desc': 'Write data to flash partition'},
-        'erase_frp':             {'name': 'Erase FRP',              'risk': 'DANGER', 'desc': 'Erase Factory Reset Protection'},
         'reset_seccfg':          {'name': 'Reset SecCfg',           'risk': 'DANGER', 'desc': 'Reset security configuration'},
         'memory_dump':           {'name': 'Memory Dump',            'risk': 'DANGER', 'desc': 'Dump raw memory regions'},
         'read_rpmb':             {'name': 'Read RPMB',              'risk': 'DANGER', 'desc': 'Read RPMB protected storage'},
