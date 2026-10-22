@@ -40,9 +40,9 @@ Image Anarchy includes powerful tools that **must be used responsibly**:
 - ✅ **DO** use for device recovery, repair, and customization
 - ❌ **DON'T** use on stolen devices
 - ❌ **DON'T** use for fraud or illegal purposes
-- ❌ **DON'T** modify IMEI for malicious purposes
+- ⛔ **NEVER:** bypass Factory Reset Protection (FRP) or screen locks, or modify an IMEI
 
-**IMEI modification is illegal in many countries.** We provide these tools for legitimate repair and recovery purposes only. You are solely responsible for knowing and following your local laws.
+**Hard lines, enforced in the software:** Image Anarchy has no FRP bypass and no IMEI write, and every toolkit refuses to erase or overwrite FRP partitions. FRP is why lost phones get returned instead of kept, and we won't be the tool that changes that. In our community and remote-repair services, attempting any of these is an automatic, permanent ban.
 
 📜 **[Read our full Acceptable Use Policy](ACCEPTABLE_USE_POLICY.md)**
 
@@ -118,7 +118,7 @@ WORLD FIRST: Live root filesystem backup:
 - **🔓 Network Unlock** - Modem patch method (md1img RSA key replacement + ARM patching + SIMMELOCK neutralization) — confirmed working on real devices
 - **📡 META Mode Switch v4** - Complete rewrite using BROM hardware register method for universal reliability
 - **🎛️ Mode-Aware Buttons** - UI buttons auto-enable/disable based on device mode (BROM/Preloader/DA/META)
-- **📖 IMEI Read/Write** - Direct nvdata partition access with encryption support
+- **📖 IMEI Read** - Direct nvdata partition access with encryption support
 - **🔐 RPMB Operations** - Read, write, erase, and auth RPMB
 - **📊 eFuse Reader** - Hardware fuse register inspection
 - **💾 Memory Dumps** - BROM, DRAM, eFuse, SRAM regions
@@ -300,8 +300,7 @@ Complete bootloader operations with 8 specialized tabs:
 
 <h3>✨ v2.2 Features</h3>
 <ul>
-  <li>✍️ <strong>IMEI Write</strong> - Restore YOUR device identity (read AND write!)</li>
-  <li>📡 <strong>Modem Patching</strong> - Unlock IMEI operations on restricted devices</li>
+  <li>📡 <strong>Modem Patching</strong> - Patch modem firmware (md1img)</li>
   <li>🔐 <strong>Full RPMB Control</strong> - Read, Write, Erase, and Authenticate RPMB</li>
   <li>⚡ <strong>VBMeta Patching</strong> - Disable Android Verified Boot with one click</li>
   <li>📱 <strong>IMEI Read</strong> - Decrypt and display device IMEI values</li>

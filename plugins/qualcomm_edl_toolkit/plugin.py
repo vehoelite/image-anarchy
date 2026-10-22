@@ -31,6 +31,36 @@ except ImportError:  # pragma: no cover - runtime top-level context
 manifest = None  # set by PluginManager
 
 
+# ── Ownership policy ─────────────────────────────────────────────────────────
+# Factory Reset Protection is what makes a lost or stolen phone worthless to
+# whoever is holding it. Image Anarchy will not erase or overwrite it, in any
+# mode, for anyone. See ACCEPTABLE_USE_POLICY.md.
+FRP_PARTITIONS = {"frp", "persistent", "config"}  # FRP storage varies by vendor
+FRP_BLOCKED_MSG = ("⛔ Blocked: Image Anarchy does not erase or overwrite Factory Reset "
+                   "Protection (FRP). Sign in with the device's Google account, or use "
+                   "Google account recovery with proof of purchase.")
+
+
+def _is_frp_partition(name: str) -> bool:
+    """True if name is a partition (or partition image file) holding FRP data."""
+    base = os.path.splitext(os.path.basename(str(name)))[0].lower()
+    if base.endswith(("_a", "_b")):
+        base = base[:-2]
+    return base in FRP_PARTITIONS
+
+
+def _frp_blocked(args) -> bool:
+    """True if these edl.py args would erase or write an FRP partition."""
+    if len(args) < 2:
+        return False
+    cmd = str(args[0]).lower()
+    if cmd in ("e", "w"):
+        return any(_is_frp_partition(p) for p in str(args[1]).split(","))
+    if cmd == "wl" and os.path.isdir(args[1]):
+        return any(_is_frp_partition(f) for f in os.listdir(args[1]))
+    return False
+
+
 class EdlWorker(QThread):
     """Runs one EDL operation off the UI thread; talks to the UI via signals."""
     log = pyqtSignal(str)
@@ -160,6 +190,8 @@ class EdlWorker(QThread):
         `memory` is 'eMMC'/'ufs'/'nand' (omit for non-storage cmds like reset).
         `lun` is omitted for partition-name reads so edl.py scans all LUNs to find
         the partition (UFS devinfo lives on a non-zero LUN, e.g. LUN 4 on LG 8998)."""
+        if _frp_blocked(args):
+            raise PermissionError(FRP_BLOCKED_MSG)
         cmd = [self._python(), os.path.join(edl_dir, "edl.py"), *args]
         if loader:
             cmd.append(f"--loader={loader}")

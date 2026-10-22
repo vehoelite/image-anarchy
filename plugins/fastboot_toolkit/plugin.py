@@ -1365,8 +1365,36 @@ def find_fastboot() -> Optional[str]:
     return None
 
 
+# ── Ownership policy ─────────────────────────────────────────────────────────
+# Factory Reset Protection is what makes a lost or stolen phone worthless to
+# whoever is holding it. Image Anarchy will not erase or overwrite it, in any
+# mode, for anyone. See ACCEPTABLE_USE_POLICY.md.
+FRP_PARTITIONS = {"frp", "persistent", "config"}  # FRP storage varies by vendor
+FRP_BLOCKED_MSG = ("⛔ Blocked: Image Anarchy does not erase or overwrite Factory Reset "
+                   "Protection (FRP). Sign in with the device's Google account, or use "
+                   "Google account recovery with proof of purchase.")
+
+
+def _is_frp_partition(name: str) -> bool:
+    """True if name is a partition (or partition image file) holding FRP data."""
+    base = os.path.splitext(os.path.basename(str(name)))[0].lower()
+    if base.endswith(("_a", "_b")):
+        base = base[:-2]
+    return base in FRP_PARTITIONS
+
+
+def _frp_blocked(args) -> bool:
+    """True if these fastboot args would flash, erase or format an FRP partition."""
+    for i, arg in enumerate(args[:-1]):
+        if str(arg).split(":")[0].lower() in ("flash", "erase", "format") and _is_frp_partition(args[i + 1]):
+            return True
+    return False
+
+
 def run_fastboot(args: List[str], device: Optional[str] = None, timeout: int = 60) -> tuple:
     """Run Fastboot command and return (success, output)."""
+    if _frp_blocked(args):
+        return False, FRP_BLOCKED_MSG
     fb_path = find_fastboot()
     if not fb_path:
         return False, "Fastboot not found"
