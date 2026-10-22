@@ -315,6 +315,25 @@ def get_app_dir() -> str:
         return os.path.dirname(os.path.abspath(__file__))
 
 
+# Windows-only files that Plugin Store zips may contain; useless on Linux/macOS
+WINDOWS_ONLY_EXTS = ('.exe', '.dll', '.msi')
+
+
+def is_runnable_binary(path) -> bool:
+    """Check whether path is a binary this OS can execute.
+
+    On Windows any existing file counts. On Linux/macOS, .exe files are
+    rejected and the execute bit is required, so callers fall through to
+    the native tool on PATH instead of hitting "Permission denied".
+    """
+    path = str(path)
+    if not os.path.isfile(path):
+        return False
+    if sys.platform == 'win32':
+        return True
+    return not path.lower().endswith('.exe') and os.access(path, os.X_OK)
+
+
 def _extract_bundled_resources():
     """Extract bundled resources from PyInstaller _MEIPASS to app directory.
     
@@ -6662,12 +6681,12 @@ class ErofsImageExtractor:
             # Prefer extract.erofs.exe (dedicated extraction tool)
             for candidate in ['extract.erofs.exe', 'extract.erofs']:
                 tool_path = tools_dir / candidate
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return {'path': str(tool_path), 'use_wsl': False, 'tool': 'extract.erofs'}
             # Fall back to fsck.erofs
             for candidate in ['fsck.erofs.exe', 'fsck.erofs']:
                 tool_path = tools_dir / candidate
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return {'path': str(tool_path), 'use_wsl': False, 'tool': 'fsck.erofs'}
         
         # Check native PATH
@@ -7966,7 +7985,7 @@ class ErofsImageExtractor:
         if tools_dir.exists():
             for candidate in ['mkfs.erofs.exe', 'mkfs.erofs']:
                 tool_path = tools_dir / candidate
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return {'path': str(tool_path), 'use_wsl': False}
         
         # Check native PATH
@@ -9193,11 +9212,11 @@ class F2fsImageExtractor:
         if tools_dir.exists():
             for candidate in ['dump.f2fs.exe', 'dump.f2fs']:
                 tool_path = tools_dir / candidate
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return {'path': str(tool_path), 'use_wsl': False, 'tool': 'dump.f2fs'}
             for candidate in ['fsck.f2fs.exe', 'fsck.f2fs']:
                 tool_path = tools_dir / candidate
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return {'path': str(tool_path), 'use_wsl': False, 'tool': 'fsck.f2fs'}
         
         # Check native PATH
@@ -11619,7 +11638,7 @@ class PluginManager:
             # Filter to only URL-based binaries
             url_binaries = []
             is_linux = sys.platform != 'win32'
-            _win_only_exts = ('.exe', '.dll', '.msi')
+            _win_only_exts = WINDOWS_ONLY_EXTS
             skipped_win_binaries = []
             for binary in manifest.bundled_binaries:
                 if isinstance(binary, str) and binary.startswith(('http://', 'https://')):
@@ -17181,7 +17200,7 @@ def create_gui_app():
             # Check tools folder (both .exe and bare name for cross-platform)
             for name in ['imgRePacker.exe', 'imgRePacker']:
                 tool_path = base / 'tools' / 'Allwinner' / name
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return str(tool_path)
             
             # Check if it's in PATH
@@ -17389,7 +17408,7 @@ def create_gui_app():
             # Check tools folder (both .exe and bare name for cross-platform)
             for name in ['imgRePackerRK.exe', 'imgRePackerRK']:
                 tool_path = base / 'tools' / 'Rockchip' / name
-                if tool_path.exists():
+                if is_runnable_binary(tool_path):
                     return str(tool_path)
             
             # Check if it's in PATH
@@ -21127,10 +21146,10 @@ def create_gui_app():
                 import shutil as _shutil
                 for name in names:
                     if subdir:
-                        if os.path.exists(os.path.join(tools_dir, subdir, name)):
+                        if is_runnable_binary(os.path.join(tools_dir, subdir, name)):
                             return True
                     else:
-                        if os.path.exists(os.path.join(tools_dir, name)):
+                        if is_runnable_binary(os.path.join(tools_dir, name)):
                             return True
                 # Fallback: system PATH
                 base_name = names[-1] if names else None  # bare name is last
@@ -28518,16 +28537,20 @@ def create_gui_app():
                 with zipfile.ZipFile(zip_path, 'r') as zf:
                     # Check if the zip has a root folder or files at root
                     namelist = zf.namelist()
-                    
+                    # Store zips are built on Windows; don't drop adb.exe & co.
+                    # onto Linux/macOS where they'd shadow the native tools
+                    members = [n for n in namelist
+                               if sys.platform == 'win32' or not n.lower().endswith(WINDOWS_ONLY_EXTS)]
+
                     # Check if all files are in a subdirectory already
                     has_root_folder = False
                     if namelist:
                         first_part = namelist[0].split('/')[0]
                         has_root_folder = all(n.startswith(first_part + '/') or n == first_part for n in namelist)
-                    
+
                     if has_root_folder:
                         # Extract and move contents from the root folder
-                        zf.extractall(plugins_dir)
+                        zf.extractall(plugins_dir, members=members)
                         # The extracted folder might have a different name, rename if needed
                         extracted_folder = os.path.join(plugins_dir, first_part)
                         if extracted_folder != plugin_install_dir and os.path.exists(extracted_folder):
@@ -28538,8 +28561,8 @@ def create_gui_app():
                             os.rename(extracted_folder, plugin_install_dir)
                     else:
                         # Files are at root level, extract to plugin subdirectory
-                        zf.extractall(plugin_install_dir)
-                
+                        zf.extractall(plugin_install_dir, members=members)
+
                 # Clean up temp file
                 os.remove(zip_path)
                 os.rmdir(temp_dir)

@@ -156,6 +156,19 @@ def get_plugin_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_runnable(path: str) -> bool:
+    """True if path is a binary this OS can execute.
+
+    Plugin Store zips ship Windows builds (adb.exe, fastboot.exe, ...). On
+    Linux/macOS those must be skipped so the system tools on PATH are used.
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return not path.lower().endswith(".exe") and os.access(path, os.X_OK)
+
+
 def find_adb() -> Optional[str]:
     """Find ADB executable - checks plugin directory first for self-contained plugins."""
     plugin_dir = get_plugin_dir()
@@ -169,7 +182,7 @@ def find_adb() -> Optional[str]:
     ]
     
     for path in plugin_adb_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # PRIORITY 2: PyInstaller frozen exe bundled files
@@ -185,7 +198,7 @@ def find_adb() -> Optional[str]:
         ]
         
         for path in frozen_paths:
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     else:
         # Development mode - check app root
@@ -196,7 +209,7 @@ def find_adb() -> Optional[str]:
         ]
         
         for path in dev_paths:
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     
     # PRIORITY 3: System PATH and common locations
@@ -211,7 +224,7 @@ def find_adb() -> Optional[str]:
     for path in system_paths:
         if path and shutil.which(path):
             return shutil.which(path)
-        if path and os.path.isfile(path):
+        if path and _is_runnable(path):
             return path
     
     return None
@@ -264,7 +277,7 @@ class AdbWorkerThread(QThread):
     
     def run(self):
         if not self.adb_path:
-            self.finished_signal.emit(False, "ADB not found. Please ensure platform-tools is available.")
+            self.finished_signal.emit(False, "ADB not found. " + ("Please ensure platform-tools is available." if os.name == "nt" else "Install it with your package manager (e.g. sudo apt install adb)."))
             return
         
         try:

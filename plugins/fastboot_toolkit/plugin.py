@@ -1304,6 +1304,19 @@ def get_plugin_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_runnable(path: str) -> bool:
+    """True if path is a binary this OS can execute.
+
+    Plugin Store zips ship Windows builds (adb.exe, fastboot.exe, ...). On
+    Linux/macOS those must be skipped so the system tools on PATH are used.
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return not path.lower().endswith(".exe") and os.access(path, os.X_OK)
+
+
 def find_fastboot() -> Optional[str]:
     """Find Fastboot executable - checks plugin directory first for self-contained plugins."""
     plugin_dir = get_plugin_dir()
@@ -1317,7 +1330,7 @@ def find_fastboot() -> Optional[str]:
     ]
     
     for path in plugin_fb_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # PRIORITY 2: PyInstaller frozen exe bundled files
@@ -1333,7 +1346,7 @@ def find_fastboot() -> Optional[str]:
         ]
         
         for path in frozen_paths:
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     else:
         # Development mode - check app root
@@ -1344,7 +1357,7 @@ def find_fastboot() -> Optional[str]:
         ]
         
         for path in dev_paths:
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     
     # PRIORITY 3: System PATH and common locations
@@ -1359,7 +1372,7 @@ def find_fastboot() -> Optional[str]:
     for path in system_paths:
         if path and shutil.which(path):
             return shutil.which(path)
-        if path and os.path.isfile(path):
+        if path and _is_runnable(path):
             return path
     
     return None
@@ -1397,7 +1410,7 @@ def find_adb() -> Optional[str]:
         os.path.join(plugin_dir, "platform-tools", "adb"),
     ]
     for path in plugin_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
 
     # PRIORITY 2: PyInstaller frozen exe
@@ -1407,13 +1420,13 @@ def find_adb() -> Optional[str]:
         for d in (meipass, app_dir):
             for fn in ("adb.exe", "adb"):
                 p = os.path.join(d, "platform-tools", fn)
-                if os.path.isfile(p):
+                if _is_runnable(p):
                     return p
     else:
         app_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         for fn in ("adb.exe", "adb"):
             p = os.path.join(app_dir, "platform-tools", fn)
-            if os.path.isfile(p):
+            if _is_runnable(p):
                 return p
 
     # PRIORITY 3: System PATH / common locations
@@ -1992,7 +2005,7 @@ class FastbootWorkerThread(QThread):
         # ADB-only operations don't require fastboot
         adb_only_ops = {"inject_product_key"}
         if not self.fb_path and self.operation not in adb_only_ops:
-            self.finished_signal.emit(False, "Fastboot not found. Please ensure platform-tools is available.")
+            self.finished_signal.emit(False, "Fastboot not found. " + ("Please ensure platform-tools is available." if os.name == "nt" else "Install it with your package manager (e.g. sudo apt install fastboot)."))
             return
         
         try:
