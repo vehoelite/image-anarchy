@@ -83,6 +83,19 @@ def get_plugin_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_runnable(path: str) -> bool:
+    """True if path is a binary this OS can execute.
+
+    Plugin Store zips ship Windows builds (adb.exe, fastboot.exe, ...). On
+    Linux/macOS those must be skipped so the system tools on PATH are used.
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return not path.lower().endswith(".exe") and os.access(path, os.X_OK)
+
+
 def find_adb() -> Optional[str]:
     """Find ADB executable."""
     plugin_dir = get_plugin_dir()
@@ -93,7 +106,7 @@ def find_adb() -> Optional[str]:
         os.path.join(plugin_dir, "adb"),
     ]
     for path in direct_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # Check plugin's platform-tools subfolder (legacy)
@@ -102,7 +115,7 @@ def find_adb() -> Optional[str]:
         os.path.join(plugin_dir, "platform-tools", "adb"),
     ]
     for path in plugin_adb_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # Check ADB Toolkit plugin (if installed)
@@ -114,7 +127,7 @@ def find_adb() -> Optional[str]:
     ]
     for path in adb_toolkit_paths:
         norm_path = os.path.normpath(path)
-        if os.path.isfile(norm_path):
+        if _is_runnable(norm_path):
             return norm_path
     
     # Check frozen app
@@ -124,14 +137,14 @@ def find_adb() -> Optional[str]:
         for base in [meipass, app_dir]:
             for p in ["adb.exe", "adb", "platform-tools/adb.exe", "platform-tools/adb"]:
                 path = os.path.join(base, p)
-                if os.path.isfile(path):
+                if _is_runnable(path):
                     return path
     else:
         # Dev mode - check app root
         app_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         for p in ["adb.exe", "adb", "platform-tools/adb.exe", "platform-tools/adb"]:
             path = os.path.join(app_dir, p)
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     
     # System PATH
@@ -145,7 +158,7 @@ def find_adb() -> Optional[str]:
     if android_home:
         for p in ["platform-tools/adb.exe", "platform-tools/adb"]:
             path = os.path.join(android_home, p)
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     
     return None
@@ -161,7 +174,7 @@ def find_fastboot() -> Optional[str]:
         os.path.join(plugin_dir, "fastboot"),
     ]
     for path in direct_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # Check plugin's platform-tools subfolder (legacy)
@@ -170,7 +183,7 @@ def find_fastboot() -> Optional[str]:
         os.path.join(plugin_dir, "platform-tools", "fastboot"),
     ]
     for path in plugin_fb_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # Check Fastboot Toolkit plugin (if installed)
@@ -182,7 +195,7 @@ def find_fastboot() -> Optional[str]:
     ]
     for path in fb_toolkit_paths:
         norm_path = os.path.normpath(path)
-        if os.path.isfile(norm_path):
+        if _is_runnable(norm_path):
             return norm_path
     
     # Check frozen app
@@ -192,13 +205,13 @@ def find_fastboot() -> Optional[str]:
         for base in [meipass, app_dir]:
             for p in ["fastboot.exe", "fastboot", "platform-tools/fastboot.exe", "platform-tools/fastboot"]:
                 path = os.path.join(base, p)
-                if os.path.isfile(path):
+                if _is_runnable(path):
                     return path
     else:
         app_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         for p in ["fastboot.exe", "fastboot", "platform-tools/fastboot.exe", "platform-tools/fastboot"]:
             path = os.path.join(app_dir, p)
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     
     # System PATH

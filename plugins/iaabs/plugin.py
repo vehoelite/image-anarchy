@@ -37,6 +37,19 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QFont, QIcon
 
 
+def _is_runnable(path: str) -> bool:
+    """True if path is a binary this OS can execute.
+
+    Plugin Store zips ship Windows builds (adb.exe, fastboot.exe, ...). On
+    Linux/macOS those must be skipped so the system tools on PATH are used.
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return not path.lower().endswith(".exe") and os.access(path, os.X_OK)
+
+
 def find_adb() -> Optional[str]:
     """Find ADB executable - checks ADB Toolkit plugin and common locations."""
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +65,7 @@ def find_adb() -> Optional[str]:
     ]
     
     for path in adb_toolkit_paths:
-        if os.path.isfile(path):
+        if _is_runnable(path):
             return path
     
     # PRIORITY 2: App root platform-tools (development/frozen)
@@ -68,7 +81,7 @@ def find_adb() -> Optional[str]:
         ]
         
         for path in frozen_paths:
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     else:
         # Development mode
@@ -80,7 +93,7 @@ def find_adb() -> Optional[str]:
         ]
         
         for path in dev_paths:
-            if os.path.isfile(path):
+            if _is_runnable(path):
                 return path
     
     # PRIORITY 3: System PATH and common locations
@@ -95,7 +108,7 @@ def find_adb() -> Optional[str]:
     for path in system_paths:
         if path and shutil.which(path):
             return shutil.which(path)
-        if path and os.path.isfile(path):
+        if path and _is_runnable(path):
             return path
     
     return None

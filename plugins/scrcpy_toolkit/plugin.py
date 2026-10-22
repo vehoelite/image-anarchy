@@ -56,39 +56,39 @@ def get_base_path() -> Path:
         return Path(__file__).parent.parent.parent
 
 
+def _is_runnable(path) -> bool:
+    """True if path is a binary this OS can execute.
+
+    Plugin Store zips ship Windows builds (scrcpy.exe, adb.exe). On
+    Linux/macOS those must be skipped so the system tools on PATH are used.
+    """
+    path = str(path)
+    if not os.path.isfile(path):
+        return False
+    if os.name == "nt":
+        return True
+    return not path.lower().endswith(".exe") and os.access(path, os.X_OK)
+
+
+def _exe_names(name: str) -> List[str]:
+    """Candidate filenames for a tool on this OS."""
+    return [name + ".exe", name] if os.name == "nt" else [name]
+
+
 def find_adb_toolkit_path() -> Optional[str]:
     """Find ADB executable from ADB Toolkit plugin or bundled with scrcpy."""
     base_path = get_base_path()
-    
-    # Check scrcpy plugin's own bundled adb.exe FIRST (downloaded via bundled_binaries)
-    scrcpy_adb = base_path / 'plugins' / 'scrcpy_toolkit' / 'adb.exe'
-    if scrcpy_adb.exists():
-        return str(scrcpy_adb)
-    
-    # Check ADB Toolkit plugin path
-    adb_toolkit_path = base_path / 'plugins' / 'adb_toolkit' / 'platform-tools' / 'adb.exe'
-    if adb_toolkit_path.exists():
-        return str(adb_toolkit_path)
-    
-    # Check root platform-tools
-    root_adb = base_path / 'platform-tools' / 'adb.exe'
-    if root_adb.exists():
-        return str(root_adb)
-    
-    # Linux/Mac paths - scrcpy plugin's bundled adb
-    scrcpy_adb_unix = base_path / 'plugins' / 'scrcpy_toolkit' / 'adb'
-    if scrcpy_adb_unix.exists():
-        return str(scrcpy_adb_unix)
-    
-    # Linux/Mac - ADB Toolkit
-    adb_toolkit_unix = base_path / 'plugins' / 'adb_toolkit' / 'platform-tools' / 'adb'
-    if adb_toolkit_unix.exists():
-        return str(adb_toolkit_unix)
-    
-    root_adb_unix = base_path / 'platform-tools' / 'adb'
-    if root_adb_unix.exists():
-        return str(root_adb_unix)
-    
+    dirs = [
+        base_path / 'plugins' / 'scrcpy_toolkit',                    # own bundled copy first
+        base_path / 'plugins' / 'adb_toolkit' / 'platform-tools',    # ADB Toolkit plugin
+        base_path / 'plugins' / 'adb_toolkit',
+        base_path / 'platform-tools',                                # app root
+    ]
+    for d in dirs:
+        for name in _exe_names('adb'):
+            if _is_runnable(d / name):
+                return str(d / name)
+
     # Fall back to system PATH
     return shutil.which('adb')
 
@@ -96,27 +96,16 @@ def find_adb_toolkit_path() -> Optional[str]:
 def find_scrcpy_path() -> Optional[str]:
     """Find scrcpy executable."""
     base_path = get_base_path()
-    
-    # Check plugin folder
-    plugin_scrcpy = base_path / 'plugins' / 'scrcpy_toolkit' / 'scrcpy.exe'
-    if plugin_scrcpy.exists():
-        return str(plugin_scrcpy)
-    
-    # Check plugin tools subfolder
-    plugin_tools = base_path / 'plugins' / 'scrcpy_toolkit' / 'tools' / 'scrcpy.exe'
-    if plugin_tools.exists():
-        return str(plugin_tools)
-    
-    # Check root tools
-    root_tools = base_path / 'tools' / 'scrcpy.exe'
-    if root_tools.exists():
-        return str(root_tools)
-    
-    # Linux/Mac
-    plugin_scrcpy_unix = base_path / 'plugins' / 'scrcpy_toolkit' / 'scrcpy'
-    if plugin_scrcpy_unix.exists():
-        return str(plugin_scrcpy_unix)
-    
+    dirs = [
+        base_path / 'plugins' / 'scrcpy_toolkit',
+        base_path / 'plugins' / 'scrcpy_toolkit' / 'tools',
+        base_path / 'tools',
+    ]
+    for d in dirs:
+        for name in _exe_names('scrcpy'):
+            if _is_runnable(d / name):
+                return str(d / name)
+
     # Fall back to system PATH
     return shutil.which('scrcpy')
 
@@ -150,7 +139,7 @@ class AdbHelper:
                  timeout: int = 30, binary: bool = False) -> subprocess.CompletedProcess:
         """Run ADB command."""
         if not self.adb_path:
-            raise RuntimeError("ADB not found. Install ADB Toolkit plugin.")
+            raise RuntimeError("ADB not found. " + ("Install ADB Toolkit plugin." if os.name == "nt" else "Install it with your package manager (e.g. sudo apt install adb)."))
         
         cmd = [self.adb_path]
         if serial:
@@ -810,7 +799,7 @@ class PluginWidget(QWidget):
         
         if not self.scrcpy_path or not Path(self.scrcpy_path).exists():
             QMessageBox.warning(self, "Scrcpy Not Found",
-                "scrcpy.exe not found. Try reinstalling the plugin from Plugin Store.")
+                "scrcpy.exe not found. Try reinstalling the plugin from Plugin Store." if os.name == "nt" else "scrcpy not found. Install it with your package manager (e.g. sudo apt install scrcpy).")
             return
         
         serial = self.device_combo.currentData()
@@ -929,7 +918,7 @@ class PluginWidget(QWidget):
         
         if not self.scrcpy_path or not Path(self.scrcpy_path).exists():
             QMessageBox.warning(self, "Scrcpy Not Found",
-                "scrcpy.exe not found. Try reinstalling the plugin from Plugin Store.")
+                "scrcpy.exe not found. Try reinstalling the plugin from Plugin Store." if os.name == "nt" else "scrcpy not found. Install it with your package manager (e.g. sudo apt install scrcpy).")
             return
         
         serial = self.record_device_combo.currentData()
